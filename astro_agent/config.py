@@ -60,7 +60,11 @@ class Settings:
     # External binaries
     siril_bin: str
     graxpert_bin: str
-    starnet_bin: str        # absolute path to the starnet++ executable
+    starnet_bin: str        # absolute path to the starnet2 executable
+    starnet_weights: str    # absolute path to StarNet2_weights.pt
+
+    # Camera sensor
+    pixel_size_um: float | None  # optional override; None → use camera lookup table
 
     # LangSmith (optional tracing)
     langchain_tracing: bool
@@ -96,6 +100,8 @@ def load_settings() -> Settings:
         siril_bin=_optional("SIRIL_BIN", "siril-cli"),
         graxpert_bin=_optional("GRAXPERT_BIN", "graxpert"),
         starnet_bin=_require("STARNET_BIN"),
+        starnet_weights=_require("STARNET_WEIGHTS"),
+        pixel_size_um=float(v) if (v := _optional("PIXEL_SIZE_UM")) else None,
         langchain_tracing=_optional("LANGCHAIN_TRACING_V2", "false").lower() == "true",
         langchain_api_key=_optional("LANGCHAIN_API_KEY"),
         langchain_project=_optional("LANGCHAIN_PROJECT", "astro-agent"),
@@ -139,30 +145,64 @@ def _check_graxpert(graxpert_bin: str) -> None:
         )
 
 
-def _check_starnet(starnet_bin: str) -> None:
+def _check_starnet(starnet_bin: str, starnet_weights: str) -> None:
     """
-    StarNet v2 on macOS is a standalone CLI binary (starnet++) downloaded from
-    starnetastro.com. Siril calls it via the path set in Siril > Preferences >
-    Miscellaneous > Software Location. STARNET_BIN must point to that same path.
+    StarNet v2 on macOS is a standalone CLI binary downloaded from starnetastro.com.
+    We call it directly via subprocess (not through Siril) using STARNET_BIN.
+    The MPS-accelerated PyTorch build (starnet2) is preferred for Apple Silicon.
 
-    See .env.example for full installation instructions.
+    See .env.example for full installation and code-signing instructions.
     """
     path = Path(starnet_bin)
     if not path.exists():
         raise DependencyError(
             f"StarNet binary not found at '{starnet_bin}'. "
-            "Set STARNET_BIN in .env to the absolute path of your starnet++ executable.\n"
+            "Set STARNET_BIN in .env to the absolute path of your starnet2 executable.\n"
             "Installation:\n"
-            "  1. Download StarNet v2 CLI for macOS: https://www.starnetastro.com/download/\n"
-            "  2. chmod +x starnet++ run_starnet.sh\n"
-            "  3. Run starnet++ once and allow in System Settings > Privacy & Security\n"
-            "  4. Set path in Siril > Preferences > Miscellaneous > Software Location\n"
-            "  5. Set STARNET_BIN=/path/to/starnet++ in .env"
+            "  1. Download StarNet v2 (MPS build) from: https://www.starnetastro.com/download/\n"
+            "  2. chmod +x starnet2\n"
+            "  3. xattr -d com.apple.quarantine starnet2\n"
+            "  4. Allow in System Settings > Privacy & Security\n"
+            "  5. codesign --force --sign - /path/to/starnet2\n"
+            "  6. Set STARNET_BIN and STARNET_WEIGHTS in .env"
         )
     if not os.access(path, os.X_OK):
         raise DependencyError(
             f"StarNet binary at '{starnet_bin}' is not executable. "
             f"Run: chmod +x {starnet_bin}"
+        )
+    weights_path = Path(starnet_weights)
+    if not weights_path.exists():
+        raise DependencyError(
+            f"StarNet weights file not found at '{starnet_weights}'. "
+            "The weights file (StarNet2_weights.pt) ships in the same folder as the binary. "
+            "Set STARNET_WEIGHTS in .env to its absolute path."
+        )
+
+
+def _check_exiftool() -> None:
+    """ExifTool is installed system-wide (brew install exiftool) and must be on PATH."""
+    exiftool_path = shutil.which("exiftool")
+    if not exiftool_path:
+        raise DependencyError(
+            "ExifTool not found on PATH. "
+            "Install with: brew install exiftool\n"
+            "ExifTool is required for reading EXIF metadata from camera RAW files (T01)."
+        )
+    result = subprocess.run(
+        [exiftool_path, "-ver"], capture_output=True, text=True, timeout=10
+    )
+    version_str = result.stdout.strip()
+    try:
+        major = int(version_str.split(".")[0])
+        if major < 12:
+            raise DependencyError(
+                f"ExifTool {version_str} is too old. AstroAgent requires ExifTool ≥ 12. "
+                "Upgrade: brew upgrade exiftool"
+            )
+    except (ValueError, IndexError):
+        raise DependencyError(
+            f"Could not parse ExifTool version from: {version_str!r}"
         )
 
 
@@ -202,7 +242,8 @@ def check_dependencies(settings: Settings | None = None) -> None:
 
     _check_siril(settings.siril_bin)
     _check_graxpert(settings.graxpert_bin)
-    _check_starnet(settings.starnet_bin)
+    _check_starnet(settings.starnet_bin, settings.starnet_weights)
+    _check_exiftool()
     _check_python_libs()
 
 

@@ -1,0 +1,283 @@
+"""
+T26 — reduce_stars
+
+Reduce the angular size of stars using morphological erosion applied only
+within star regions. Unlike T19 star_restoration with star_weight < 1.0
+(which dims stars without changing size), this tool physically shrinks star
+disks — eliminating bloom and improving perceived sharpness of background
+nebulosity.
+
+Apply to the final combined image after T19, or directly before export.
+Not a substitute for good registration; intended for residual star size
+reduction after all other processing is complete.
+
+Algorithm:
+1. Build binary star mask from T15 output or auto-threshold luminance
+2. Optionally dilate mask to exclude innermost star cores from erosion
+3. Apply skimage.morphology.erosion(channel, disk(kernel_radius)) for
+   `iterations` passes, only within the masked star region
+4. Blend eroded result with original via feathered mask + blend_amount
+5. Report stars_affected_count and mean_size_reduction_pct
+
+Backend: Pure Python — scikit-image + Astropy. No Siril invocation.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+from astropy.io import fits as astropy_fits
+from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+from skimage.filters import gaussian
+from skimage.measure import label, regionprops
+from skimage.morphology import binary_dilation, dilation, disk, erosion
+
+
+# ── Pydantic input schema ──────────────────────────────────────────────────────
+
+class ReduceStarsInput(BaseModel):
+    working_dir: str = Field(
+        description="Absolute path to the working directory."
+    )
+    image_path: str = Field(
+        description=(
+            "Absolute path to the final combined FITS image (stars + starless). "
+            "Call after T19 star_restoration, not on the starless image alone."
+        )
+    )
+    star_mask_path: str | None = Field(
+        default=None,
+        description=(
+            "Absolute path to the star mask FITS from T15 star_removal. "
+            "Preferred over auto-detection — more precise and prevents erosion "
+            "from affecting bright nebula knots misidentified as stars."
+        ),
+    )
+    detection_threshold: float = Field(
+        default=0.6,
+        description=(
+            "Luminance value above which a pixel is treated as a star when "
+            "no star_mask_path is provided. "
+            "0.6: standard stretched image. "
+            "0.4: catch fainter stars. "
+            "0.75: avoid bright nebula cores being incorrectly eroded."
+        ),
+    )
+    kernel_radius: int = Field(
+        default=1,
+        description=(
+            "Radius of the morphological erosion disk element (pixels). "
+            "1: gentlest (subtle tightening). "
+            "2: moderate (noticeable bloom reduction). "
+            "3: aggressive (only for severely bloated stars). "
+            "Do not exceed 3 without previewing — stars become pixelated."
+        ),
+    )
+    iterations: int = Field(
+        default=1,
+        description=(
+            "Number of erosion passes applied sequentially. "
+            "1 pass = minimal. 2 passes = strong. Do not exceed 3."
+        ),
+    )
+    blend_amount: float = Field(
+        default=1.0,
+        description=(
+            "Weight applied to the eroded result in the blend: "
+            "1.0 = full reduction applied. "
+            "0.5 = half-strength (useful for mildly large stars). "
+            "Blended with original: result * blend + original * (1 - blend)."
+        ),
+    )
+    protect_core_radius: int = Field(
+        default=0,
+        description=(
+            "Pixels to dilate the exclusion zone around each star peak, "
+            "preventing erosion from modifying the star core. "
+            "Use when stars contain important color data (e.g. red giants). "
+            "0 = no core protection (default)."
+        ),
+    )
+    feather_px: int = Field(
+        default=3,
+        description=(
+            "Gaussian sigma for the transition between eroded star region "
+            "and surrounding image. Prevents visible edge rings. "
+            "3px: standard. 5px: for larger stars or stronger reduction."
+        ),
+    )
+    output_stem: str | None = Field(
+        default=None,
+        description="Output FITS stem. Defaults to '{source_stem}_reduced_stars'.",
+    )
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _load_fits(image_path: Path) -> tuple[np.ndarray, bool]:
+    """
+    Load a FITS file, return (array, is_color).
+    Color images returned as (3, H, W) float32.
+    """
+    with astropy_fits.open(image_path) as hdul:
+        data = hdul[0].data.astype(np.float32)
+
+    if data.max() > 1.0:
+        data = data / data.max()
+
+    if data.ndim == 3 and data.shape[0] == 3:
+        return data, True
+    elif data.ndim == 3 and data.shape[2] == 3:
+        return np.moveaxis(data, -1, 0), True
+    else:
+        return data.squeeze()[np.newaxis, :, :], False
+
+
+def _compute_luminance(data: np.ndarray) -> np.ndarray:
+    """Compute (H, W) luminance from (3, H, W) float32 array."""
+    return (0.2126 * data[0] + 0.7152 * data[1] + 0.0722 * data[2]).astype(np.float32)
+
+
+def _load_mask_channel(mask_path: Path) -> np.ndarray:
+    """Load a single-channel float32 mask FITS, return (H, W) boolean."""
+    with astropy_fits.open(mask_path) as hdul:
+        mask_data = hdul[0].data.astype(np.float32).squeeze()
+    if mask_data.max() > 1.0:
+        mask_data = mask_data / mask_data.max()
+    return mask_data > 0.5
+
+
+def _erode_channel(
+    channel: np.ndarray,
+    star_binary: np.ndarray,
+    core_exclusion: np.ndarray,
+    kernel_radius: int,
+    iterations: int,
+) -> np.ndarray:
+    """
+    Apply morphological erosion to channel pixels within star_binary,
+    excluding pixels in core_exclusion zone.
+    """
+    struct = disk(kernel_radius)
+    eroded = channel.copy()
+    for _ in range(iterations):
+        e = erosion(eroded, struct)
+        # Apply only within star region, not in core exclusion zone
+        apply_mask = star_binary & ~core_exclusion
+        eroded = np.where(apply_mask, e, eroded)
+    return eroded
+
+
+def _count_stars_affected(star_binary: np.ndarray) -> int:
+    """Count distinct connected star regions."""
+    labeled = label(star_binary)
+    return int(labeled.max())
+
+
+# ── LangChain tool ─────────────────────────────────────────────────────────────
+
+@tool(args_schema=ReduceStarsInput)
+def reduce_stars(
+    working_dir: str,
+    image_path: str,
+    star_mask_path: str | None = None,
+    detection_threshold: float = 0.6,
+    kernel_radius: int = 1,
+    iterations: int = 1,
+    blend_amount: float = 1.0,
+    protect_core_radius: int = 0,
+    feather_px: int = 3,
+    output_stem: str | None = None,
+) -> dict:
+    """
+    Physically reduce the angular size of stars via morphological erosion.
+
+    This tool shrinks star disk diameters without dimming them. Use it on the
+    final combined image (after T19 star_restoration) to eliminate residual
+    bloom. The effect is confined to the star region mask — background
+    nebulosity is never touched.
+
+    Key settings:
+    - kernel_radius=1, iterations=1: gentlest effect, almost always safe
+    - kernel_radius=2: moderate bloom reduction (preview result)
+    - star_mask_path from T15: always preferred over auto-detection — prevents
+      bright nebula cores from being incorrectly identified as stars
+    - blend_amount=0.5: half-strength, useful when stars are only mildly large
+
+    After running, call analyze_image to confirm stars.median_fwhm decreased.
+    """
+    img_path = Path(image_path)
+    if not img_path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    data, is_color = _load_fits(img_path)
+    lum = _compute_luminance(data)
+
+    # Build star mask
+    if star_mask_path and Path(star_mask_path).exists():
+        star_binary = _load_mask_channel(Path(star_mask_path))
+        # Resize if needed (mask might differ in shape from image)
+        if star_binary.shape != lum.shape:
+            from skimage.transform import resize
+            star_binary = resize(
+                star_binary.astype(np.float32), lum.shape, order=0
+            ).astype(bool)
+    else:
+        star_binary = lum > detection_threshold
+
+    # Core exclusion zone — protect innermost star centers
+    if protect_core_radius > 0:
+        core_exclusion = binary_dilation(star_binary, disk(protect_core_radius))
+        core_exclusion = core_exclusion & star_binary
+    else:
+        core_exclusion = np.zeros_like(star_binary, dtype=bool)
+
+    # Feathered blend mask for smooth edges
+    star_float = star_binary.astype(np.float32)
+    if feather_px > 0:
+        star_blend_mask = gaussian(star_float, sigma=feather_px)
+        star_blend_mask = np.clip(star_blend_mask, 0.0, 1.0)
+    else:
+        star_blend_mask = star_float
+
+    # Track pre-erosion star region stats for reporting
+    star_lum_before = np.mean(lum[star_binary]) if np.any(star_binary) else 0.0
+
+    # Apply erosion per channel
+    output_data = data.copy()
+    for ch_idx in range(data.shape[0]):
+        eroded = _erode_channel(
+            data[ch_idx], star_binary, core_exclusion, kernel_radius, iterations
+        )
+        # Blend eroded result with original via feathered mask
+        blended = eroded * blend_amount + data[ch_idx] * (1.0 - blend_amount)
+        output_data[ch_idx] = (
+            blended * star_blend_mask + data[ch_idx] * (1.0 - star_blend_mask)
+        )
+
+    # Measure size reduction
+    star_lum_after = (
+        np.mean(
+            (0.2126 * output_data[0] + 0.7152 * output_data[1] + 0.0722 * output_data[2])[star_binary]
+        ) if np.any(star_binary) else 0.0
+    )
+    mean_size_reduction_pct = (
+        float((star_lum_before - star_lum_after) / (star_lum_before + 1e-9) * 100)
+        if star_lum_before > 0
+        else 0.0
+    )
+    stars_affected_count = _count_stars_affected(star_binary)
+
+    # Save output
+    out_stem = output_stem or f"{img_path.stem}_reduced_stars"
+    out_path = Path(working_dir) / f"{out_stem}.fits"
+    hdu = astropy_fits.PrimaryHDU(data=output_data)
+    astropy_fits.HDUList([hdu]).writeto(out_path, overwrite=True)
+
+    return {
+        "reduced_image_path": str(out_path),
+        "stars_affected_count": stars_affected_count,
+        "mean_size_reduction_pct": round(mean_size_reduction_pct, 2),
+    }

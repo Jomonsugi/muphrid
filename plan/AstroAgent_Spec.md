@@ -11,6 +11,50 @@ choices via A/B variant selection.
 
 ---
 
+## 0  Engineering Philosophy
+
+**The goal is PixInsight-quality output from open source software.**
+Every decision in this system — package selection, algorithm choice, tool
+architecture — is made against that bar.
+
+### Gold Standard Over Convenient
+
+Always choose the most robust, comprehensive, and trusted tool for a given job,
+even if it requires an additional system dependency or more setup.
+
+The `pyexiftool` / ExifTool choice over `exifread` is the reference example:
+ExifTool is what Adobe Lightroom, Capture One, and digiKam use under the hood.
+It reads every RAW format including Fujifilm proprietary maker notes. `exifread`
+failed on RAF entirely. When the easier path produces worse data, take the harder
+path.
+
+**Decision checklist for new packages/tools:**
+1. Is this what professional tools (Lightroom, PixInsight, Capture One) use?
+2. Does it handle the full range of formats, not just today's use case?
+3. Is it actively maintained? (commits in the last 6 months)
+4. Battle-tested C/C++ library wrapped in Python > pure-Python alternative
+5. External binaries are a first-class pattern here (Siril, GraXpert, StarNet,
+   ExifTool) — do not reject a better tool solely because it needs a binary
+
+### Data Quality Drives Agent Quality
+
+The agent makes decisions based on metrics and image statistics.
+**Richer, more accurate data = better autonomous decisions.**
+
+This applies everywhere:
+- EXIF extraction (T01) — all maker notes, not just basic tags
+- Image analysis (T20) — every meaningful statistical metric exposed
+- Siril stdout parsing (`_siril.py`) — extract all parseable values
+
+### Agentic Ethos Over Rigid Heuristics
+
+The system gives the agent tools — the same tools a skilled human would use —
+and lets it decide how and when to use them. Prescriptive checklists and
+hardcoded heuristics are failures of system design, not features. The prompt
+should be minimal; the tools and data should do the work.
+
+---
+
 ## 1  Scope & Constraints
 
 
@@ -64,6 +108,39 @@ choices via A/B variant selection.
 | **Planner-Tool Loop**       | ReAct cycle for linear and non-linear processing. The LLM observes image metrics (text only), reasons, selects a tool, evaluates the result, and loops. Visual context reaches the agent only via HITL responses. |
 | **HITL Interrupt**          | Hard-wired, auto-triggered, and on-demand pause points where previews are generated and the photographer provides visual assessment or feedback.    |
 
+
+---
+
+## 2.5  Session Startup — Mandatory Human Context
+
+Before the pipeline starts, the CLI collects a minimal set of human-provided
+context that shapes every subsequent decision. This information cannot be
+derived from pixel data, EXIF, or plate-solve results — it is the photographer's
+knowledge of the subject and session.
+
+```
+$ astro_agent process /path/to/dataset \
+    --target "M42 Orion Nebula"   \    ← REQUIRED (will prompt if omitted)
+    --bortle 4                    \    ← REQUIRED (will prompt if omitted)
+    --sqm 20.8                    \    ← optional: SQM-L reading in mag/arcsec²
+    --remove-stars ask            \    ← ask | yes | no (default: ask)
+    --notes "L-eNhance duoband, 5-min subs, mediocre seeing"  ← optional
+    --profile balanced                 ← conservative | balanced | aggressive
+```
+
+These four fields form the `SessionContext` stored at `state.session` and are
+injected verbatim into every planner call via `build_state_summary()`. The
+three-way `remove_stars` flag prevents the agent from making a star-processing
+decision silently — `ask` routes to a HITL question ("Do you want to process
+stars separately? This separates nebulosity from stars for independent
+enhancement.") when the agent is ready to call T15.
+
+**Why target name is required:** A frontier LLM already holds deep knowledge
+about M42, M31, NGC 7000, the Milky Way core, etc. — their colour palettes,
+angular extents, characteristic processing challenges, and what "good" looks
+like. Providing the name unlocks that knowledge directly. Without it, the
+agent can still reason from T20 metrics, but naming the target is the highest-
+leverage single input.
 
 ---
 
@@ -138,7 +215,42 @@ Utility tools available at any phase (agent-callable):
 from typing import TypedDict, Annotated
 from langgraph.graph.message import add_messages
 
+class SessionContext(TypedDict):
+    """
+    Human-provided context collected before the pipeline starts.
+    These four fields are the upfront knowledge that shapes the entire run.
+    Injected into every planner call via build_state_summary().
+
+    target_name   — Required. "M42 Orion Nebula", "NGC 7000 North America",
+                    "M31 Andromeda", "Milky Way core". Single most impactful
+                    context: a frontier LLM already knows what M42 looks like,
+                    its colour palette, angular scale, and typical processing
+                    decisions. Naming the target unlocks all of that knowledge.
+
+    bortle        — Bortle scale of the imaging site (1-9). Directly informs:
+                      gradient removal aggressiveness (high Bortle → larger gradient)
+                      noise reduction strength (high Bortle → more passes)
+                      stretch conservatism (high Bortle → preserve faint structure)
+
+    remove_stars  — True = run T15+T19; False = skip entirely;
+                    None = ask via HITL when the agent reaches that decision.
+
+    notes         — Free-text session notes. Injected verbatim into every
+                    planner prompt. Use for anything relevant but uncaptured:
+                      "Shot with Optolong L-eNhance duoband filter"
+                      "Very poor seeing — FWHM likely > 4px"
+                      "Prioritise faint outer nebulosity over star cores"
+    """
+    target_name:  str          # required
+    bortle:       int          # required: 1–9 Bortle scale
+    sqm_reading:  float | None # optional: SQM-L reading in mag/arcsec² (e.g. 20.8)
+    remove_stars: bool | None  # True/False/None=ask via HITL
+    notes:        str | None   # optional free-text
+
 class AstroState(TypedDict):
+    # Human-provided upfront context — available to every node from step 1
+    session: SessionContext
+
     # -- Core --
     dataset: Dataset
     phase: ProcessingPhase
@@ -202,11 +314,14 @@ class AcquisitionMeta(TypedDict):
     target_name: str | None
     focal_length_mm: float | None
     pixel_size_um: float | None
-    iso: int | None
-    gain: int | None
+    exposure_time_s: float | None      # per-frame exposure in seconds
+    iso: int | None                    # DSLR/mirrorless ISO
+    gain: int | None                   # dedicated astro camera gain (ADU)
+    filter: str | None                 # filter name (FITS FILTER keyword or None for RAW)
     bortle: int | None
     camera_model: str | None
     telescope: str | None
+    input_format: str | None           # "fits" | "raw" — set by T01, read by T03
 ```
 
 ### 4.3 ProcessingPhase
@@ -296,21 +411,44 @@ All tools write outputs to the working directory and return paths to the new fil
 
 #### T01 — `ingest_dataset`
 
-**Purpose:** Scan a directory tree, classify files by type (light/dark/flat/bias)
-using FITS headers (IMAGETYP, FRAME, EXPTIME), extract acquisition metadata,
-and populate the Dataset schema.
+**Purpose:** Scan a directory tree, classify files by type (light/dark/flat/bias),
+extract acquisition metadata, and populate the Dataset schema.
 
-**Backend:** Python — `astropy.io.fits` header parsing, `pathlib` directory walk.
+Supports two ingestion paths determined by the files found under
+`root_directory`:
+
+- **FITS path** (`*.fits`, `*.fit`, `*.fts`): classify by `IMAGETYP` /
+  `FRAME` header; extract metadata from standard FITS keywords (`EXPTIME`,
+  `FOCALLEN`, `XPIXSZ`, `GAIN`, `OBJECT`, `TELESCOP`, `FILTER`).
+- **Camera RAW path** (`*.raf`, `*.cr2`, `*.cr3`, `*.arw`, `*.nef`, etc.):
+  classify by subdirectory name (`lights/`, `darks/`, `flats/`, `bias/`);
+  extract metadata via `pyexiftool` / `exiftool` binary (`ExposureTime`,
+  `FocalLength`, `ISO`, `Model`). Siril reads RAW files natively and
+  performs CFA debayering during calibration.
+
+Both paths return the same `Dataset` schema. The detected format is stored in
+`AcquisitionMeta.input_format` so downstream tools can set CFA flags
+appropriately.
+
+**Backend:** Python — `pathlib` directory walk; `astropy.io.fits` for FITS
+headers; `pyexiftool` (wrapping the `exiftool` system binary) for camera RAW
+EXIF tags. ExifTool is the gold standard for RAW metadata — it handles every
+format (RAF, CR2, ARW, NEF, etc.) and reads Fujifilm proprietary maker notes
+that other libraries miss. Install: `brew install exiftool`.
 
 **Inputs:**
 
 ```json
 {
   "root_directory": "str",
-  "file_pattern": "str = '*.fits'",
+  "file_pattern": "str | null = null",
   "override_target_name": "str | null"
 }
 ```
+
+`file_pattern` is optional. When `null`, T01 auto-detects format by scanning
+for known FITS and RAW extensions. Pass an explicit glob (e.g. `"*.fits"` or
+`"*.RAF"`) to force a specific format.
 
 **Outputs:**
 
@@ -323,15 +461,21 @@ and populate the Dataset schema.
     "darks_count": "int",
     "flats_count": "int",
     "biases_count": "int",
-    "total_exposure_s": "float"
+    "total_exposure_s": "float",
+    "input_format": "fits | raw",
+    "detected_extensions": ["str"]
   }
 }
 ```
 
 **Agent notes:** Always the first tool called. If `biases_count` or
-`darks_count` is 0, the agent must adapt the calibration strategy (e.g. use
-synthetic bias offset, skip dark subtraction if sensor has negligible dark
-current).
+`darks_count` is 0, adapt the calibration strategy (e.g. use synthetic bias
+offset, skip dark subtraction if sensor has negligible dark current). Check
+`input_format` and pass `is_cfa = true` to T03 when `input_format == "raw"`.
+For RAW input, classification relies on subdirectory names — warn the user if
+files are found in an unrecognized directory (not `lights/`, `darks/`,
+`flats/`, or `bias/`). `override_target_name` sets `AcquisitionMeta.target_name`
+when the object cannot be determined from headers or filename.
 
 ---
 
@@ -419,10 +563,12 @@ calibrate lights -bias=master_bias -dark=master_dark -flat=master_flat
 }
 ```
 
-**Agent notes:** Set `is_cfa = true` for OSC/DSLR cameras. Enable
-`optimize_dark` when dark frames were shot at a slightly different temperature
-than lights. Set `equalize_cfa = true` to prevent color tinting from flat
-field correction on CFA sensors.
+**Agent notes:** Set `is_cfa = true` when `AcquisitionMeta.input_format == "raw"`
+or when the input is an OSC/DSLR camera. For Fujifilm X-Trans sensors (e.g.
+X-T30 II, X-T4), Siril handles the non-Bayer CFA pattern internally — set
+`equalize_cfa = true` to prevent the color tinting that X-Trans sensors are
+particularly prone to. Enable `optimize_dark` when dark frames were shot at a
+slightly different temperature than lights.
 
 ---
 
@@ -685,10 +831,19 @@ dependency on Siril's GraXpert preferences configuration.
 
 ```
 # GraXpert (direct subprocess — preferred)
-$GRAXPERT_BIN <image> -cli -cmd background-extraction -output <out> -correction <subtraction|division>
+# Models: bge-ai-models/1.0.1/model.onnx (cached in ~/Library/Application Support/GraXpert/)
+# CoreML acceleration active on Apple Silicon
+$GRAXPERT_BIN <image> -cli -cmd background-extraction \
+  -output <out.fits> \
+  -correction <Subtraction|Division> \
+  -smoothing <0.0–1.0> \
+  -ai_version 1.0.1 \
+  [-bg]          # also save the background model as a separate file
 
-# Siril (fallback)
-subsky -rbf -samples=25 -tolerance=1.0 -smooth=0.5
+# Siril (fallback) — verified Siril 1.4 syntax:
+subsky -rbf [-dither] -samples=25 -tolerance=1.0 -smooth=0.5
+# or polynomial:
+subsky <degree=4> [-dither] -samples=25 -tolerance=1.0
 ```
 
 **Inputs:**
@@ -699,14 +854,18 @@ subsky -rbf -samples=25 -tolerance=1.0 -smooth=0.5
   "image_path": "str",
   "backend": "graxpert | siril",
   "graxpert_options": {
-    "correction_type": "subtraction | division"
+    "correction_type": "Subtraction | Division",
+    "smoothing": "float = 0.5",
+    "save_background_model": "bool = true",
+    "ai_version": "str = 1.0.1"
   },
   "siril_options": {
     "model": "rbf | polynomial",
     "polynomial_degree": "int = 4",
     "samples_per_line": "int = 25",
     "tolerance": "float = 1.0",
-    "smoothing": "float = 0.5"
+    "smoothing": "float = 0.5",
+    "dither": "bool = false"
   }
 }
 ```
@@ -738,13 +897,13 @@ grey) and optionally spectrophotometric calibration.
 **Backend:** Siril CLI — `pcc` or `spcc` (requires plate-solved image).
 
 ```
-# PCC
-platesolve -focal=<fl> -pixelsize=<px>
-pcc -catalog=nomad
+# PCC (coords are positional, must come before named flags)
+platesolve [ra dec] -focal=<fl> -pixelsize=<px>
+pcc -catalog=gaia [-limitmag=+2] [-bgtol=-2.8,2.0]
 
 # SPCC (more accurate, models atmospheric extinction)
-platesolve -focal=<fl> -pixelsize=<px>
-spcc -oscsensor=<sensor> [-atmos]
+platesolve [ra dec] -focal=<fl> -pixelsize=<px>
+spcc -oscsensor=<sensor> [-oscfilter=<filter>] [-atmos] [-limitmag=+2] [-bgtol=-2.8,2.0]
 ```
 
 **Inputs:**
@@ -758,12 +917,14 @@ spcc -oscsensor=<sensor> [-atmos]
   "pixel_size_um": "float",
   "target_coords": { "ra": "float | null", "dec": "float | null" },
   "catalog": "nomad | apass | gaia | localgaia",
+  "limitmag": "str | null  (e.g. '+2', '-1', '12' — adjusts star magnitude limit)",
+  "bgtol_lower": "float | null  (background rejection lower sigma, default -2.8)",
+  "bgtol_upper": "float | null  (background rejection upper sigma, default 2.0)",
   "spcc_options": {
     "sensor_name": "str | null",
     "filter_name": "str | null",
     "atmospheric_correction": "bool = false"
-  },
-  "background_tolerance": { "lower": "float = -2.8", "upper": "float = 2.0" }
+  }
 }
 ```
 
@@ -839,11 +1000,17 @@ after stacking). A milder second pass may optionally be applied post-stretch.
 or SOS boosting), or GraXpert CLI denoising.
 
 ```
-# Siril
-denoise [-mod=0.8] [-da3d]
+# Siril (primary) — verified Siril 1.4 syntax:
+denoise [-mod=0.9] [-da3d | -sos=3] [-vst] [-indep] [-nocosmetic]
 
-# GraXpert
-graxpert <image> -cli -cmd denoising -output <out>
+# GraXpert (alternative)
+# Models: denoise-ai-models/2.0.0/model.onnx (cached in ~/Library/Application Support/GraXpert/)
+# Strength is not a direct CLI flag — controlled via a temp preferences JSON
+# passed with -preferences_file. Default strength = 0.5 (0.0–1.0).
+$GRAXPERT_BIN <image> -cli -cmd denoising \
+  -output <out.fits> \
+  -ai_version 2.0.0 \
+  -preferences_file <temp_prefs.json>
 ```
 
 **Inputs:**
@@ -857,11 +1024,13 @@ graxpert <image> -cli -cmd denoising -output <out>
     "modulation": "float = 0.9",
     "method": "standard | da3d | sos",
     "sos_iterations": "int = 3",
-    "cosmetic_first": "bool = true",
-    "independent_channels": "bool = false"
+    "independent_channels": "bool = false",
+    "use_vst": "bool = false  (Anscombe variance-stabilizing transform; standard method only)",
+    "apply_cosmetic": "bool = true  (false maps to -nocosmetic flag)"
   },
   "graxpert_options": {
-    "strength": "float = 0.5"
+    "strength": "float = 0.5",
+    "ai_version": "str = 2.0.0"
   }
 }
 ```
@@ -897,8 +1066,25 @@ verify noise reduction without signal loss.
 deconvolution). PSF estimated via `makepsf` or loaded from star analysis.
 
 ```
-makepsf -auto [-save=psf.fits]
-rl -loadpsf=psf.fits -iters=15 -tv -alpha=3000
+# PSF from detected stars (preferred — most accurate for astrophotography)
+makepsf stars [-sym]
+rl -iters=15 -tv -alpha=3000 [-stop=1e-5]
+
+# Blind PSF fallback (use when star count is low)
+makepsf blind
+rl -iters=10 -tv -alpha=3000
+
+# Manual PSF — Moffat (accurate for atmospheric seeing, preferred over Gaussian)
+makepsf manual -moffat -fwhm=2.5 -beta=3.5
+rl -iters=15 -tv -alpha=3000
+
+# Manual PSF — Airy (theoretical diffraction limit for known telescope optics)
+makepsf manual -airy -dia=130 -fl=910 -wl=525 -pixelsize=3.77
+rl -iters=15 -fh -alpha=3000
+
+# Wiener alternative
+makepsf stars
+wiener -alpha=0.001
 ```
 
 **Inputs:**
@@ -908,12 +1094,25 @@ rl -loadpsf=psf.fits -iters=15 -tv -alpha=3000
   "working_dir": "str",
   "image_path": "str",
   "method": "richardson_lucy | wiener",
-  "psf_source": "auto | from_file",
+  "psf_source": "stars | blind | manual | from_file",
   "psf_file": "str | null",
+  "makepsf_manual_options": {
+    "profile": "moffat | gaussian | airy | disc",
+    "fwhm_px": "float | null  (measure from analyze_image star metrics)",
+    "moffat_beta": "float = 3.5  (wing shape; 2.0 poor seeing – 5.0 excellent)",
+    "aspect_ratio": "float = 1.0  (1.0 = circular; <1.0 = elongated)",
+    "angle_deg": "float = 0.0",
+    "airy_diameter_mm": "float | null  (telescope aperture)",
+    "airy_focal_length_mm": "float | null",
+    "airy_wavelength_nm": "float = 525.0",
+    "airy_obstruction_pct": "float = 0.0",
+    "symmetric": "bool = false  (force circular PSF from stars: makepsf stars -sym)"
+  },
   "rl_options": {
     "iterations": "int = 10",
-    "regularization": "total_variation | frobenius | none",
-    "alpha": "float = 3000",
+    "regularization": "total_variation | hessian_frobenius | none",
+    "alpha": "float = 3000  (lower = less regularization = sharper but more ringing)",
+    "stop": "float | null  (early stopping residual threshold, e.g. 1e-5)",
     "use_multiplicative": "bool = false"
   },
   "wiener_options": {
@@ -927,16 +1126,24 @@ rl -loadpsf=psf.fits -iters=15 -tv -alpha=3000
 ```json
 {
   "sharpened_image_path": "str",
-  "psf_fwhm_used": "float"
+  "psf_source": "str",
+  "psf_profile": "str | null",
+  "psf_fwhm_used": "float",
+  "regularization": "str",
+  "stop_criterion": "float | null"
 }
 ```
 
 **Agent notes:** Deconvolution is optional and should only be attempted when
 SNR is adequate (`snr_estimate > 50`). Over-deconvolution creates ringing
-artifacts. Richardson-Lucy with Total Variation regularization (`-tv`) is the
-safest choice. Always run `analyze_image` afterward to check for artifacts.
-Must be done in linear space. The agent should start conservative (5-10
-iterations) and increase only if the result shows improvement without ringing.
+artifacts. Richardson-Lucy with `regularization=total_variation` (`-tv`) is the
+safest choice. `hessian_frobenius` (`-fh`) preserves sharp linear features
+(galaxy spiral arms, nebula filaments) better than TV, but with higher ringing
+risk — use only at high SNR. Use `stop=1e-5` to prevent over-iterating in
+automation. The `manual` PSF source with `profile=moffat` is preferred when
+the star field is sparse or when you know the seeing FWHM from `analyze_image`
+star metrics. Use `profile=airy` only when telescope parameters are precisely
+known and seeing is excellent. Must be done in linear space.
 
 ---
 
@@ -1139,12 +1346,18 @@ color casts. The agent may apply multiple passes with different settings.
 #### T17 — `local_contrast_enhance`
 
 **Purpose:** Enhance fine detail and local contrast in nebulosity and galaxy
-structure without affecting global brightness.
+structure without affecting global brightness. Four methods, each optimal
+for different enhancement goals.
 
-**Backend:** Siril CLI — `clahe` (adaptive histogram equalization), `unsharp`
-(unsharp mask), or `wavelet` + `wrecons` (multi-scale wavelet sharpening).
+**Backend:** Siril CLI — `epf` (edge-preserving bilateral/guided filter),
+`clahe` (adaptive histogram equalization), `unsharp` (unsharp mask), or
+`wavelet` + `wrecons` (multi-scale wavelet sharpening).
 
 ```
+# Edge-preserving bilateral filter (structure-safe noise smoothing)
+# For 32-bit FITS: si/ss should be 0–1 range
+epf [-guided] [-d=5] -si=0.02 -ss=0.02 -mod=0.8 [-guideimage=<stem>]
+
 # CLAHE
 clahe 2.0 8
 
@@ -1162,7 +1375,15 @@ wrecons 1.2 1.1 1.0 1.0 1.0 1.0
 {
   "working_dir": "str",
   "image_path": "str",
-  "method": "clahe | unsharp | wavelet",
+  "method": "edge_preserve | clahe | unsharp | wavelet",
+  "epf_options": {
+    "guided": "bool = false  (false=bilateral, true=guided filter)",
+    "diameter": "int = 5  (filter kernel size; 0=auto from spatial_sigma)",
+    "intensity_sigma": "float = 0.02  (0–1 range for 32-bit FITS; tonal smoothing radius)",
+    "spatial_sigma": "float = 0.02  (0–1 range for 32-bit FITS; spatial smoothing radius)",
+    "mod": "float = 0.8  (blend: 1.0=full filter, 0.0=no effect)",
+    "guide_image_stem": "str | null  (guided filter only; null=self-guided)"
+  },
   "clahe_options": {
     "clip_limit": "float = 2.0",
     "tile_size": "int = 8"
@@ -1183,18 +1404,24 @@ wrecons 1.2 1.1 1.0 1.0 1.0 1.0
 
 ```json
 {
-  "enhanced_image_path": "str"
+  "enhanced_image_path": "str",
+  "method": "str"
 }
 ```
 
-**Agent notes:** Apply to starless image only. CLAHE is effective for
-revealing faint structure but can amplify noise — pair with prior noise
-reduction. Unsharp mask is gentler and good for mild detail enhancement.
-Wavelet sharpening gives the most control: boost fine-scale layers (1-2)
-while leaving coarse layers (4-5) untouched. Start with conservative settings
-and iterate. This is a subjective step and a good HITL checkpoint. The agent
-should generate an enhanced variant alongside the unmodified version for
-comparison.
+**Agent notes:** Apply to starless image only.
+
+`edge_preserve` (epf) is the recommended first pass: the bilateral filter
+smooths noise in flat areas while respecting sharp edges — this is
+PixInsight-tier structure-safe processing. Excellent for cleaning residual
+noise in background/faint nebula regions after NL-Bayes. Use `mod=0.6–0.9`
+for blended effect. Self-guided (`guided=False`) works for most images.
+
+CLAHE is effective for revealing faint structure but amplifies noise — always
+apply after noise reduction and optionally after edge_preserve.
+
+Wavelet sharpening gives surgical per-scale control: boost fine-scale layers
+(1-2) while leaving coarse layers (3+) at 1.0. Start conservative (1.1–1.3×).
 
 ---
 
@@ -1349,21 +1576,33 @@ star detection and advanced metrics.
   },
   "noise": {
     "background_noise": "float",
-    "method": "MAD"
+    "method": "siril_bgnoise_MAD"
   },
   "background": {
     "median": "float",
     "flatness_score": "float",
-    "gradient_magnitude": "float"
+    "gradient_magnitude": "float",
+    "per_channel_bg": {
+      "red": "float", "green": "float", "blue": "float",
+      "n_background_pixels": "int"
+    }
   },
   "stars": {
     "count": "int",
     "median_fwhm": "float",
-    "median_roundness": "float"
+    "median_roundness": "float",
+    "fwhm_std": "float",
+    "median_star_peak_ratio": "float"
   },
   "dynamic_range_db": "float",
   "snr_estimate": "float",
-  "is_linear_estimate": "bool",
+  "linearity": {
+    "is_linear": "bool",
+    "confidence": "high | medium | low",
+    "histogram_skewness": "float",
+    "median_brightness": "float"
+  },
+  "signal_coverage_pct": "float",
   "clipping": {
     "shadows_pct": "float",
     "highlights_pct": "float"
@@ -1371,26 +1610,46 @@ star detection and advanced metrics.
   "color_balance": {
     "green_excess": "float",
     "channel_imbalance": "float"
-  }
+  },
+  "color": {
+    "mean_saturation": "float",
+    "median_saturation": "float",
+    "high_saturation_pct": "float"
+  },
+  "histogram": {
+    "red":   { "p1": "float", "p5": "float", "p25": "float", "p50": "float",
+               "p75": "float", "p95": "float", "p99": "float" },
+    "green": { "..." },
+    "blue":  { "..." }
+  },
+  "image_shape": ["int"],
+  "is_color": "bool"
 }
 ```
 
 **Agent decision map:**
 
-
-| Metric                                        | Threshold             | Implies                                                          |
-| --------------------------------------------- | --------------------- | ---------------------------------------------------------------- |
-| `gradient_magnitude > 0.05`                   | High                  | Run `remove_gradient`                                            |
-| `green_excess > 0.02`                         | Noticeable            | Run `remove_green_noise`                                         |
-| `snr_estimate < 30`                           | Low                   | Skip `deconvolution`                                             |
-| `background.flatness_score < 0.9`             | Uneven                | Re-run gradient removal                                          |
-| `clipping.shadows_pct > 1.0`                  | Over-clipped          | Reduce stretch aggressiveness                                    |
-| `stars.median_fwhm > 4.0`                     | Bloated (pre-stretch) | Investigate registration / optics                                |
-| `stars.median_fwhm > 3.0`                     | Bloated (post-stretch)| Run `reduce_stars` after restoration (T26)                       |
-| `noise.background_noise` increased after step | Degraded              | Revert or adjust parameters                                      |
-| Any step where global effect harms a region   | Spatial conflict      | Run `create_mask` (T25) then blend via `pixel_math` (T23)        |
-| Nebula detail lacking after `curves_adjust`   | Needs targeted sharp  | Run `multiscale_process` (T27): sharpen scales 2–3 with mask     |
-| Noise visible in dark sky after processing    | Background noise amp  | Run `multiscale_process` (T27): denoise scales 1–2 with inv-lum mask |
+| Metric                                              | Threshold               | Implies                                                               |
+| --------------------------------------------------- | ----------------------- | --------------------------------------------------------------------- |
+| `background.gradient_magnitude > 0.05`              | High gradient           | Run `remove_gradient`                                                 |
+| `background.flatness_score < 0.9`                   | Uneven sky              | Re-run gradient removal or increase polynomial degree                 |
+| `background.per_channel_bg` — spread > 0.02         | Unbalanced sky color    | Re-run `color_calibrate` or apply manual `pixel_math` neutralization  |
+| `color_balance.green_excess > 0.02`                 | Green cast              | Run `remove_green_noise`                                              |
+| `snr_estimate < 30`                                 | Low SNR                 | Skip or defer `deconvolution`                                         |
+| `stars.median_fwhm > 4.0 px` (pre-stretch)          | Bloated PSF             | Investigate registration / optics                                     |
+| `stars.fwhm_std > 1.5 px`                           | Non-uniform PSF         | Use `makepsf manual` (Moffat) with measured FWHM for T13              |
+| `stars.median_star_peak_ratio > 50`                 | Star-dominated frame    | Run `reduce_stars` (T26) post-stretch to balance star/nebula ratio    |
+| `clipping.shadows_pct > 1.0`                        | Over-clipped blacks     | Reduce stretch aggressiveness; adjust `black_point`                   |
+| `linearity.is_linear` (high confidence)             | Linear image            | Only linear-phase tools (T09–T13) are valid                           |
+| `linearity.is_linear = False` (high confidence)     | Stretched image         | Only non-linear tools (T14–T19, T25–T27) are valid                   |
+| `signal_coverage_pct < 5`                           | Sparse target           | Conservative T09 (low polynomial degree); light T17/T27 passes       |
+| `signal_coverage_pct > 30`                          | Nebula/Milky Way fill   | T09 risk of nebula subtraction is higher; use GraXpert AI model       |
+| `color.mean_saturation < 0.10` (post-stretch)       | Desaturated colors      | Run `saturation_adjust` (T18); increase boost significantly            |
+| `color.mean_saturation > 0.40` (post-boost)         | Risk of over-saturation | Reduce T18 boost; protect background with mask                       |
+| `noise.background_noise` increased after step       | Processing degraded SNR | Revert or adjust tool parameters                                      |
+| Any step where global effect harms a region         | Spatial conflict        | Run `create_mask` (T25) then blend via `pixel_math` (T23)             |
+| Nebula detail lacking after `curves_adjust`         | Needs targeted sharpness| Run `multiscale_process` (T27): sharpen scales 2–3 with nebula mask   |
+| Noise visible in dark sky after processing          | Background noise amp    | Run `multiscale_process` (T27): denoise scales 1–2 with inv-lum mask  |
 
 
 ---
@@ -1473,12 +1732,16 @@ visualization without modifying the FITS data.
 }
 ```
 
-**Agent notes:** The agent calls this frequently to "see" the current image
-state through its vision capabilities. For linear images, always set
-`auto_stretch_linear = true` — otherwise the preview will appear black.
-Use `annotation` to label variants (e.g. "Variant A: Gentle Stretch").
-Keep preview width moderate (1920px) for fast LLM inference without losing
-diagnostic detail.
+**Internal use only.** This is not a `@tool`-decorated function and must not
+appear in any `PHASE_TOOLS` list. It is called exclusively by:
+  1. `auto_hitl_check()` in the tool executor post-hook (after tools with
+     `requires_visual_review=True`).
+  2. The mandatory HITL nodes (`stretch_hitl`, `final_hitl`).
+
+For linear images, always set `auto_stretch_linear = true` — otherwise the
+preview will appear black. Use `annotation` to label variants for HITL
+comparison (e.g. "Variant A: Gentle Stretch"). Preview generation must never
+happen in the planner path — the planner's context is text-only metrics.
 
 ---
 
@@ -1547,7 +1810,7 @@ savejpg result_web 95
     {
       "type": "tiff16 | tiff8 | jpg | png",
       "quality": "int = 95",
-      "icc_profile": "sRGB | AdobeRGB | Rec2020 | null",
+      "icc_profile": "sRGB | sRGBlinear | Rec2020 | Rec2020linear | null",
       "filename_suffix": "str = ''"
     }
   ]
@@ -1797,26 +2060,30 @@ artifact-free astrophotography processing.
 **Backend:** Python — PyWavelets + scikit-image + Astropy.
 
 ```python
-import pywt                                                  # à trous / SWT transform
+from scipy.ndimage import convolve                           # B3-spline à trous kernel
 from astropy.io.fits import open as fits_open, writeto as fits_write
-from skimage.restoration import denoise_wavelet              # BayesShrink / VisuShrink
-from skimage.filters import gaussian                         # scaling function for à trous
 import numpy as np
+# B3-spline kernel: [1/16, 4/16, 6/16, 4/16, 1/16]
+# Applied separably at each scale with stride=2^i (à trous = "with holes")
 ```
 
 The algorithm:
 1. Load FITS as float32 array. If color, operate on luminance channel only
    (unless `per_channel=True`).
-2. Compute the à trous wavelet decomposition: `pywt.swt2(data, wavelet, level=num_scales)`.
-   Each level yields a detail layer (wavelet coefficients at that scale) and
-   a residual.
+2. Compute the B3-spline à trous wavelet decomposition using
+   `scipy.ndimage.convolve` with the B3 spline kernel `[1/16, 4/16, 6/16, 4/16, 1/16]`
+   applied separably at each scale with inter-scale hole-filling (stride=2^i).
+   Each level yields an isotropic detail layer and a residual approximation.
+   Note: PyWavelets does NOT have a `'b3'` wavelet — use the custom B3 atrous
+   implementation via `scipy.ndimage.convolve`, not `pywt.swt2`.
 3. Per scale, apply the specified operation to the detail coefficients:
    - `sharpen`: multiply coefficients by `weight` (e.g. 1.3 = 30% boost).
-   - `denoise`: apply `skimage.restoration.denoise_wavelet` thresholding
-     with `denoise_sigma` to the coefficient array.
+   - `denoise`: apply MAD-normalized soft thresholding: threshold is computed
+     as `denoise_sigma * median(|coeffs|) / 0.6745`, then coefficients are
+     soft-thresholded: `sign(c) * max(|c| - threshold, 0)`.
    - `suppress`: zero the coefficients (remove this scale's contribution).
    - `passthrough`: leave coefficients unchanged.
-4. Reconstruct via `pywt.iswt2()`.
+4. Reconstruct by summing all detail layers plus the final approximation residual.
 5. If `mask_path` supplied: blend reconstructed result with original image
    via T25-style mask so operations are confined to the masked region.
 6. Write result as FITS.
@@ -1837,7 +2104,7 @@ The algorithm:
       "denoise_method": "BayesShrink | VisuShrink"
     }
   ],
-  "wavelet": "str = 'b3'",
+  "wavelet": "str = 'b3spline'",
   "mask_path": "str | null",
   "per_channel": "bool = false",
   "output_stem": "str | null"
@@ -1872,11 +2139,12 @@ The algorithm:
 
 **Agent notes:**
 
-- The `'b3'` wavelet (B³-spline, also called the "starlet") is the correct
-  choice for astrophotography. It is symmetric, produces no ringing, and is
-  the same basis used by PixInsight MLT, NoiseXterminator, and most
-  professional astro denoising tools. Do not substitute with `'haar'` or
-  `'db4'` — they will introduce ringing artifacts.
+- The B³-spline (starlet, `wavelet='b3spline'`) is always used internally.
+  PyWavelets has no `'b3'` wavelet — the implementation uses a custom à trous
+  algorithm via `scipy.ndimage.convolve` with the `[1/16, 4/16, 6/16, 4/16, 1/16]`
+  kernel applied separably with stride=2^i per scale. This is symmetric,
+  produces no ringing, and is the same basis as PixInsight MLT. The `wavelet`
+  parameter is reserved but currently ignored; only B3 spline is supported.
 - **Standard non-linear sharpening recipe** (apply on starless image with
   nebula luminance mask from T25):
   ```
@@ -1910,6 +2178,75 @@ The algorithm:
 - T27 complements T17 `local_contrast_enhance` (which uses Siril's `wavelet`):
   use T17 for coarse global wavelet boosts; use T27 when you need per-scale
   control and/or mask-protected application.
+
+---
+
+#### T28 — `extract_narrowband`
+
+**Purpose:** Extract narrowband signal channels (Hα, O-III, Green) from a CFA
+(Bayer mosaic) image captured through a narrowband or duoband filter. Enables
+the OSC dual-narrowband workflow for color cameras (e.g. Fujifilm X-T30 II +
+Optolong L-eNhance or L-Ultimate) without a dedicated mono camera.
+
+**Backend:** Siril CLI — `extract_Ha`, `extract_HaOIII`, `extract_Green`.
+
+**IMPORTANT:** Input must be a CFA (non-debayered) FITS. T03 must be run with
+`debayer=False` to produce CFA calibrated frames. The FITS header must contain
+the `BAYER_PATTERN` keyword for Siril to correctly identify Bayer pixel layout.
+
+**Dual-narrowband OSC workflow:**
+1. Capture lights through a duoband filter. Keep calibrated frames as CFA.
+2. Call `extract_Ha` or `extract_HaOIII` to split into Hα (red Bayer pixels)
+   and O-III (blue Bayer pixels).
+3. Register (T04) and stack (T07) each channel independently.
+4. Process each stack with T12 (noise reduction) and T27 (multiscale detail).
+5. Combine via T23 `pixel_math` using HOO or SHO palette:
+   - HOO (natural nebula): `R=$Ha$ G=$OIII$ B=$OIII$`
+   - SHO (Hubble): `R=$Ha$ G=0.3*$Ha$+0.7*$OIII$ B=$OIII$`
+
+```
+# Extract Hα and O-III simultaneously (recommended for duoband)
+extract_HaOIII [-resample=oiii]  # -resample=oiii to equalize sizes
+
+# Extract Hα only
+extract_Ha [-upscale]
+
+# Extract green continuum (diagnostic)
+extract_Green
+```
+
+**Inputs:**
+
+```json
+{
+  "working_dir": "str",
+  "image_path": "str  (CFA FITS — not debayered)",
+  "extraction_type": "ha | ha_oiii | green",
+  "upscale_ha": "bool = false  (-upscale: 2x upsample Ha to full sensor resolution)",
+  "resample": "null | 'ha' | 'oiii'  (-resample= to equalize Ha and OIII output sizes)"
+}
+```
+
+**Outputs:**
+
+```json
+{
+  "ha_path": "str | null",
+  "oiii_path": "str | null",
+  "green_path": "str | null",
+  "extraction_type": "str",
+  "next_steps": "str"
+}
+```
+
+**Agent notes:** This tool is the entry point for all OSC narrowband workflows.
+Use `extraction_type=ha_oiii` with `resample=oiii` for duoband captures so
+both channels have equal dimensions after extraction. The `green` extraction is
+mainly diagnostic — it isolates the pure continuum channel. After extraction,
+run T04+T07 for each channel separately (two independent registration+stacking
+pipelines), then converge with T23 `pixel_math` for palette combination.
+The `resample` option is important: without it, the O-III image has 2× the
+dimensions of the Hα image (since O-III uses 3 of 4 Bayer pixels vs 1 for Hα).
 
 ---
 
@@ -2818,6 +3155,8 @@ every operation for auditability.
 | StarNet++         | 2.0         | Star removal neural network                            | Yes         |
 | Python            | 3.11+       | Agent runtime, Astropy, Photutils                      | Yes         |
 | Astropy           | 6.0+        | FITS I/O, WCS, header parsing                          | Yes         |
+| ExifTool          | 12.0+       | EXIF/metadata extraction from all camera RAW formats (T01). Install: `brew install exiftool` | Yes |
+| pyexiftool        | 0.5.6+      | Python wrapper for ExifTool binary (T01)               | Yes         |
 | Photutils         | 2.0+        | Star detection, PSF analysis                           | Yes         |
 | scikit-image      | 0.22+       | Mask generation (T25), morphological star reduction (T26), wavelet processing (T27) | Yes |
 | PyWavelets (pywt) | 1.6+        | Undecimated (à trous) wavelet transform for T27 `multiscale_process` | Yes |

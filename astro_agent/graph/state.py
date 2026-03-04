@@ -97,14 +97,17 @@ class Metrics(TypedDict):
 
 
 class AcquisitionMeta(TypedDict):
-    target_name:     str | None
-    focal_length_mm: float | None
-    pixel_size_um:   float | None
-    iso:             int | None
-    gain:            int | None
-    bortle:          int | None
-    camera_model:    str | None
-    telescope:       str | None
+    target_name:      str | None
+    focal_length_mm:  float | None
+    pixel_size_um:    float | None
+    exposure_time_s:  float | None   # per-frame exposure in seconds
+    iso:              int | None     # DSLR/mirrorless ISO
+    gain:             int | None     # dedicated astro camera gain (ADU)
+    filter:           str | None     # filter name (FITS FILTER keyword; None for camera RAW)
+    bortle:           int | None
+    camera_model:     str | None
+    telescope:        str | None
+    input_format:     str | None     # "fits" | "raw" — set by T01, read by T03
 
 
 class FileInventory(TypedDict):
@@ -135,6 +138,66 @@ class ReportEntry(TypedDict):
     timestamp:      str          # ISO 8601
 
 
+# ── Session context (human-provided at startup) ────────────────────────────────
+
+class SessionContext(TypedDict):
+    """
+    Human-provided context collected before the pipeline starts.
+
+    This is the upfront knowledge that cannot be derived from pixel data or EXIF —
+    it shapes the entire processing run. Collected via CLI arguments or interactive
+    prompts before the agent's ReAct loop begins.
+
+    Fields:
+      target_name   — Required. The astronomical target name as the user knows it
+                      ("M42 Orion Nebula", "NGC 7000 North America", "M31 Andromeda",
+                       "Milky Way core"). This single piece of context informs the
+                      agent's domain knowledge about the expected appearance,
+                      angular size, colour palette, and appropriate processing
+                      intensity for the subject. A frontier LLM already knows what
+                      M42 looks like — naming it unlocks that knowledge.
+
+      bortle        — Required. Bortle scale of the imaging site (1–9).
+                      1–3 = rural dark sky, 4–5 = rural/suburban transition,
+                      6–7 = suburban, 8–9 = urban. Look up at
+                      lightpollutionmap.info if uncertain. Directly informs:
+                       - gradient removal aggressiveness (high → larger gradient)
+                       - noise reduction strength (high → more NL-Bayes passes)
+                       - stretch conservatism (high → preserve faint structure)
+
+      sqm_reading   — Optional. Sky Quality Meter reading in mag/arcsec²,
+                      taken with an SQM-L at the imaging site before the session.
+                      More precise than Bortle (continuous scale):
+                        ≥ 21.5 → Bortle 1–2, truly dark sky
+                        20.5–21.5 → Bortle 3–4, rural
+                        19.5–20.5 → Bortle 5–6, suburban transition
+                        < 19.5  → Bortle 7–9, suburban/urban
+                      When provided, the agent uses sqm_reading as the primary
+                      sky quality metric and bortle as a coarse cross-check.
+                      If you forget to take a reading, leave it None — bortle
+                      alone is sufficient.
+
+      remove_stars  — User intent for star processing:
+                       True  → run star_removal (T15) + star_restoration (T19)
+                       False → skip T15/T19 entirely
+                       None  → ask via HITL when the agent reaches that decision point
+                      Default None — the agent uses HITL to ask a simple yes/no.
+
+      notes         — Optional free-text session notes from the user. Injected into
+                      the system prompt at every ReAct cycle. Use for anything that
+                      affects processing but isn't captured elsewhere:
+                        "Shot with Optolong L-eNhance duoband filter"
+                        "Very poor seeing — FWHM likely > 4px"
+                        "10-min subs, ASI2600, gain 100"
+                        "Prioritise faint outer nebulosity over star quality"
+    """
+    target_name:  str          # required: "M42 Orion Nebula", "wide angle Milky Way core"
+    bortle:       int          # required: 1–9 Bortle scale (1=darkest, 9=city)
+    sqm_reading:  float | None # optional: SQM-L reading in mag/arcsec² (e.g. 20.8)
+    remove_stars: bool | None  # True/False/None=ask via HITL
+    notes:        str | None   # optional free-text session notes
+
+
 # ── HITL payload ───────────────────────────────────────────────────────────────
 
 class HITLPayload(TypedDict):
@@ -158,6 +221,9 @@ class HITLPayload(TypedDict):
 # ── Top-level graph state ──────────────────────────────────────────────────────
 
 class AstroState(TypedDict):
+    # Human-provided upfront context — available to every node from the first step
+    session: SessionContext
+
     # Core
     dataset:    Dataset
     phase:      ProcessingPhase
@@ -178,12 +244,16 @@ class AstroState(TypedDict):
 
 # ── Factory ────────────────────────────────────────────────────────────────────
 
-def make_empty_state(dataset: Dataset) -> AstroState:
+def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
     """
     Build a minimal valid AstroState for a new dataset.
     Called by make_initial_state() in cli.py after T01 ingest_dataset runs.
+
+    session is the human-provided startup context: target_name (required),
+    bortle (optional), remove_stars intent (optional), and free-text notes.
     """
     return AstroState(
+        session=session,
         dataset=dataset,
         phase=ProcessingPhase.INGEST,
         paths=PathState(

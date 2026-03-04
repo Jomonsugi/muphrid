@@ -18,8 +18,8 @@ Phase 11	Full run on real data. Final gate.
 
 The riskiest parts to get right before moving on:
 run_siril_script() (Phase 0) — everything Siril-based calls this. If output parsing is wrong here, every tool downstream is broken.
-T01 ingest_dataset — if file classification is wrong (misreading IMAGETYP headers), calibration will fail silently.
-T09 remove_gradient — GraXpert CLI invocation via Siril pyscript is not straightforward; get this working with real data before assuming it works.
+T01 ingest_dataset — for FITS: wrong IMAGETYP classification causes silent calibration failure. For camera RAW (current test data is Fujifilm RAF): classification relies on subdirectory names; EXIF extraction via `pyexiftool`/ExifTool must correctly parse `ExposureTime`, `FocalLength`, `ISO`, `Model`. The `input_format` field flows into T03's `is_cfa` flag.
+T09 remove_gradient — GraXpert direct subprocess invocation is confirmed working (v3.0.2, CoreML acceleration, bge-ai-models/1.0.1 cached locally). Key confirmed CLI flags: `-cli -cmd background-extraction -correction Subtraction -smoothing 0.5 -ai_version 1.0.1 [-bg]`. Denoising model 2.0.0 also cached (denoise-ai-models/2.0.0). GraXpert denoising strength is not a direct CLI flag — pass a temp preferences JSON via `-preferences_file`.
 Phase 7 tool executor post-hook — the auto-analyze + auto-HITL routing is the most architecturally novel part. Build it as a standalone unit, test the routing logic, then integrate.
 
 Schema	Type	Why
@@ -60,7 +60,7 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
 *Imported by every tool and graph node. Build before anything else.*
 
 - [x] **`graph/state.py` — all TypedDicts**
-  `AstroState`, `PathState`, `MasterPaths`, `Metadata`, `Metrics`, `Dataset`, `FileInventory`, `AcquisitionMeta`, `FrameMetrics`, `ReportEntry`, `HITLPayload` with correct `Annotated` reducers for `history` (append-only), `messages` (`add_messages`), and `processing_report` (append-only list of `ReportEntry`). `PathState` must include `latest_preview: str | None`. Spec: §4.
+  `AstroState`, `PathState`, `MasterPaths`, `Metadata`, `Metrics`, `Dataset`, `FileInventory`, `AcquisitionMeta`, `FrameMetrics`, `ReportEntry`, `HITLPayload`, **`SessionContext`** with correct `Annotated` reducers for `history` (append-only), `messages` (`add_messages`), and `processing_report` (append-only list of `ReportEntry`). `PathState` includes `latest_preview: str | None`. `SessionContext` holds human-provided startup context: `target_name` (required), `bortle`, `remove_stars`, `notes`. Injected into every planner call via `build_state_summary()`. Spec: §2.5, §4.
 
 - [x] **`ProcessingPhase` enum**
   All phases from §4.3. Helper: `is_linear_phase() -> bool`. Spec: §4.3.
@@ -71,28 +71,29 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
 
 *Each tool is a standalone `@tool`-decorated function. No LangGraph dependency. Test each in isolation with real FITS data before moving on.*
 
-- [ ] **T01 `ingest_dataset`**
-  Walk directory, classify files by `IMAGETYP` FITS header, extract `AcquisitionMeta`. Return `Dataset` + warnings. Spec: §5 T01.
+- [x] **T01 `ingest_dataset`**
+  Walk directory. Auto-detect format: FITS (`*.fits` etc.) → classify by `IMAGETYP` header, extract metadata via `astropy`; Camera RAW (`*.raf`, `*.cr2`, etc.) → classify by subdirectory name (`lights/`, `darks/`, `flats/`, `bias/`), extract metadata via `pyexiftool` (wraps ExifTool binary). Store `input_format` in `AcquisitionMeta` so T03 can set CFA flags. Both paths return the same `Dataset` schema. Spec: §5 T01.
+  Tested against real Fujifilm RAF data — extracts camera model, ISO, exposure, focal length. FITS path is a stub (NotImplementedError).
 
-- [ ] **T02 `build_masters`**
+- [x] **T02 `build_masters`**
   Build master bias, dark, or flat via Siril `convert` + `stack`. Enforce dependency order (bias → dark → flat). Return `master_path` + stats. Spec: §5 T02.
 
-- [ ] **T03 `siril_calibrate`**
+- [x] **T03 `siril_calibrate`**
   Apply masters to lights via Siril `calibrate`. Handle CFA/OSC flag, `equalize_cfa`, cosmetic correction, dark optimization. Return calibrated sequence path. Spec: §5 T03.
 
-- [ ] **T04 `siril_register`**
+- [x] **T04 `siril_register`**
   Two-pass registration via Siril `register -2pass` + `seqapplyreg`. Support homography/affine/shift, Lanczos4 interpolation, optional drizzle, FWHM/roundness inline filtering. Spec: §5 T04.
 
-- [ ] **T05 `analyze_frames`**
-  Per-frame FWHM, eccentricity, roundness, background, noise via Siril `seqstat` + Photutils `DAOStarFinder`. Return `frame_metrics` dict + summary. Spec: §5 T05.
+- [x] **T05 `analyze_frames`**
+  Per-frame FWHM, eccentricity, roundness, background, noise via Siril `seqstat` + `seqpsf`. Return `frame_metrics` dict + summary. Spec: §5 T05.
 
-- [ ] **T06 `select_frames`**
+- [x] **T06 `select_frames`**
   Pure Python sigma-clipping on T05 metrics. Reject frames outside FWHM, roundness, star count, and background thresholds relative to median. Safety: never return zero accepted frames. Spec: §5 T06.
 
-- [ ] **T07 `siril_stack`**
-  Mark rejected frames with Siril `unselect`, then run `stack rej` with sigma/winsorized rejection, addscale normalization, wfwhm weighting, 32-bit output. Spec: §5 T07.
+- [x] **T07 `siril_stack`**
+  Parses .seq file to build filename→index map. Emits `unselect`/`select` preamble for accepted_frames. Runs `stack` with sigma/winsorized rejection, addscale normalization, wfwhm weighting, 32-bit output. Spec: §5 T07.
 
-- [ ] **T08 `auto_crop`**
+- [x] **T08 `auto_crop`**
   Load FITS with Astropy, compute bounding box on signal mask (per-pixel max across channels > threshold), apply 5px safety inset, run Siril `crop`. Spec: §5 T08.
 
 ---
@@ -101,100 +102,114 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
 
 *All operate on linear data. Each must guard against being called post-stretch.*
 
-- [ ] **T09 `remove_gradient`**
-  Primary: call `GRAXPERT_BIN` directly via subprocess — do NOT use Siril's `pyscript GraXpert-AI.py` wrapper. GraXpert CLI: `graxpert <image> -cli -cmd background-extraction -output <out> -correction <type>`. Fallback: Siril `subsky -rbf` or `subsky <degree>`. Return processed image path + optional background model. Spec: §5 T09.
+- [x] **T09 `remove_gradient`**
+  Primary: call `GRAXPERT_BIN` directly via subprocess — do NOT use Siril's `pyscript GraXpert-AI.py` wrapper. GraXpert CLI: `graxpert <image> -cli -cmd background-extraction -output <out.fits> -correction <Subtraction|Division> -smoothing <float> -ai_version 1.0.1 [-bg]`. Fallback: Siril `subsky -rbf` or `subsky <degree> -samples=N -tolerance=N`. Return processed image path + optional background model. `requires_visual_review=True` by default (HITL at this checkpoint). Spec: §5 T09.
+  Bugs fixed in Phase 5c: `subsky` polynomial syntax corrected to flag-based args; `dither: bool` added.
 
-- [ ] **T10 `color_calibrate`**
-  Internally calls `plate_solve` if WCS not present. Then Siril `pcc` or `spcc`. Return calibrated path, WCS coords, pixel scale, color coefficients. Spec: §5 T10.
+- [x] **T10 `color_calibrate`**
+  Internally calls `plate_solve` if WCS not present. Then Siril `pcc` or `spcc`. Return calibrated path, WCS coords, pixel scale, color coefficients. `limitmag` and `bgtol_lower/bgtol_upper` added in Phase 5c. Spec: §5 T10.
 
-- [ ] **T11 `remove_green_noise`**
-  Siril `rmgreen` with average-neutral or maximum-neutral protection. Only valid on OSC/DSLR data. Spec: §5 T11.
+- [x] **T11 `remove_green_noise`**
+  Siril `rmgreen` with average-neutral or maximum-neutral protection. Only valid on OSC/DSLR data. Bug fixed in Phase 5c: `amount` parameter omitted for types 0/1. Spec: §5 T11.
 
-- [ ] **T12 `noise_reduction`**
-  Primary: Siril `denoise` (NL-Bayes, DA3D, SOS). Alternative: call `GRAXPERT_BIN` directly via subprocess — do NOT use Siril's `pyscript` wrapper. GraXpert CLI: `graxpert <image> -cli -cmd denoising -output <out> -strength <value>`. Measure and return `noise_before`/`noise_after` via `bgnoise`. Spec: §5 T12.
+- [x] **T12 `noise_reduction`**
+  Primary: Siril `denoise` (NL-Bayes, DA3D, SOS). Alternative: call `GRAXPERT_BIN` directly via subprocess — do NOT use Siril's `pyscript` wrapper. GraXpert CLI: `graxpert <image> -cli -cmd denoising -output <out> -strength <value>`. Measure and return `noise_before`/`noise_after` via `bgnoise`. `use_vst` and `apply_cosmetic` added in Phase 5c. Spec: §5 T12.
 
-- [ ] **T13 `deconvolution`**
-  Methods: Siril `rl` (Richardson-Lucy + TV regularization), Siril `wiener`, or GraXpert `pyscript -deconv_stellar` / `-deconv_obj`. PSF via Siril `makepsf -auto`. Spec: §5 T13.
+- [x] **T13 `deconvolution`**
+  Methods: Siril `rl` (Richardson-Lucy + TV regularization), Siril `wiener`. PSF via Siril `makepsf stars` (primary) or `makepsf blind` (fallback) or `makepsf manual` (Moffat/Airy — added Phase 5c). `rl_stop` and `-fh` regularization added Phase 5c. Spec: §5 T13.
+  **Note:** `requires_visual_review=True` by default. Deconvolution over-sharpening (ringing, halos) is a known artefact risk — HITL is mandatory in V1. The bool flag is designed to be flipped to `False` once confidence is established.
 
 ---
 
 ## Phase 4 — Stretch & Non-Linear Tools (T14–T19)
 
-- [ ] **T14 `stretch_image`**
-  Siril `ght` (GHS), `asinh`, or `autostretch`. Measure `clipped_shadows_pct` and `clipped_highlights_pct` from output stats. Set `metadata.is_linear = false` in state. Spec: §5 T14.
+- [x] **T14 `stretch_image`**
+  Siril `ght` (GHS), `asinh`, or `autostretch`. Measure `clipped_shadows_pct` and `clipped_highlights_pct` from output stats. Set `metadata.is_linear = false` in state. Bug fixed in Phase 5c: `color_model="even"` flag now always emitted. Spec: §5 T14.
 
-- [ ] **T15 `star_removal`**
-  Siril `starnet` *or* call StarNet binary directly via subprocess. Spec: §5 T15.
+- [x] **T15 `star_removal`**
+  Calls `STARNET_BIN` (starnet2-mps PyTorch/MPS build) directly via subprocess with `-i/-o/-m/-w/-u` flags. FITS→TIF→StarNet→FITS conversion chain handled internally. `requires_visual_review=True` by default. Spec: §5 T15.
+  **Note — PyTorch/MPS StarNet (starnet2-mps):** Binary requires `install_name_tool -add_rpath <lib_dir>` and `codesign --force --sign -` on first install.
 
-  **Note — PyTorch/MPS StarNet (starnet2-mps):** The experimental build uses a different CLI than the TensorFlow version. Uses `-i` input, `-o` starless, `-m` mask, `-w` weights path, `-u` upsampling. Siril's `starnet` command may not forward correctly to this binary. Consider calling `STARNET_BIN` directly with `STARNET_WEIGHTS` (or weights path beside binary) — produces both starless + mask in one run. Binary path requires `install_name_tool -add_rpath <lib_dir>` and `codesign --force --sign -` on first install (see StarNet setup docs).
-
-- [ ] **T16 `curves_adjust`**
+- [x] **T16 `curves_adjust`**
   Siril `mtf` (global) or `ght` with high B value (targeted tonal range). Per-channel support. Spec: §5 T16.
 
-- [ ] **T17 `local_contrast_enhance`**
-  Siril `clahe`, `unsharp`, or `wavelet` + `wrecons` with per-layer weights. Spec: §5 T17.
+- [x] **T17 `local_contrast_enhance`**
+  Siril `clahe`, `unsharp`, or `epf` (edge-preserving bilateral/guided filter — added Phase 5c). Spec: §5 T17.
 
-- [ ] **T18 `saturation_adjust`**
+- [x] **T18 `saturation_adjust`**
   Siril `satu` with background protection factor and optional hue index (0–6). `ght -sat` for midtone-focused saturation. Spec: §5 T18.
 
-- [ ] **T19 `star_restoration`**
+- [x] **T19 `star_restoration`**
   Blend mode: Siril `pm "$starless$ + $starmask$ * <weight>"`. Synthstar mode: Siril `synthstar` on original linear image. Spec: §5 T19.
 
 ---
 
 ## Phase 5 — Utility Tools (T20–T24)
 
-- [ ] **T20 `analyze_image`**
-  Siril `stat main` + `bgnoise` + `histo` (per channel). Photutils for star count and FWHM. Compute derived metrics: `gradient_magnitude`, `green_excess`, `snr_estimate`, `is_linear_estimate`, `background_flatness_score`. Spec: §5 T20.
+- [x] **T20 `analyze_image`**
+  Siril `bgnoise` for authoritative noise (MAD-based). Astropy+numpy for per-channel sigma-clipped stats. Photutils `IRAFStarFinder` for star count, FWHM, roundness, `fwhm_std` (PSF uniformity), `median_star_peak_ratio` (star dominance indicator). Scipy `sobel`/`gaussian_filter` for `gradient_magnitude`. Derived: `snr_estimate`, `linearity` (dual-consensus: median + histogram skewness replaces fragile `is_linear_estimate`), `flatness_score`, `per_channel_bg` (sky-only pixels per channel — color neutralization verifier), `signal_coverage_pct` (nebulosity fraction), `color` (HSV saturation stats — drives T18), `clipping`, `green_excess`. Spec: §5 T20.
 
-- [ ] **T21 `plate_solve`**
-  Siril `platesolve` with RA/Dec hint, focal length, pixel size. Parse WCS result from stdout. Fallback to local astrometry.net. Spec: §5 T21.
+- [x] **T21 `plate_solve`**
+  Siril `platesolve [ra dec] -focal= -pixelsize=` (coords positional, not `-ra=/-dec=`). Reuses `_build_platesolve_cmd` helpers from T10. Added `-force` and `-localasnet` flags. Spec: §5 T21.
 
-- [ ] **T22 `generate_preview`** *(internal function — not agent-callable)*
-  Copy FITS to temp, run Siril `autostretch` + `savejpg` (linear only), resize to target width. Original FITS untouched. Output to `previews/`. Called exclusively by `auto_hitl_check()` and the mandatory HITL nodes (`stretch_hitl`, `final_hitl`). Must not be registered in `PHASE_TOOLS`. Spec: §5 T22.
+- [x] **T22 `generate_preview`** *(internal function — not agent-callable)*
+  Siril `autostretch -linked` + `savejpg`. PIL resize + annotation. NOT a @tool — verified by verify_phase_5.py. Spec: §5 T22.
 
-- [ ] **T23 `pixel_math`**
-  Siril `pm "<expression>"`. Validate that all `$variable$` stems exist in working dir before invoking. Spec: §5 T23.
+- [x] **T23 `pixel_math`**
+  Siril `pm "expression"`. Validates all `$stem$` tokens exist in working_dir before invoking. Spec: §5 T23.
 
-- [ ] **T24 `export_final`**
-  Siril `icc_convert_to` + `savetif`/`savejpg`/`savepng`. Always produce 16-bit TIFF (AdobeRGB) + JPG (sRGB). Output to `export/`. Spec: §5 T24.
+- [x] **T24 `export_final`**
+  Siril `icc_convert_to` + `savetif`/`savetif32`/`savejpg`/`savepng`. Default: Rec2020 TIFF16 (archival, wide-gamut) + sRGB JPG (web). Note: AdobeRGB is not a Siril built-in — Rec2020 is the correct wide-gamut choice. Output to `export/`. Spec: §5 T24.
 
 ---
 
 ## Phase 5b — scikit-image Tools (T25–T27)
 
-*Pure-Python tools. No Siril invocation. All I/O via `astropy.io.fits`. Each must
-be tested in isolation on a real stretched FITS before wiring into the graph.*
+*Pure-Python tools. No Siril invocation. All I/O via `astropy.io.fits`.*
 
-- [ ] **T25 `create_mask`**
-  Read FITS with `astropy.io.fits`. Compute luminance via `skimage.color.rgb2gray`.
-  Apply threshold range to produce a binary 0/1 mask. Feather edges with
-  `skimage.filters.gaussian(sigma=feather_radius)`. Optionally expand/contract
-  mask with `skimage.morphology.binary_dilation` / `binary_erosion` using
-  `skimage.morphology.disk`. Support mask types: `luminance`, `inverted_luminance`,
-  `range`, `channel_diff`. Write single-channel float32 FITS. Return `mask_path`,
-  `coverage_pct`, `mean_value`. Spec: §5 T25.
+- [x] **T25 `create_mask`**
+  Astropy load → numpy. Four mask types: `luminance`, `inverted_luminance`, `range`, `channel_diff`. Morphological `binary_dilation`/`binary_erosion` with `disk`. Gaussian feathering. Float32 FITS output. Spec: §5 T25.
 
-- [ ] **T26 `reduce_stars`**
-  Accept FITS image and optional star mask from T15. If no mask provided,
-  auto-threshold luminance at `detection_threshold` to build a star region mask.
-  Apply `skimage.morphology.erosion(channel, skimage.morphology.disk(kernel_radius))`
-  for `iterations` passes only within the star mask region. Optionally protect
-  star cores via `binary_dilation` exclusion zone. Blend eroded result with
-  original using `blend_amount` and `skimage.filters.gaussian` feathering.
-  Return `reduced_image_path`, `stars_affected_count`, `mean_size_reduction_pct`.
-  Spec: §5 T26.
+- [x] **T26 `reduce_stars`**
+  Accepts star mask from T15 or auto-thresholds luminance. `skimage.morphology.erosion(channel, disk(kernel_radius))` for `iterations` passes within star region. Core exclusion via `binary_dilation`. Feathered blend with `blend_amount`. Reports `stars_affected_count`, `mean_size_reduction_pct`. Spec: §5 T26.
 
-- [ ] **T27 `multiscale_process`**
-  Load FITS as float32. If `per_channel=False`, extract luminance with
-  `skimage.color.rgb2gray`, process, recombine. Apply `pywt.swt2(data, wavelet='b3',
-  level=num_scales)` to get wavelet coefficients per scale. For each scale apply:
-  `sharpen` (multiply coefficients by weight), `denoise` (apply
-  `skimage.restoration.denoise_wavelet` with `denoise_sigma`), `suppress` (zero
-  coefficients), or `passthrough`. Reconstruct via `pywt.iswt2`. If `mask_path`
-  supplied, blend result with original via mask. Write FITS. Return
-  `processed_image_path` and `per_scale_stats` with coefficient energy before/after.
-  Spec: §5 T27.
+- [x] **T27 `multiscale_process`**
+  B3-spline à trous transform via `scipy.ndimage.convolve1d` with kernel `[1/16, 4/16, 6/16, 4/16, 1/16]` and stride=2^i per scale. NOT `pywt.swt2('b3')` — PyWavelets has no 'b3'. Per-scale operations: `sharpen` (weight mult), `denoise` (MAD soft-threshold), `suppress` (zero), `passthrough`. Roundtrip residual < 1e-5 verified. Optional mask blending. Spec: §5 T27.
+
+---
+
+## Phase 5c — Pre-Phase 6 Full Tool Review (completed)
+
+*Full audit of all 28 tools before graph wiring. Verified against Siril 1.4 docs.*
+
+- [x] **T09 `remove_gradient` — subsky polynomial syntax bug fixed**
+  `subsky {degree} {samples} {tolerance}` (positional, WRONG) → `subsky {degree} -samples={N} -tolerance={N}` (correct Siril 1.4 flag syntax). Added `dither: bool` field for low-dynamic-range gradient suppression.
+
+- [x] **T10 `color_calibrate` — star magnitude and background tolerance controls**
+  Added `limitmag: str | None` to PCC and SPCC: `+N/-N` for relative depth, absolute value for fixed limit. Added `bgtol_lower/bgtol_upper: float | None` for background sample rejection control — critical for extended nebula frames where nebulosity fills the frame and would otherwise bias the background reference.
+
+- [x] **T12 `noise_reduction` — VST and cosmetic correction flags**
+  Added `use_vst: bool` (Anscombe variance-stabilizing transform, `-vst` flag). VST is incompatible with DA3D/SOS and is only applied for `method=standard`. Added `apply_cosmetic: bool` (default True) that maps to Siril's `-nocosmetic` flag when False — prevents double-applying cosmetic correction.
+
+- [x] **T13 `deconvolution` — makepsf manual profiles, rl -stop=, -fh regularization**
+  Added `MakePsfManualOptions` supporting `psf_source=manual`: `-moffat` (with `beta` for wing control), `-airy` (with telescope optics parameters: diameter, focal length, wavelength, obstruction), `-gaussian`, `-disc`. Added `rl_options.stop: float | None` for early stopping. Added `hessian_frobenius` as a regularization option (`-fh` flag — Frobenius norm of Hessian, better at preserving linear structure than TV). Added `symmetric: bool` for `makepsf stars -sym`. Removed stale `makepsf -auto` reference from docstring.
+
+- [x] **T17 `local_contrast_enhance` — epf edge-preserving filter**
+  Added `method=edge_preserve` mapping to Siril's `epf` command (bilateral or guided filter). New `EpfOptions` schema: `guided` (bilateral vs guided), `diameter`, `intensity_sigma` and `spatial_sigma` (normalized 0–1 for 32-bit FITS), `mod` (blend strength), `guide_image_stem` (for guided filter with separate guide). Bilateral EPF is PixInsight-tier structure-safe noise smoothing — excellent for cleaning residual noise from background and faint regions after NL-Bayes.
+
+- [x] **T28 `extract_narrowband` — new tool: Hα/O-III/Green CFA extraction**
+  New tool at `astro_agent/tools/utility/t28_extract_narrowband.py`. Wraps Siril `extract_Ha`, `extract_HaOIII`, `extract_Green`. Enables the OSC dual-narrowband workflow for Fujifilm X-T30 II (or any OSC camera) with a duoband filter (Optolong L-eNhance, L-Ultimate, STC Duo, etc.). Input must be CFA (non-debayered) FITS from T03 with `debayer=False`. `upscale_ha` and `resample` options for matching output dimensions. Returns `ha_path`, `oiii_path`, `green_path`. Next steps in output: register+stack each channel independently (T04+T07) then combine via T23 pixel_math (HOO or SHO palette). Spec: §5 T28.
+
+---
+
+## Future Tools (add when needed, not before)
+
+- **T29 `fix_banding`** — Siril `fixbanding` command. Removes horizontal/vertical
+  fixed-pattern noise (DSLR sensor banding). Add when banding artifacts are
+  observed in real data. The agent would detect banding via a periodic noise
+  metric in T20 (row/column variance analysis) and call this tool automatically.
+  Not added yet — the X-T30 II may never show banding, and the tool is only
+  useful if the artifact actually appears.
 
 ---
 
@@ -203,7 +218,7 @@ be tested in isolation on a real stretched FITS before wiring into the graph.*
 *Prove tools work independently before building the agent.*
 
 - [ ] **Manual pipeline integration script**
-  A plain Python script (not a test, not the graph) that calls T01 → T27 sequentially on a real dataset. Every intermediate file must exist on disk. The script must demonstrate the masked-application pattern: T25 → T27 → T23 on the starless image. The script completes without error and produces a viewable export. This is the gate before Phase 7.
+  A plain Python script (not a test, not the graph) that calls T01 → T28 sequentially on a real dataset. Every intermediate file must exist on disk. The script must demonstrate the masked-application pattern: T25 → T27 → T23 on the starless image. The script completes without error and produces a viewable export. This is the gate before Phase 7.
 
 ---
 
@@ -221,7 +236,7 @@ be tested in isolation on a real stretched FITS before wiring into the graph.*
   Dict mapping each `ProcessingPhase` to the subset of tools the LLM may call during that phase. Verify: `color_calibrate` is absent from `NONLINEAR`, `stretch_image` is absent from `LINEAR`, `reduce_stars` is absent from `LINEAR`, `multiscale_process` in `LINEAR` accepts only `denoise` operations (enforced via agent notes, not code). Spec: §6.3.
 
 - [ ] **Tool executor node**
-  `ToolNode` wrapping all 27 tools (T01–T27). After execution: update
+  `ToolNode` wrapping all 28 tools (T01–T28). After execution: update
   `state.paths.current_image` and `state.history`; run `tool_executor_post_hook`
   (auto-analyze + auto-HITL check via `ToolEntry` flags); append a `ReportEntry`
   to `state.processing_report` using `build_report_entry()`. No auto-preview,
@@ -319,7 +334,7 @@ it correctly and ensuring all context the LLM needs reaches it at runtime.*
   When flag is set, replace `cli_presenter` with `auto_presenter`: auto-selects the middle option from `payload["options"]` and logs the decision to history. Graph still pauses/resumes via `interrupt` — only the presenter changes. Spec: §8.0.
 
 - [ ] **`TOOL_REGISTRY` with `ToolEntry`**
-  Implement `ToolEntry` dataclass with `fn`, `modifies_image`, `requires_visual_review`, `visual_review_question`, `visual_review_options` fields. Populate all 27 tools per §6.5. `requires_visual_review=True` for `remove_gradient`, `deconvolution`, `star_removal` in V1. Changing a checkpoint from required to optional in the future is a one-line boolean change. Spec: §6.5.
+  Implement `ToolEntry` dataclass with `fn`, `modifies_image`, `requires_visual_review`, `visual_review_question`, `visual_review_options` fields. Populate all 28 tools per §6.5. `requires_visual_review=True` for `remove_gradient`, `deconvolution`, `star_removal` in V1. Changing a checkpoint from required to optional in the future is a one-line boolean change. Spec: §6.5.
 
 - [ ] **`tool_executor_post_hook()`**
   After each tool call: (1) if `entry.modifies_image`, call `analyze_image_fn` and update `state.metrics`; (2) if `entry.requires_visual_review`, call `auto_hitl_check()` which calls `generate_preview_fn` and returns a HITL payload; (3) inject payload into state routing so the graph routes to `hitl_interrupt_node` before returning to planner. `generate_preview_fn` is never called outside this hook and the mandatory HITL nodes. Spec: §6.5.
@@ -332,7 +347,17 @@ it correctly and ensuring all context the LLM needs reaches it at runtime.*
 ## Phase 10 — Entry Point
 
 - [ ] **`cli.py`**
-  `astro_agent process <directory> [--profile conservative|balanced|aggressive] [--resume <thread_id>] [--no-hitl]`. Runs `make_initial_state` then streams the graph via `app.stream(..., stream_mode="updates")`. On each chunk, checks for `__interrupt__`: if present, calls `cli_presenter(payload)` to display images + question, reads response, and resumes with `app.invoke(Command(resume=response), config)`. If `--no-hitl`, uses `auto_presenter` instead. Print thread ID at start so the user can resume later. Spec: §2, §8.0.
+  ```
+  astro_agent process <directory>
+    --target "M42 Orion Nebula"     (REQUIRED)
+    --bortle 4                      (recommended)
+    --remove-stars ask|yes|no       (default: ask → HITL)
+    --notes "free text"             (optional)
+    --profile conservative|balanced|aggressive
+    --resume <thread_id>
+    --no-hitl
+  ```
+  Collects `SessionContext` from CLI arguments (prompts interactively for `--target` if not provided). Runs `make_initial_state(dataset, session)` then streams the graph via `app.stream(..., stream_mode="updates")`. On each chunk, checks for `__interrupt__`: if present, calls `cli_presenter(payload)` to display images + question, reads response, and resumes with `app.invoke(Command(resume=response), config)`. If `--no-hitl`, uses `auto_presenter` instead. Print thread ID at start so the user can resume later. Spec: §2.5, §8.0.
 
 ---
 

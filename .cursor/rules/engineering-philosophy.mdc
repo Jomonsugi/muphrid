@@ -1,0 +1,51 @@
+---
+description: Core engineering philosophy for AstroAgent — quality, gold-standard tools, and data-driven decisions
+alwaysApply: true
+---
+
+# AstroAgent Engineering Philosophy
+
+## The Goal
+Build an agentic astrophotography pipeline that matches PixInsight-quality output
+using open source software. Every decision — package choice, algorithm, architecture —
+should be made with that bar in mind.
+
+## Gold Standard Over Convenient
+
+Always choose the most robust, comprehensive, and trusted tool for a job.
+
+| Don't choose | Choose instead | Why |
+|---|---|---|
+| `exifread` | `pyexiftool` + ExifTool binary | ExifTool reads every format including Fujifilm proprietary maker notes; Lightroom/Capture One use it |
+| `rawpy` metadata | ExifTool | rawpy is for pixel data, not metadata |
+| Convenience library | Industry standard | The agent's decisions are only as good as the data it gets |
+
+**The ExifTool decision is the reference example.** When evaluating options, ask:
+- Is this what professional tools (Lightroom, Capture One, PixInsight) use under the hood?
+- Does it handle the full range of formats and edge cases, not just today's use case?
+- Is it actively maintained and trusted by the community?
+
+## External Binaries Are Expected
+
+This system already requires Siril, GraXpert, and StarNet — adding ExifTool is not a burden.
+External binaries managed via `.env` are a first-class pattern here.
+Do not reject a better tool solely because it requires a system dependency.
+
+## Data Quality Drives Agent Quality
+
+The agent makes decisions based on metrics and EXIF/FITS metadata.
+**Garbage in = garbage decisions.** Every tool in the pipeline should extract
+the most complete, accurate data possible. Richer data = better agent.
+
+This applies to:
+- EXIF extraction (T01) — get all maker notes, not just basic tags
+- Image metrics (T20 `analyze_image`) — expose every meaningful statistic
+- Siril output parsing (`_siril.py`) — extract all parseable metrics from stdout
+
+## When Evaluating New Packages
+
+1. Check GitHub for recent commit activity (within last 6 months)
+2. Check if it's what professional tools use (Lightroom, PixInsight, etc.)
+3. Prefer battle-tested C/C++ libraries wrapped in Python over pure-Python alternatives
+4. Check PyPI download count as a proxy for community trust
+5. License matters for open-source intent — note GPL vs MIT for future publication
