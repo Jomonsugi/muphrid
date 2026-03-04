@@ -60,7 +60,7 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
 *Imported by every tool and graph node. Build before anything else.*
 
 - [x] **`graph/state.py` — all TypedDicts**
-  `AstroState`, `PathState`, `MasterPaths`, `Metadata`, `Metrics`, `Dataset`, `FileInventory`, `AcquisitionMeta`, `FrameMetrics`, `ReportEntry`, `HITLPayload`, **`SessionContext`** with correct `Annotated` reducers for `history` (append-only), `messages` (`add_messages`), and `processing_report` (append-only list of `ReportEntry`). `PathState` includes `latest_preview: str | None`. `SessionContext` holds human-provided startup context: `target_name` (required), `bortle`, `remove_stars`, `notes`. Injected into every planner call via `build_state_summary()`. Spec: §2.5, §4.
+  `AstroState`, `PathState`, `MasterPaths`, `Metadata`, `Metrics`, `Dataset`, `FileInventory`, `AcquisitionMeta`, `FrameMetrics`, `ReportEntry`, `HITLPayload`, **`SessionContext`** with correct `Annotated` reducers for `history` (append-only), `messages` (`add_messages`), and `processing_report` (append-only list of `ReportEntry`). `PathState` includes `latest_preview: str | None`. `SessionContext` holds human-provided startup context: `target_name` (required), `bortle` (required), `sqm_reading` (optional), `remove_stars`, `notes`. Injected into every planner call via `build_state_summary()`. Spec: §2.5, §4.
 
 - [x] **`ProcessingPhase` enum**
   All phases from §4.3. Helper: `is_linear_phase() -> bool`. Spec: §4.3.
@@ -88,13 +88,13 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
   Per-frame FWHM, eccentricity, roundness, background, noise via Siril `seqstat` + `seqpsf`. Return `frame_metrics` dict + summary. Spec: §5 T05.
 
 - [x] **T06 `select_frames`**
-  Pure Python sigma-clipping on T05 metrics. Reject frames outside FWHM, roundness, star count, and background thresholds relative to median. Safety: never return zero accepted frames. Spec: §5 T06.
+  Pure Python sigma-clipping on T05 metrics. Reject frames outside FWHM, roundness, star count, and background thresholds relative to median. Contract: non-empty input never returns zero accepted frames (safety fallback); empty `frame_metrics` now fails loudly with actionable error ("run T05 first"). Spec: §5 T06.
 
 - [x] **T07 `siril_stack`**
   Parses .seq file to build filename→index map. Emits `unselect`/`select` preamble for accepted_frames. Runs `stack` with sigma/winsorized rejection, addscale normalization, wfwhm weighting, 32-bit output. Spec: §5 T07.
 
 - [x] **T08 `auto_crop`**
-  Load FITS with Astropy, compute bounding box on signal mask (per-pixel max across channels > threshold), apply 5px safety inset, run Siril `crop`. Spec: §5 T08.
+  Load FITS with Astropy, compute bounding box on signal mask (per-pixel max across channels > threshold), apply 5px safety inset, run Siril `crop`. Guard added: if inset collapses tiny signal regions, fallback to non-inset bbox so crop geometry stays valid (no negative width/height). Spec: §5 T08.
 
 ---
 
@@ -147,7 +147,7 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
 ## Phase 5 — Utility Tools (T20–T24)
 
 - [x] **T20 `analyze_image`**
-  Siril `bgnoise` for authoritative noise (MAD-based). Astropy+numpy for per-channel sigma-clipped stats. Photutils `IRAFStarFinder` for star count, FWHM, roundness, `fwhm_std` (PSF uniformity), `median_star_peak_ratio` (star dominance indicator). Scipy `sobel`/`gaussian_filter` for `gradient_magnitude`. Derived: `snr_estimate`, `linearity` (dual-consensus: median + histogram skewness replaces fragile `is_linear_estimate`), `flatness_score`, `per_channel_bg` (sky-only pixels per channel — color neutralization verifier), `signal_coverage_pct` (nebulosity fraction), `color` (HSV saturation stats — drives T18), `clipping`, `green_excess`. Spec: §5 T20.
+  Siril `bgnoise` for authoritative noise (MAD-based). Astropy+numpy for per-channel sigma-clipped stats. Photutils `IRAFStarFinder` for star count, FWHM, roundness, `fwhm_std` (PSF uniformity), `median_star_peak_ratio` (star dominance indicator). Scipy `sobel`/`gaussian_filter` for `gradient_magnitude`. Derived: `snr_estimate`, `linearity` (dual-consensus: median + histogram skewness replaces fragile `is_linear_estimate`), `flatness_score`, `per_channel_bg` (sky-only pixels per channel — color neutralization verifier), `signal_coverage_pct` (nebulosity fraction), `color` (HSV saturation stats — drives T18), `clipping`, `green_excess`. NaN/Inf input pixels are sanitized on load so tool outputs remain finite and deterministic.
 
 - [x] **T21 `plate_solve`**
   Siril `platesolve [ra dec] -focal= -pixelsize=` (coords positional, not `-ra=/-dec=`). Reuses `_build_platesolve_cmd` helpers from T10. Added `-force` and `-localasnet` flags. Spec: §5 T21.
@@ -174,7 +174,7 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
   Accepts star mask from T15 or auto-thresholds luminance. `skimage.morphology.erosion(channel, disk(kernel_radius))` for `iterations` passes within star region. Core exclusion via `binary_dilation`. Feathered blend with `blend_amount`. Reports `stars_affected_count`, `mean_size_reduction_pct`. Spec: §5 T26.
 
 - [x] **T27 `multiscale_process`**
-  B3-spline à trous transform via `scipy.ndimage.convolve1d` with kernel `[1/16, 4/16, 6/16, 4/16, 1/16]` and stride=2^i per scale. NOT `pywt.swt2('b3')` — PyWavelets has no 'b3'. Per-scale operations: `sharpen` (weight mult), `denoise` (MAD soft-threshold), `suppress` (zero), `passthrough`. Roundtrip residual < 1e-5 verified. Optional mask blending. Spec: §5 T27.
+  B3-spline à trous transform via `scipy.ndimage.convolve1d` with kernel `[1/16, 4/16, 6/16, 4/16, 1/16]` and stride=2^i per scale. NOT `pywt.swt2('b3')` — PyWavelets has no 'b3'. Per-scale operations: `sharpen` (weight mult), `denoise` (MAD soft-threshold), `suppress` (zero), `passthrough`. Roundtrip residual < 1e-5 verified. Supports mono and color images in luminance mode. If `mask_path` shape differs from the image, mask is auto-resized before blending.
 
 ---
 
@@ -210,6 +210,16 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
   metric in T20 (row/column variance analysis) and call this tool automatically.
   Not added yet — the X-T30 II may never show banding, and the tool is only
   useful if the artifact actually appears.
+
+---
+
+## Phase 5d — Math Integrity Regression Gate (completed)
+
+- [x] **Added `scripts/verify_math_integrity.py` and integrated into verification workflow**
+  Focused regression checks for math-heavy Python tools (T06, T08, T20, T26, T27):
+  mono/color path handling, NaN/Inf sanitation, valid crop geometry for tiny regions,
+  mismatched mask resize behavior, and deterministic fail-loud preconditions.
+  Current status: all checks passing.
 
 ---
 
@@ -350,14 +360,15 @@ it correctly and ensuring all context the LLM needs reaches it at runtime.*
   ```
   astro_agent process <directory>
     --target "M42 Orion Nebula"     (REQUIRED)
-    --bortle 4                      (recommended)
+    --bortle 4                      (REQUIRED)
+    --sqm 20.8                      (optional)
     --remove-stars ask|yes|no       (default: ask → HITL)
     --notes "free text"             (optional)
     --profile conservative|balanced|aggressive
     --resume <thread_id>
     --no-hitl
   ```
-  Collects `SessionContext` from CLI arguments (prompts interactively for `--target` if not provided). Runs `make_initial_state(dataset, session)` then streams the graph via `app.stream(..., stream_mode="updates")`. On each chunk, checks for `__interrupt__`: if present, calls `cli_presenter(payload)` to display images + question, reads response, and resumes with `app.invoke(Command(resume=response), config)`. If `--no-hitl`, uses `auto_presenter` instead. Print thread ID at start so the user can resume later. Spec: §2.5, §8.0.
+  Collects `SessionContext` from CLI arguments (prompts interactively for required `--target` and `--bortle` if omitted). Runs `make_initial_state(dataset, session)` then streams the graph via `app.stream(..., stream_mode="updates")`. On each chunk, checks for `__interrupt__`: if present, calls `cli_presenter(payload)` to display images + question, reads response, and resumes with `app.invoke(Command(resume=response), config)`. If `--no-hitl`, uses `auto_presenter` instead. Print thread ID at start so the user can resume later. Spec: §2.5, §8.0.
 
 ---
 
