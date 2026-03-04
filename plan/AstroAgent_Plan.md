@@ -211,6 +211,14 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
   Not added yet — the X-T30 II may never show banding, and the tool is only
   useful if the artifact actually appears.
 
+- **T30 `combine_channels`** — Dedicated narrowband palette mapping tool for
+  multi-filter setups (Ha, OIII, SII). Would provide named palette presets
+  (SHO/Hubble, HOO, HOS) with per-channel weight and bias controls, plus
+  automatic star color restoration from a broadband RGB reference. Currently
+  achievable via T23 `pixel_math` expressions, but a dedicated tool would give
+  the agent structured parameters instead of freeform math strings — reducing
+  prompt complexity and error surface for narrowband combination workflows.
+
 ---
 
 ## Phase 5d — Math Integrity Regression Gate (completed)
@@ -220,6 +228,30 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
   mono/color path handling, NaN/Inf sanitation, valid crop geometry for tiny regions,
   mismatched mask resize behavior, and deterministic fail-loud preconditions.
   Current status: all checks passing.
+
+---
+
+## Phase 5e — Pre-Phase 6 Data Quality Audit (completed)
+
+*Full audit of all tools focused on agent data-driven decision quality.*
+
+- [x] **`Metrics` TypedDict expanded** to capture full T20 output
+  Added 15 new fields: `dynamic_range_db`, `gradient_magnitude`, `per_channel_bg`, `channel_imbalance`, `mean_saturation`, `median_saturation`, `is_linear_estimate`, `linearity_confidence`, `histogram_skewness`, `signal_coverage_pct`, `clipped_shadows_pct`, `clipped_highlights_pct`, `star_count`, `fwhm_std`, `median_star_peak_ratio`, `contrast_ratio`. The state now carries all data the agent needs for math-based decisions without re-running T20.
+
+- [x] **`is_osc` auto-derived from ingestion format**
+  `make_empty_state()` now sets `metadata.is_osc = True` when `input_format == "raw"` (camera RAW is always CFA). Previously defaulted to False.
+
+- [x] **T05 `analyze_frames` — enriched summary statistics**
+  Added `median_eccentricity`, `median_star_count`, `median_background`, `std_background`, `median_noise`, and `frame_count` to the summary dict. The agent now has all aggregates needed to set T06 rejection thresholds without manually parsing per-frame data.
+
+- [x] **T20 `analyze_image` — added `contrast_ratio` metric**
+  `contrast_ratio = p95 - p5` of luminance. Measures usable tonal range. < 0.3 post-stretch → flat image needing T16 curves; > 0.8 → high contrast, cautious with further enhancement. Previously referenced in T16 docstring but never computed.
+
+- [x] **T10 `color_calibrate` — `background_neutralization` description corrected**
+  Siril PCC/SPCC always include background neutralization — there is no `-nobgn` CLI flag. Updated description to document this as advisory and added the fallback path: T20 `per_channel_bg` + T23 pixel_math manual equalization when plate solving fails.
+
+- [x] **T11 `remove_green_noise` — all 4 Siril rmgreen types exposed**
+  Added `maximum_mask` (type 2) and `additive_mask` (type 3) protection types, which accept the `amount` parameter (0–1). Types 0/1 (already present) do not use amount. This gives the agent proportional green removal control — critical for targets with genuine green emission (e.g., [OIII] in broadband images).
 
 ---
 
@@ -238,6 +270,11 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
 
 - [ ] **State reducers and `make_initial_state()`**
   Confirm `history` appends (not replaces) across updates. `make_initial_state(dataset_path)` calls T01 and returns a fully populated `AstroState` with `phase = INGEST`. Spec: §4, §6.
+  **Note:** `is_osc`, `exposure_seconds`, and `frame_count` from T01 metadata
+  drive the first branching decisions (calibration strategy, stacking method,
+  rejection thresholds). Add an assertion that `acquisition_meta.input_format`
+  is populated — if T01 can't determine this, every downstream decision is
+  unreliable.
 
 - [ ] **`tools/control.py` — `advance_phase` and `request_hitl`**
   Both as `@tool`-decorated functions with the exact signatures and docstrings from §6.4. These are the LLM's signals for routing — not processing tools.
@@ -348,6 +385,10 @@ it correctly and ensuring all context the LLM needs reaches it at runtime.*
 
 - [ ] **`tool_executor_post_hook()`**
   After each tool call: (1) if `entry.modifies_image`, call `analyze_image_fn` and update `state.metrics`; (2) if `entry.requires_visual_review`, call `auto_hitl_check()` which calls `generate_preview_fn` and returns a HITL payload; (3) inject payload into state routing so the graph routes to `hitl_interrupt_node` before returning to planner. `generate_preview_fn` is never called outside this hook and the mandatory HITL nodes. Spec: §6.5.
+  **Note:** When previewing linear-stage images for HITL, the preview must
+  apply an auto-stretch — raw linear FITS rendered as-is are nearly black.
+  Verify T22 `generate_preview` handles this (Siril's `savejpg` auto-stretches,
+  but confirm the output is human-reviewable at every pipeline stage).
 
 - [ ] **Feedback integration**
   User's free-text revision requests in `state.user_feedback["revision_requests"]` are read by the planner on resume and factored into parameter selection on the next iteration. Spec: §8.3.

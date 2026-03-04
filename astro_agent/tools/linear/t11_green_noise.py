@@ -42,18 +42,24 @@ class RemoveGreenNoiseInput(BaseModel):
         default="average_neutral",
         description=(
             "average_neutral (type 0): Reduces green relative to the average of "
-            "red and blue — the standard choice for most images. "
+            "red and blue — the standard choice for most images. No amount control. "
             "maximum_neutral (type 1): Reduces green relative to the maximum of "
-            "red and blue — more aggressive; use when average_neutral is insufficient."
+            "red and blue — more aggressive than average_neutral. No amount control. "
+            "maximum_mask (type 2): Creates a green-excess mask using max(R,B) as "
+            "reference. Accepts amount parameter (0–1) for proportional reduction. "
+            "Use when you want partial green removal with fine control. "
+            "additive_mask (type 3): Additive mask approach — subtracts a fraction "
+            "of the green excess. Accepts amount parameter (0–1). Gentlest method; "
+            "good for targets with genuine green content (e.g. [OIII] emission)."
         ),
     )
     amount: float = Field(
         default=1.0,
         description=(
-            "Reduction strength 0.0–1.0. "
-            "1.0: full green neutralization (appropriate when green_excess is > 0.05). "
-            "0.5–0.8: partial reduction for targets with some genuine green content "
-            "(e.g. broadband images with strong [OIII])."
+            "Reduction strength 0.0–1.0. Only used by maximum_mask (type 2) and "
+            "additive_mask (type 3). Types 0/1 ignore this parameter. "
+            "1.0: full green neutralization. "
+            "0.5–0.8: partial reduction for targets with genuine green emission."
         ),
     )
     preserve_lightness: bool = Field(
@@ -80,8 +86,18 @@ def remove_green_noise(
 
     Only apply to OSC/DSLR data (metadata.is_osc=True). Check green_excess
     from analyze_image first — if it is near zero, skip this tool to avoid
-    introducing a magenta cast. Use amount < 1.0 for targets with genuine
-    green emission content.
+    introducing a magenta cast.
+
+    Protection type guide:
+    - average_neutral: standard, reliable. Full green neutralization with no
+      amount control. Best first choice for most broadband images.
+    - maximum_neutral: more aggressive than average_neutral. Use when
+      average_neutral leaves visible green.
+    - maximum_mask: accepts amount (0–1) for proportional control. Use when
+      you want partial removal (e.g., amount=0.7 for targets with genuine
+      green [OIII] emission).
+    - additive_mask: gentlest, accepts amount (0–1). Best for narrowband
+      or targets where preserving subtle green tones matters.
 
     Must be called in linear space, typically after color_calibrate (T10).
     Run analyze_image after to confirm green_excess is reduced.
@@ -93,18 +109,24 @@ def remove_green_noise(
     stem = img_path.stem
     output_stem = f"{stem}_rmg"
 
-    type_int = 0 if protection_type == "average_neutral" else 1
-    # -nopreserve disables lightness preservation; default IS to preserve
+    _TYPE_MAP = {
+        "average_neutral": 0,
+        "maximum_neutral": 1,
+        "maximum_mask": 2,
+        "additive_mask": 3,
+    }
+    type_int = _TYPE_MAP.get(protection_type, 0)
     nopreserve_flag = " -nopreserve" if not preserve_lightness else ""
 
-    # Verified Siril 1.4 rmgreen syntax:
-    #   rmgreen [-nopreserve] [type] [amount]
-    # The `amount` argument is ONLY valid for types 2 (maximum_mask) and
-    # 3 (additive_mask). Types 0 and 1 (the only types exposed by this tool)
-    # do not accept an amount argument. Passing it would cause a Siril error.
+    # Siril 1.4 rmgreen syntax: rmgreen [-nopreserve] [type] [amount]
+    # amount is ONLY valid for types 2 and 3.
+    rmgreen_cmd = f"rmgreen{nopreserve_flag} {type_int}"
+    if type_int >= 2:
+        rmgreen_cmd += f" {amount}"
+
     commands = [
         f"load {stem}",
-        f"rmgreen{nopreserve_flag} {type_int}",
+        rmgreen_cmd,
         f"save {output_stem}",
     ]
     run_siril_script(commands, working_dir=working_dir, timeout=60)

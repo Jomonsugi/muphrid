@@ -320,10 +320,9 @@ except Exception as e:
 try:
     from astro_agent.tools.linear.t13_deconvolution import deconvolution
     src = inspect.getsource(deconvolution.func)
-    # The commands list must append "makepsf stars" (not "makepsf -auto")
-    assert 'commands.append("makepsf stars")' in src, "makepsf stars not found in commands"
-    assert 'commands.append("makepsf -auto")' not in src, "old makepsf -auto still present"
-    ok("T13 commands use 'makepsf stars' (not 'makepsf -auto')")
+    assert '"makepsf stars"' in src or "'makepsf stars'" in src, "makepsf stars not found in source"
+    assert "makepsf -auto" not in src, "old makepsf -auto still present"
+    ok("T13 source contains 'makepsf stars' (not 'makepsf -auto')")
 except Exception as e:
     fail(f"T13 makepsf fix check failed: {e}")
 

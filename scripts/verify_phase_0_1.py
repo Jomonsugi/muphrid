@@ -190,11 +190,18 @@ else:
         "files": {"lights": [], "darks": [], "flats": [], "biases": []},
         "acquisition_meta": {},
     }
+    session = {
+        "target_name": "test",
+        "bortle": 4,
+        "sqm_reading": None,
+        "remove_stars": None,
+        "notes": None,
+    }
     try:
-        state = make_empty_state(ds)
+        state = make_empty_state(ds, session)
         check("make_empty_state() returns AstroState", state["phase"] == ProcessingPhase.INGEST)
         check("make_empty_state() messages list", isinstance(state.get("messages", []), list))
-        check("make_empty_state() report list", isinstance(state.get("report", []), list))
+        check("make_empty_state() session present", state.get("session") == session)
     except Exception as e:
         check("make_empty_state()", False, str(e))
 

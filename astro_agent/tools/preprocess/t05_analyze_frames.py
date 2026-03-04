@@ -136,20 +136,26 @@ def _merge_metrics(
 
 
 def _compute_summary(frame_metrics: dict[str, dict]) -> dict:
-    fwhms      = [v["fwhm"]       for v in frame_metrics.values() if v.get("fwhm")      is not None]
-    roundnesses= [v["roundness"]  for v in frame_metrics.values() if v.get("roundness") is not None]
+    fwhms       = [v["fwhm"]             for v in frame_metrics.values() if v.get("fwhm")             is not None]
+    roundnesses = [v["roundness"]        for v in frame_metrics.values() if v.get("roundness")        is not None]
+    eccs        = [v["eccentricity"]     for v in frame_metrics.values() if v.get("eccentricity")     is not None]
+    star_counts = [v["star_count"]       for v in frame_metrics.values() if v.get("star_count")       is not None]
+    backgrounds = [v["background_level"] for v in frame_metrics.values() if v.get("background_level") is not None]
+    noises      = [v["noise_estimate"]   for v in frame_metrics.values() if v.get("noise_estimate")   is not None]
 
     if not fwhms:
         return {
+            "frame_count": len(frame_metrics),
             "median_fwhm": None, "std_fwhm": None,
-            "median_roundness": None, "best_frame": None, "worst_frame": None,
+            "median_roundness": None, "median_eccentricity": None,
+            "median_star_count": None, "median_background": None,
+            "median_noise": None, "std_background": None,
+            "best_frame": None, "worst_frame": None,
         }
 
     med_fwhm   = statistics.median(fwhms)
     std_fwhm   = statistics.stdev(fwhms) if len(fwhms) > 1 else 0.0
-    med_round  = statistics.median(roundnesses) if roundnesses else None
 
-    # Best = lowest FWHM, worst = highest FWHM
     sorted_by_fwhm = sorted(
         [(k, v["fwhm"]) for k, v in frame_metrics.items() if v.get("fwhm") is not None],
         key=lambda x: x[1],
@@ -158,11 +164,17 @@ def _compute_summary(frame_metrics: dict[str, dict]) -> dict:
     worst = sorted_by_fwhm[-1][0] if sorted_by_fwhm else None
 
     return {
-        "median_fwhm":      round(med_fwhm, 4),
-        "std_fwhm":         round(std_fwhm, 4),
-        "median_roundness": round(med_round, 4) if med_round is not None else None,
-        "best_frame":       best,
-        "worst_frame":      worst,
+        "frame_count":          len(frame_metrics),
+        "median_fwhm":          round(med_fwhm, 4),
+        "std_fwhm":             round(std_fwhm, 4),
+        "median_roundness":     round(statistics.median(roundnesses), 4) if roundnesses else None,
+        "median_eccentricity":  round(statistics.median(eccs), 4) if eccs else None,
+        "median_star_count":    int(statistics.median(star_counts)) if star_counts else None,
+        "median_background":    round(statistics.median(backgrounds), 6) if backgrounds else None,
+        "std_background":       round(statistics.stdev(backgrounds), 6) if len(backgrounds) > 1 else None,
+        "median_noise":         round(statistics.median(noises), 6) if noises else None,
+        "best_frame":           best,
+        "worst_frame":          worst,
     }
 
 

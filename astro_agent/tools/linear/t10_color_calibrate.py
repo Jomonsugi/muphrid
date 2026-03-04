@@ -233,10 +233,13 @@ class ColorCalibrateInput(BaseModel):
     background_neutralization: bool = Field(
         default=True,
         description=(
-            "Run background neutralization as part of PCC/SPCC. "
-            "Sets all channel background medians equal — removes color casts in sky. "
-            "Almost always desirable; disable only if the background contains signal "
-            "(e.g., very extended H-alpha nebula filling the frame)."
+            "Advisory flag: Siril PCC/SPCC always include background neutralization "
+            "(sets channel background medians equal, removing sky color casts). "
+            "There is no Siril CLI flag to disable this. This field exists so the "
+            "agent can record intent. If background neutralization without PCC/SPCC "
+            "is needed (e.g., plate solve fails), use T20 per_channel_bg to measure "
+            "channel imbalance, then T23 pixel_math to equalize manually: "
+            "'$image$ * (1, green_bg/red_bg, green_bg/blue_bg)'."
         ),
     )
 

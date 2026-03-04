@@ -386,6 +386,8 @@ def analyze_image(
     - linearity.is_linear + linearity.confidence: phase gate for linear/non-linear tools
     - signal_coverage_pct < 5: sparse target, be conservative with T09 / T17 / T27
     - color.mean_saturation < 0.10 post-stretch: T18 saturation boost likely needed
+    - contrast_ratio < 0.3 post-stretch: image is flat, T16 curves adjustment needed
+    - contrast_ratio > 0.8: very contrasty, be cautious with further local contrast
 
     All statistics use sigma-clipping (3σ, 3 iterations) for robustness
     against star outliers. Background noise uses Siril's bgnoise (MAD-based).
@@ -494,6 +496,12 @@ def analyze_image(
             "blue":  _histogram_percentiles(b),
         }
 
+    # Contrast ratio: usable dynamic range expressed as p95 - p5 of luminance.
+    # Measures the tonal spread the image actually occupies post-stretch.
+    # < 0.3 after stretch → image is flat, needs curves adjustment.
+    # 0.4–0.7 → good tonal distribution. > 0.8 → very contrasty.
+    contrast_ratio = float(np.percentile(lum, 95) - np.percentile(lum, 5))
+
     return {
         "channels": channels,
         "noise": {
@@ -520,6 +528,7 @@ def analyze_image(
             "channel_imbalance": channel_imbalance,
         },
         "color": color_saturation,
+        "contrast_ratio": round(contrast_ratio, 5),
         "histogram": histogram,
         "image_shape": list(data.shape),
         "is_color": is_color,

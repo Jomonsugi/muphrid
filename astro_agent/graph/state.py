@@ -87,13 +87,49 @@ class FrameMetrics(TypedDict):
 
 class Metrics(TypedDict):
     frame_stats:         dict[str, FrameMetrics]  # keyed by filename
+
+    # Core image quality (from T20 analyze_image)
     current_fwhm:        float | None
     current_background:  float | None
     current_noise:       float | None
     snr_estimate:        float | None
+    dynamic_range_db:    float | None
+
+    # Per-channel statistics (from T20 channels)
     channel_stats:       dict | None              # per-channel mean/median/std
-    background_flatness: float | None
+
+    # Background characterization
+    background_flatness: float | None             # 0–1, 1=perfectly flat
+    gradient_magnitude:  float | None             # 0–1, >0.05 = gradient present
+    per_channel_bg:      dict | None              # {red, green, blue, n_background_pixels}
+
+    # Color balance
     green_excess:        float | None
+    channel_imbalance:   float | None             # max - min channel mean
+
+    # Color saturation (HSV-based, drives T18)
+    mean_saturation:     float | None
+    median_saturation:   float | None
+
+    # Linearity state (dual-consensus: median + histogram skewness)
+    is_linear_estimate:  bool | None
+    linearity_confidence: str | None              # "high" / "medium" / "low"
+    histogram_skewness:  float | None
+
+    # Signal coverage (fraction of frame containing nebula/galaxy signal)
+    signal_coverage_pct: float | None
+
+    # Clipping (worst channel, percentage)
+    clipped_shadows_pct:    float | None
+    clipped_highlights_pct: float | None
+
+    # Star metrics (from T20 photutils)
+    star_count:          int | None
+    fwhm_std:            float | None             # PSF uniformity indicator
+    median_star_peak_ratio: float | None          # star dominance indicator
+
+    # Contrast (p95 - p5 luminance range)
+    contrast_ratio:      float | None
 
 
 class AcquisitionMeta(TypedDict):
@@ -252,6 +288,9 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
     session is the human-provided startup context: target_name (required),
     bortle (optional), remove_stars intent (optional), and free-text notes.
     """
+    input_fmt = dataset.get("acquisition_meta", {}).get("input_format")
+    is_osc = input_fmt == "raw"  # camera RAW is always OSC/CFA
+
     return AstroState(
         session=session,
         dataset=dataset,
@@ -267,7 +306,7 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
         metadata=Metadata(
             is_linear=True,
             is_color=True,
-            is_osc=False,
+            is_osc=is_osc,
             pixel_scale=None,
             plate_solve_coords=None,
             focal_length_mm=None,
@@ -279,9 +318,25 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             current_background=None,
             current_noise=None,
             snr_estimate=None,
+            dynamic_range_db=None,
             channel_stats=None,
             background_flatness=None,
+            gradient_magnitude=None,
+            per_channel_bg=None,
             green_excess=None,
+            channel_imbalance=None,
+            mean_saturation=None,
+            median_saturation=None,
+            is_linear_estimate=True,
+            linearity_confidence="high",
+            histogram_skewness=None,
+            signal_coverage_pct=None,
+            clipped_shadows_pct=None,
+            clipped_highlights_pct=None,
+            star_count=None,
+            fwhm_std=None,
+            median_star_peak_ratio=None,
+            contrast_ratio=None,
         ),
         history=[],
         processing_report=[],
