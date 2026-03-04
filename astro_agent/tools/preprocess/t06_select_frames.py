@@ -146,6 +146,12 @@ def select_frames(
     all are accepted and a warning is returned. For small datasets (< 15 subs),
     use max_fwhm_sigma=3.0 to preserve integration time.
     """
+    if not frame_metrics:
+        raise ValueError(
+            "frame_metrics is empty. Run analyze_frames (T05) first and pass "
+            "its frame_metrics output."
+        )
+
     if isinstance(criteria, SelectionCriteria):
         parsed_criteria = criteria
     else:

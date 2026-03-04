@@ -203,10 +203,20 @@ def _load_fits(image_path: Path) -> tuple[np.ndarray, bool]:
 
 
 def _load_mask(mask_path: Path, target_shape: tuple) -> np.ndarray:
+    from skimage.transform import resize
+
     with astropy_fits.open(mask_path) as hdul:
         m = hdul[0].data.astype(np.float32).squeeze()
     if m.max() > 1.0:
         m = m / m.max()
+    if m.shape != target_shape:
+        m = resize(
+            m,
+            target_shape,
+            order=1,
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.float32)
     return np.clip(m, 0.0, 1.0)
 
 
@@ -331,19 +341,27 @@ def multiscale_process(
     per_scale_stats: list[dict] = []
 
     if not per_channel:
-        # Process luminance only, recombine
-        lum = (0.2126 * data[0] + 0.7152 * data[1] + 0.0722 * data[2]).astype(np.float32)
-        processed_lum, stats = _process_plane(lum, num_scales, op_map)
-        per_scale_stats = stats
+        # Process luminance only, then recombine.
+        # For mono images (1, H, W) luminance IS the single channel.
+        # For color images (3, H, W) use rec.709 weights.
+        if data.shape[0] == 1:
+            lum = data[0]
+            processed_lum, stats = _process_plane(lum, num_scales, op_map)
+            per_scale_stats = stats
+            output = np.stack([processed_lum], axis=0)
+        else:
+            lum = (0.2126 * data[0] + 0.7152 * data[1] + 0.0722 * data[2]).astype(np.float32)
+            processed_lum, stats = _process_plane(lum, num_scales, op_map)
+            per_scale_stats = stats
 
-        # Recombine: scale each channel by the luminance ratio
-        lum_safe = np.where(lum > 1e-6, lum, 1e-6)
-        ratio = processed_lum / lum_safe
-        output = np.stack([
-            np.clip(data[0] * ratio, 0.0, 1.0),
-            np.clip(data[1] * ratio, 0.0, 1.0),
-            np.clip(data[2] * ratio, 0.0, 1.0),
-        ], axis=0)
+            # Recombine: scale each channel by the luminance ratio
+            lum_safe = np.where(lum > 1e-6, lum, 1e-6)
+            ratio = processed_lum / lum_safe
+            output = np.stack([
+                np.clip(data[0] * ratio, 0.0, 1.0),
+                np.clip(data[1] * ratio, 0.0, 1.0),
+                np.clip(data[2] * ratio, 0.0, 1.0),
+            ], axis=0)
     else:
         # Process each channel independently
         output_channels = []
@@ -356,7 +374,7 @@ def multiscale_process(
 
     # Optional mask blending
     if mask_path and Path(mask_path).exists():
-        mask = _load_mask(Path(mask_path), lum.shape if not per_channel else data.shape[1:])
+        mask = _load_mask(Path(mask_path), data.shape[1:])
         # Broadcast mask to (3, H, W)
         mask_3d = mask[np.newaxis, :, :]
         output = output * mask_3d + original * (1.0 - mask_3d)

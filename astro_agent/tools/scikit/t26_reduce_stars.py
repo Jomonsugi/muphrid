@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from skimage.filters import gaussian
 from skimage.measure import label, regionprops
 from skimage.morphology import binary_dilation, dilation, disk, erosion
+from skimage.feature import peak_local_max
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -136,7 +137,9 @@ def _load_fits(image_path: Path) -> tuple[np.ndarray, bool]:
 
 
 def _compute_luminance(data: np.ndarray) -> np.ndarray:
-    """Compute (H, W) luminance from (3, H, W) float32 array."""
+    """Compute (H, W) luminance from (C, H, W) float32 array."""
+    if data.shape[0] == 1:
+        return data[0].astype(np.float32)
     return (0.2126 * data[0] + 0.7152 * data[1] + 0.0722 * data[2]).astype(np.float32)
 
 
@@ -227,9 +230,19 @@ def reduce_stars(
     else:
         star_binary = lum > detection_threshold
 
-    # Core exclusion zone — protect innermost star centers
+    # Core exclusion zone — protect innermost star centers.
+    # Find local brightness peaks within star regions and dilate those peaks,
+    # not the full star mask (dilating the full mask would always equal itself).
     if protect_core_radius > 0:
-        core_exclusion = binary_dilation(star_binary, disk(protect_core_radius))
+        peaks = peak_local_max(
+            lum,
+            min_distance=max(1, protect_core_radius),
+            labels=star_binary,
+        )
+        peak_mask = np.zeros_like(star_binary, dtype=bool)
+        if len(peaks) > 0:
+            peak_mask[peaks[:, 0], peaks[:, 1]] = True
+        core_exclusion = binary_dilation(peak_mask, disk(protect_core_radius))
         core_exclusion = core_exclusion & star_binary
     else:
         core_exclusion = np.zeros_like(star_binary, dtype=bool)
@@ -242,8 +255,8 @@ def reduce_stars(
     else:
         star_blend_mask = star_float
 
-    # Track pre-erosion star region stats for reporting
-    star_lum_before = np.mean(lum[star_binary]) if np.any(star_binary) else 0.0
+    # Track pre-erosion star pixel count for size-reduction reporting
+    star_pixels_before = int(np.sum(star_binary))
 
     # Apply erosion per channel
     output_data = data.copy()
@@ -257,15 +270,17 @@ def reduce_stars(
             blended * star_blend_mask + data[ch_idx] * (1.0 - star_blend_mask)
         )
 
-    # Measure size reduction
-    star_lum_after = (
-        np.mean(
-            (0.2126 * output_data[0] + 0.7152 * output_data[1] + 0.0722 * output_data[2])[star_binary]
-        ) if np.any(star_binary) else 0.0
-    )
+    # Measure size reduction as shrinkage of bright star area.
+    # Threshold the output luminance at the same level used for detection
+    # and compare how many pixels are still "star-bright" vs before erosion.
+    output_lum = _compute_luminance(output_data)
+    lum_threshold = float(np.mean(lum[star_binary])) if np.any(star_binary) else detection_threshold
+    # Constrain post-counting to the original star region to avoid bright nebulosity
+    # elsewhere in the frame contaminating the star-size metric.
+    star_pixels_after = int(np.sum((output_lum > lum_threshold) & star_binary))
     mean_size_reduction_pct = (
-        float((star_lum_before - star_lum_after) / (star_lum_before + 1e-9) * 100)
-        if star_lum_before > 0
+        float((star_pixels_before - star_pixels_after) / (star_pixels_before + 1e-9) * 100)
+        if star_pixels_before > 0
         else 0.0
     )
     stars_affected_count = _count_stars_affected(star_binary)

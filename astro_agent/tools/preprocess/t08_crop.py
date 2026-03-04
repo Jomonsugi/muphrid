@@ -93,8 +93,14 @@ def _find_crop_bounds(image_path: Path, threshold: float) -> tuple[int, int, int
     x2 = min(signal.shape[1] - 1, col_max - inset)
     y2 = min(signal.shape[0] - 1, row_max - inset)
 
-    w = x2 - x
-    h = y2 - y
+    # If the insets collapse the crop window (small signal island), fall back
+    # to the original bounding box without inset so geometry remains valid.
+    if x2 < x or y2 < y:
+        x, y, x2, y2 = col_min, row_min, col_max, row_max
+
+    # +1 because row_max/col_max are inclusive pixel indices
+    w = x2 - x + 1
+    h = y2 - y + 1
 
     return x, y, w, h
 

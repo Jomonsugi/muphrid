@@ -29,7 +29,6 @@ from astropy.stats import sigma_clipped_stats
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from scipy.ndimage import gaussian_filter, sobel
-from scipy.stats import skew as scipy_skew
 
 from astro_agent.tools._siril import SirilError, run_siril_script
 
@@ -73,6 +72,12 @@ def _load_fits_float32(image_path: Path) -> tuple[np.ndarray, dict]:
     with astropy_fits.open(image_path) as hdul:
         data = hdul[0].data.astype(np.float32)
         header = dict(hdul[0].header)
+
+    # Sanitize NaN/Inf so metrics remain finite and deterministic.
+    if not np.isfinite(data).all():
+        finite_vals = data[np.isfinite(data)]
+        fill = float(np.median(finite_vals)) if finite_vals.size else 0.0
+        data = np.nan_to_num(data, nan=fill, posinf=fill, neginf=fill)
 
     # Normalize pixel range to [0, 1] if values exceed 1 (16-bit stored as int)
     if data.max() > 1.0:
@@ -266,7 +271,15 @@ def _linearity_analysis(lum: np.ndarray, overall_median: float) -> dict:
     - confidence: "high" / "medium" / "low" when median and skew disagree
     """
     sample = lum.flatten()[::16]
-    skewness = float(scipy_skew(sample))
+    centered = sample - np.mean(sample)
+    m2 = float(np.mean(centered ** 2))
+    if m2 < 1e-12:
+        skewness = 0.0
+    else:
+        m3 = float(np.mean(centered ** 3))
+        skewness = m3 / (m2 ** 1.5)
+        if not np.isfinite(skewness):
+            skewness = 0.0
     median_says_linear = overall_median < 0.15
     skew_says_linear = skewness > 2.0
     if median_says_linear and skew_says_linear:
