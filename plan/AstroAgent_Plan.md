@@ -60,7 +60,7 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
 *Imported by every tool and graph node. Build before anything else.*
 
 - [x] **`graph/state.py` — all TypedDicts**
-  `AstroState`, `PathState`, `MasterPaths`, `Metadata`, `Metrics`, `Dataset`, `FileInventory`, `AcquisitionMeta`, `FrameMetrics`, `ReportEntry`, `HITLPayload`, **`SessionContext`** with correct `Annotated` reducers for `history` (append-only), `messages` (`add_messages`), and `processing_report` (append-only list of `ReportEntry`). `PathState` includes `latest_preview: str | None`. `SessionContext` holds human-provided startup context: `target_name` (required), `bortle` (required), `sqm_reading` (optional), `remove_stars`, `notes`. Injected into every planner call via `build_state_summary()`. Spec: §2.5, §4.
+  `AstroState`, `PathState`, `MasterPaths`, `Metadata`, `Metrics`, `Dataset`, `FileInventory`, `AcquisitionMeta`, `FrameMetrics`, `ReportEntry`, `HITLPayload`, **`SessionContext`** with correct `Annotated` reducers for `history` (append-only), `messages` (`add_messages`), and `processing_report` (append-only list of `ReportEntry`). `PathState` includes `latest_preview: str | None`. `SessionContext` holds human-provided startup context: `target_name` (required), `bortle` (required), `sqm_reading` (optional), `remove_stars`, `notes`. Injected into every planner call via `build_state_summary()`. **Phase 6:** `AcquisitionMeta` extended with sensor fields (`black_level`, `white_level`, `bit_depth`, `raw_exposure_bias`, `sensor_type`). `FrameMetrics` fields made nullable; added `laplacian_sharpness` for Laplacian-fallback path. Spec: §2.5, §4.
 
 - [x] **`ProcessingPhase` enum**
   All phases from §4.3. Helper: `is_linear_phase() -> bool`. Spec: §4.3.
@@ -73,10 +73,13 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
 
 - [x] **T01 `ingest_dataset`**
   Walk directory. Auto-detect format: FITS (`*.fits` etc.) → classify by `IMAGETYP` header, extract metadata via `astropy`; Camera RAW (`*.raf`, `*.cr2`, etc.) → classify by subdirectory name (`lights/`, `darks/`, `flats/`, `bias/`), extract metadata via `pyexiftool` (wraps ExifTool binary). Store `input_format` in `AcquisitionMeta` so T03 can set CFA flags. Both paths return the same `Dataset` schema. Spec: §5 T01.
-  Tested against real Fujifilm RAF data — extracts camera model, ISO, exposure, focal length. FITS path is a stub (NotImplementedError).
+  Tested against real Fujifilm RAF data — extracts camera model, ISO, exposure, focal length. FITS path is a stub (NotImplementedError). **Phase 6:** Sensor characterization via `_sensor.py` (`sensor_info_from_tags`) — black/white level, bit depth, raw exposure bias. Calibration-frame cross-validation; `summary.sensor` reports usable sensor info.
+
+- [x] **T02b `convert_sequence`** *(new in Phase 6)*
+  Convert raw light frames to Siril FITSEQ before T03. Called after T01, before T02/T03. Enables calibration and registration on CFA lights. Spec: §5 T02b.
 
 - [x] **T02 `build_masters`**
-  Build master bias, dark, or flat via Siril `convert` + `stack`. Enforce dependency order (bias → dark → flat). Return `master_path` + stats. Spec: §5 T02.
+  Build master bias, dark, or flat via Siril `convert` + `stack`. Enforce dependency order (bias → dark → flat). Takes `acquisition_meta`; returns `master_path` + `diagnostics` (with `hitl_required`, `hitl_context`, `quality_flags`). **Phase 6:** Sensor-relative HITL thresholds, frame-count HITL, bias consistency check, dark sanity check via `_sensor.py`. Spec: §5 T02.
 
 - [x] **T03 `siril_calibrate`**
   Apply masters to lights via Siril `calibrate`. Handle CFA/OSC flag, `equalize_cfa`, cosmetic correction, dark optimization. Return calibrated sequence path. Spec: §5 T03.
@@ -85,13 +88,13 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
   Two-pass registration via Siril `register -2pass` + `seqapplyreg`. Support homography/affine/shift, Lanczos4 interpolation, optional drizzle, FWHM/roundness inline filtering. Spec: §5 T04.
 
 - [x] **T05 `analyze_frames`**
-  Per-frame FWHM, eccentricity, roundness, background, noise via Siril `seqstat` + `seqpsf`. Return `frame_metrics` dict + summary. Spec: §5 T05.
+  **Phase 6:** Parse `.seq` file directly for per-frame metadata (no seqstat/seqpsf). Star metrics (FWHM, eccentricity, etc.) when available; Laplacian-variance sharpness fallback when star detection fails. Output: `has_star_metrics`, `background_lvl`, `number_of_stars`, `laplacian_sharpness`, nullable FWHM fields. Spec: §5 T05.
 
 - [x] **T06 `select_frames`**
-  Pure Python sigma-clipping on T05 metrics. Reject frames outside FWHM, roundness, star count, and background thresholds relative to median. Contract: non-empty input never returns zero accepted frames (safety fallback); empty `frame_metrics` now fails loudly with actionable error ("run T05 first"). Spec: §5 T06.
+  Pure Python sigma-clipping on T05 metrics. **Phase 6:** Two paths: star-metrics (FWHM, roundness, star count, background) vs Laplacian-percentile when `has_star_metrics=false`. Inputs: `has_star_metrics`, `keep_percentile`. Output: `selection_path` ("star_metrics" or "laplacian_percentile"). Contract: non-empty input never returns zero accepted frames; empty `frame_metrics` fails loudly. Spec: §5 T06.
 
 - [x] **T07 `siril_stack`**
-  Parses .seq file to build filename→index map. Emits `unselect`/`select` preamble for accepted_frames. Runs `stack` with sigma/winsorized rejection, addscale normalization, wfwhm weighting, 32-bit output. Spec: §5 T07.
+  Parses .seq file to build filename→index map. Emits `unselect`/`select` preamble for accepted_frames. Runs `stack` with sigma/winsorized rejection, addscale normalization, wfwhm weighting, 32-bit output. **Phase 6:** `total_frames_hint` from T05 for acceptance-rate HITL. Returns `hitl_required`, `hitl_context` when accepted < 2 or acceptance rate < 15%. Spec: §5 T07.
 
 - [x] **T08 `auto_crop`**
   Load FITS with Astropy, compute bounding box on signal mask (per-pixel max across channels > threshold), apply 5px safety inset, run Siril `crop`. Guard added: if inset collapses tiny signal regions, fallback to non-inset bbox so crop geometry stays valid (no negative width/height). Spec: §5 T08.
@@ -259,8 +262,17 @@ All tool input schemas (T01–T27)	Pydantic BaseModel	Runtime validation + LLM s
 
 *Prove tools work independently before building the agent.*
 
-- [ ] **Manual pipeline integration script**
+- [x] **Manual pipeline integration script**
   A plain Python script (not a test, not the graph) that calls T01 → T28 sequentially on a real dataset. Every intermediate file must exist on disk. The script must demonstrate the masked-application pattern: T25 → T27 → T23 on the starless image. The script completes without error and produces a viewable export. This is the gate before Phase 7.
+
+- [x] **T02b `convert_sequence`** — raw lights → FITSEQ before calibration
+  Converts camera RAW lights to Siril sequence format prior to T02/T03. Required for Fujifilm RAF and other raw workflows.
+
+- [x] **Sensor-aware calibration** — `tools/_sensor.py`, T01/T02
+  Shared helpers for black/white level, fill fraction, flat quality. T01 extracts sensor characterization; T02 uses sensor-relative thresholds for HITL (bias consistency, dark sanity, flat quality).
+
+- [x] **`scripts/check_flat_quality.py`**
+  Standalone script to validate flat/bias quality (fill fraction, clipped pixels). Not part of the main pipeline; used for dataset health checks.
 
 ---
 

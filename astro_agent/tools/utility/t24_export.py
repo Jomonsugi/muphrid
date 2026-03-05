@@ -134,6 +134,15 @@ class ExportFinalInput(BaseModel):
             "Created if it does not exist."
         ),
     )
+    source_profile: str = Field(
+        default="sRGBlinear",
+        description=(
+            "ICC profile to assign to the input FITS before converting. "
+            "Pipeline FITS typically have no embedded profile; this sets the "
+            "working color space. 'sRGBlinear' is correct for linear or "
+            "stretched data processed in sRGB primaries."
+        ),
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -143,13 +152,20 @@ def _export_one(
     working_dir: str,
     fmt: FormatSpec,
     output_stem: str,
+    source_profile: str = "sRGBlinear",
 ) -> Path:
-    """Run a single Siril export script for one format/profile combination."""
+    """Run a single Siril export script for one format/profile combination.
+
+    Assigns source_profile first to ensure the image has a working color space
+    before converting.  Without this, icc_convert_to fails on images that have
+    no ICC profile embedded (common for pipeline FITS).
+    """
     profile = fmt.icc_profile if fmt.icc_profile in VALID_PROFILES else "sRGB"
     intent = fmt.rendering_intent if fmt.rendering_intent in VALID_INTENTS else "perceptual"
 
     commands = [
         f"load {stem}",
+        f"icc_assign {source_profile}",
         f"icc_convert_to {profile} {intent}",
     ]
 
@@ -190,6 +206,7 @@ def export_final(
     image_path: str,
     formats: list[FormatSpec] | None = None,
     output_dir: str | None = None,
+    source_profile: str = "sRGBlinear",
 ) -> dict:
     """
     Export the finished image in distribution-ready formats with ICC profiles.
@@ -227,12 +244,12 @@ def export_final(
     for fmt in formats:
         output_stem = f"{stem}{fmt.filename_suffix}"
 
-        # Export to working_dir first (Siril's default save location)
         result_path = _export_one(
             stem=stem,
             working_dir=working_dir,
             fmt=fmt,
             output_stem=output_stem,
+            source_profile=source_profile,
         )
 
         # Move to export directory

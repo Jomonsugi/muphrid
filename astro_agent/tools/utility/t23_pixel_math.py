@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from astropy.io import fits
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
@@ -71,10 +72,32 @@ class PixelMathInput(BaseModel):
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _validate_stems(expression: str, working_dir: str) -> list[str]:
+def _find_fits(wd: Path, stem: str) -> Path | None:
+    """Locate a FITS file by stem in the working directory."""
+    for ext in (".fit", ".fits", ".FIT", ".FITS"):
+        p = wd / f"{stem}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def _get_naxes(fits_path: Path) -> int:
+    """Return the number of axes (NAXIS) from a FITS primary header."""
+    with fits.open(str(fits_path)) as hdul:
+        return int(hdul[0].header.get("NAXIS", 0))
+
+
+def _validate_and_broadcast(expression: str, working_dir: str) -> tuple[list[str], str, bool]:
     """
-    Extract $stem$ variables from the expression and verify each FITS file
-    exists in working_dir. Returns list of found stems.
+    Extract $stem$ variables from the expression, verify each FITS file
+    exists, and auto-broadcast mono (1-layer) images to 3-layer RGB when
+    mixed with 3-layer images.  Returns (stems, possibly-rewritten expression,
+    auto_broadcast flag).
+
+    Siril pm requires all input images to have the same number of layers.
+    When a 1-layer mask is mixed with a 3-layer RGB image, we expand the
+    mono image via Siril rgbcomp and rewrite the expression to use the
+    expanded stem.
     """
     stems = re.findall(r"\$([^$]+)\$", expression)
     if not stems:
@@ -89,10 +112,13 @@ def _validate_stems(expression: str, working_dir: str) -> list[str]:
 
     wd = Path(working_dir)
     missing = []
-    for stem in stems:
-        fits_exists = any((wd / f"{stem}{ext}").exists() for ext in (".fit", ".fits", ".FIT", ".FITS"))
-        if not fits_exists:
+    stem_naxes: dict[str, int] = {}
+    for stem in set(stems):
+        fpath = _find_fits(wd, stem)
+        if fpath is None:
             missing.append(stem)
+        else:
+            stem_naxes[stem] = _get_naxes(fpath)
 
     if missing:
         raise FileNotFoundError(
@@ -100,7 +126,24 @@ def _validate_stems(expression: str, working_dir: str) -> list[str]:
             f"Working dir: {working_dir}"
         )
 
-    return stems
+    nax_values = set(stem_naxes.values())
+    auto_broadcast = False
+
+    if nax_values == {2, 3}:
+        auto_broadcast = True
+        mono_stems = [s for s, n in stem_naxes.items() if n == 2]
+        for mono_stem in mono_stems:
+            rgb_stem = f"{mono_stem}_rgb3"
+            if _find_fits(wd, rgb_stem) is None:
+                run_siril_script(
+                    [f"load {mono_stem}",
+                     f"rgbcomp {mono_stem} {mono_stem} {mono_stem} -out={rgb_stem}"],
+                    working_dir=working_dir,
+                    timeout=60,
+                )
+            expression = expression.replace(f"${mono_stem}$", f"${rgb_stem}$")
+
+    return list(set(re.findall(r"\$([^$]+)\$", expression))), expression, auto_broadcast
 
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
@@ -133,8 +176,7 @@ def pixel_math(
     Validate expression syntax before calling — the agent should check that
     all $variable$ names correspond to known pipeline outputs.
     """
-    # Validate all stems exist before running Siril
-    _validate_stems(expression, working_dir)
+    _stems, expression, auto_broadcast = _validate_and_broadcast(expression, working_dir)
 
     out_stem = output_stem or "pm_result"
 
@@ -154,4 +196,7 @@ def pixel_math(
             f"pixel_math: Siril did not produce expected output: {wd / out_stem}.fit"
         )
 
-    return {"result_image_path": str(output_path)}
+    return {
+        "result_image_path": str(output_path),
+        "auto_broadcast": auto_broadcast,
+    }

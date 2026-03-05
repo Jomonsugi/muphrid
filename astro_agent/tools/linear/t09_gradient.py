@@ -18,6 +18,7 @@ inspection is mandatory in V1 before releasing this checkpoint to automation.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -131,6 +132,35 @@ class RemoveGradientInput(BaseModel):
 
 # ── GraXpert backend ───────────────────────────────────────────────────────────
 
+def _normalize_correction_type(raw: str) -> str:
+    """GraXpert requires capitalized correction type: 'Subtraction' or 'Division'."""
+    mapping = {"subtraction": "Subtraction", "division": "Division"}
+    return mapping.get(raw.lower(), raw.capitalize())
+
+
+def _validate_ai_version(version: str) -> str:
+    """Ensure ai_version matches semver-like N.N.N format required by GraXpert."""
+    if not re.match(r"^\d+\.\d+\.\d+$", version):
+        raise ValueError(
+            f"ai_version must be in N.N.N format (e.g. '1.0.1'). Got: {version!r}"
+        )
+    return version
+
+
+def _probe_output_path(base_stem: Path, parent: Path) -> Path | None:
+    """GraXpert appends its own extension — probe common possibilities."""
+    candidates = [
+        parent / f"{base_stem}.fits",
+        parent / f"{base_stem}.fit",
+        parent / f"{base_stem}.fits.fits",
+        parent / f"{base_stem}.fit.fits",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
 def _run_graxpert_bge(
     image_path: Path,
     options: GraXpertBGEOptions,
@@ -142,18 +172,21 @@ def _run_graxpert_bge(
     settings = load_settings()
     graxpert_bin = settings.graxpert_bin
 
-    output_path = image_path.parent / f"{image_path.stem}_bge.fits"
-    bg_model_path = image_path.parent / f"{image_path.stem}_bge_background.fits"
+    correction = _normalize_correction_type(options.correction_type)
+    ai_version = _validate_ai_version(options.ai_version)
+
+    # Pass output path WITHOUT extension — GraXpert appends .fits itself
+    output_stem = image_path.parent / f"{image_path.stem}_bge"
 
     cmd: list[str] = [
         graxpert_bin,
         str(image_path),
         "-cli",
         "-cmd", "background-extraction",
-        "-output", str(output_path),
-        "-correction", options.correction_type,
+        "-output", str(output_stem),
+        "-correction", correction,
         "-smoothing", str(options.smoothing),
-        "-ai_version", options.ai_version,
+        "-ai_version", ai_version,
     ]
     if options.save_background_model:
         cmd.append("-bg")
@@ -166,14 +199,16 @@ def _run_graxpert_bge(
             f"{result.stderr or result.stdout}"
         )
 
-    if not output_path.exists():
+    output_path = _probe_output_path(f"{image_path.stem}_bge", image_path.parent)
+    if output_path is None:
         raise FileNotFoundError(
-            f"GraXpert did not produce expected output: {output_path}\n"
+            f"GraXpert did not produce expected output matching "
+            f"{image_path.stem}_bge.* in {image_path.parent}\n"
             f"stdout: {result.stdout}"
         )
 
-    bg_out = bg_model_path if bg_model_path.exists() else None
-    return output_path, bg_out
+    bg_model_path = _probe_output_path(f"{image_path.stem}_bge_background", image_path.parent)
+    return output_path, bg_model_path
 
 
 # ── Siril fallback backend ─────────────────────────────────────────────────────

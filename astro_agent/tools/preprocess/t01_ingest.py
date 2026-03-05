@@ -12,18 +12,33 @@ Two ingestion paths:
 
 ExifTool is the gold standard for camera RAW metadata. Install:
     brew install exiftool
+
+Sensor characterization:
+  The tool now reads black_level, white_level, bit_depth, raw_exposure_bias,
+  and sensor_type for all frame types (lights, darks, flats, biases). These
+  values are stored in AcquisitionMeta so downstream tools (T02 build_masters)
+  can compute sensor-relative quality thresholds instead of hardcoded 16-bit
+  constants.
+
+Cross-validation:
+  After sampling calibration frame EXIF, the tool checks:
+    - Flat ISO matches light ISO (different ISO → flat noise pattern mismatch)
+    - Dark exposure matches light exposure (within 5% tolerance)
+    - Bias frames have near-zero exposure (long bias = bad frame or wrong folder)
 """
 
 from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 import exiftool
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from astro_agent.graph.state import AcquisitionMeta, Dataset, FileInventory
+from astro_agent.tools._sensor import sensor_info_from_tags
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -74,12 +89,11 @@ class IngestDatasetInput(BaseModel):
 
 # ── EXIF extraction via ExifTool ───────────────────────────────────────────────
 
-# ExifTool tag names we care about (group-prefixed, default pyexiftool format)
-_EXPOSURE_KEYS   = ("EXIF:ExposureTime", "Composite:ShutterSpeed")
-_FOCAL_KEYS      = ("EXIF:FocalLength",)
-_ISO_KEYS        = ("EXIF:ISO",)
-_MODEL_KEYS      = ("EXIF:Model",)
-_MAKE_KEYS       = ("EXIF:Make",)
+_EXPOSURE_KEYS = ("EXIF:ExposureTime", "Composite:ShutterSpeed")
+_FOCAL_KEYS    = ("EXIF:FocalLength",)
+_ISO_KEYS      = ("EXIF:ISO",)
+_MODEL_KEYS    = ("EXIF:Model",)
+_MAKE_KEYS     = ("EXIF:Make",)
 
 
 def _first(tags: dict, keys: tuple[str, ...]):
@@ -90,10 +104,52 @@ def _first(tags: dict, keys: tuple[str, ...]):
     return None
 
 
-def _extract_raw_meta(light_files: list[Path], override_target_name: str | None) -> AcquisitionMeta:
+class _FrameSample(NamedTuple):
+    """Minimal per-frame EXIF snapshot used for cross-validation."""
+    path:          str
+    iso:           int | None
+    exposure_s:    float | None
+    black_level:   int
+    white_level:   int
+    bit_depth:     int
+
+
+def _sample_frame(file_path: Path) -> _FrameSample | None:
     """
-    Sample the first light frame for EXIF metadata using ExifTool.
-    Returns a fully typed AcquisitionMeta.
+    Read EXIF from one raw frame and return a _FrameSample.
+    Returns None on any error so callers can skip gracefully.
+    """
+    try:
+        with exiftool.ExifToolHelper() as et:
+            tags = et.get_metadata(str(file_path))[0]
+    except Exception:
+        return None
+
+    raw_iso = _first(tags, _ISO_KEYS)
+    iso: int | None = int(raw_iso) if raw_iso is not None else None
+
+    raw_exp = _first(tags, _EXPOSURE_KEYS)
+    exp: float | None = float(raw_exp) if raw_exp is not None else None
+
+    sensor = sensor_info_from_tags(tags)
+
+    return _FrameSample(
+        path=str(file_path),
+        iso=iso,
+        exposure_s=exp,
+        black_level=sensor.black_level,
+        white_level=sensor.white_level,
+        bit_depth=sensor.bit_depth,
+    )
+
+
+def _extract_raw_meta(
+    light_files: list[Path],
+    override_target_name: str | None,
+) -> AcquisitionMeta:
+    """
+    Sample the first light frame for EXIF + sensor metadata using ExifTool.
+    Returns a fully typed AcquisitionMeta with sensor characterization fields.
     """
     if not light_files:
         return _empty_meta("raw", override_target_name)
@@ -121,18 +177,26 @@ def _extract_raw_meta(light_files: list[Path], override_target_name: str | None)
     elif model_raw:
         camera_model = str(model_raw).strip()
 
+    sensor = sensor_info_from_tags(tags)
+
     return AcquisitionMeta(
         target_name=override_target_name,
         focal_length_mm=focal,
-        pixel_size_um=None,      # not in EXIF; known per sensor model
+        pixel_size_um=None,                    # not in EXIF; known per sensor model
         exposure_time_s=exposure,
         iso=iso,
-        gain=None,               # DSLR/mirrorless has no ADU gain concept
-        filter=None,             # no filter wheel on camera RAW setups
+        gain=None,                             # DSLR/mirrorless has no ADU gain concept
+        filter=None,                           # no filter wheel on camera RAW setups
         bortle=None,
         camera_model=camera_model,
         telescope=None,
         input_format="raw",
+        # Sensor characterization (new)
+        black_level=sensor.black_level,
+        white_level=sensor.white_level,
+        bit_depth=sensor.bit_depth,
+        raw_exposure_bias=sensor.raw_exposure_bias,
+        sensor_type=sensor.sensor_type,
     )
 
 
@@ -149,7 +213,76 @@ def _empty_meta(input_format: str, target_name: str | None = None) -> Acquisitio
         camera_model=None,
         telescope=None,
         input_format=input_format,
+        black_level=None,
+        white_level=None,
+        bit_depth=None,
+        raw_exposure_bias=None,
+        sensor_type=None,
     )
+
+
+# ── Calibration frame cross-validation ────────────────────────────────────────
+
+def _cross_validate_calibration(
+    light_meta: AcquisitionMeta,
+    buckets: dict[str, list[str]],
+) -> list[str]:
+    """
+    Sample one frame from each calibration bucket and check for mismatches.
+
+    Returns a list of warning strings (empty = all checks passed).
+    Warnings are informational — they do not halt ingestion. T02 may escalate
+    to HITL if a mismatch is critical for calibration quality.
+    """
+    warnings: list[str] = []
+
+    light_iso = light_meta.get("iso")
+    light_exp = light_meta.get("exposure_time_s")
+
+    # ── Flats: ISO should match lights ──────────────────────────────────────
+    flat_files = buckets.get("flats", [])
+    if flat_files:
+        sample = _sample_frame(Path(flat_files[0]))
+        if sample:
+            if light_iso is not None and sample.iso is not None:
+                if sample.iso != light_iso:
+                    warnings.append(
+                        f"Flat ISO ({sample.iso}) does not match light ISO ({light_iso}). "
+                        "Flat noise pattern will not subtract correctly — reshoot flats "
+                        "at the same ISO as lights."
+                    )
+            if sample.black_level == 0 and light_meta.get("black_level", 0) != 0:
+                warnings.append(
+                    "Could not read black_level from flat EXIF. Sensor-relative "
+                    "flat quality thresholds in T02 may fall back to safe defaults."
+                )
+
+    # ── Darks: exposure should be ≥ light exposure ───────────────────────────
+    dark_files = buckets.get("darks", [])
+    if dark_files and light_exp is not None:
+        sample = _sample_frame(Path(dark_files[0]))
+        if sample and sample.exposure_s is not None:
+            ratio = sample.exposure_s / light_exp if light_exp > 0 else None
+            if ratio is not None and (ratio < 0.95 or ratio > 1.05):
+                warnings.append(
+                    f"Dark exposure ({sample.exposure_s:.1f}s) differs from light "
+                    f"exposure ({light_exp:.1f}s) by more than 5%. Dark current will "
+                    "not scale correctly. For best results, match dark exposure to lights."
+                )
+
+    # ── Biases: exposure should be negligible ────────────────────────────────
+    bias_files = buckets.get("biases", [])
+    if bias_files:
+        sample = _sample_frame(Path(bias_files[0]))
+        if sample and sample.exposure_s is not None:
+            if sample.exposure_s > 0.001:
+                warnings.append(
+                    f"Bias frame exposure ({sample.exposure_s}s) is longer than expected "
+                    "(should be minimum shutter speed, typically ≤ 1/4000s). "
+                    "These may be dark frames placed in the wrong folder."
+                )
+
+    return warnings
 
 
 # ── Format detection ───────────────────────────────────────────────────────────
@@ -181,7 +314,6 @@ def _ingest_raw(
     file_pattern: str | None,
     override_target_name: str | None,
 ) -> tuple[Dataset, list[str], dict]:
-    # Use explicit override; fall back to root directory name (e.g. "M42_OrionNebula_2025")
     target_name = override_target_name or root.name
     warnings: list[str] = []
     buckets: dict[str, list[str]] = {
@@ -222,6 +354,10 @@ def _ingest_raw(
     light_paths = [Path(p) for p in buckets["lights"]]
     meta = _extract_raw_meta(light_paths, target_name)
 
+    # Cross-validate calibration frames against lights
+    calib_warnings = _cross_validate_calibration(meta, buckets)
+    warnings.extend(calib_warnings)
+
     inventory = FileInventory(
         lights=buckets["lights"],
         darks=buckets["darks"],
@@ -258,6 +394,16 @@ def _ingest_raw(
          for files in buckets.values() for f in files}
     )
 
+    sensor_summary: dict = {}
+    if meta.get("black_level") is not None:
+        sensor_summary = {
+            "black_level":        meta["black_level"],
+            "white_level":        meta["white_level"],
+            "bit_depth":          meta["bit_depth"],
+            "raw_exposure_bias":  meta.get("raw_exposure_bias"),
+            "sensor_type":        meta.get("sensor_type"),
+        }
+
     summary = {
         "lights_count":       len(buckets["lights"]),
         "darks_count":        len(buckets["darks"]),
@@ -266,6 +412,7 @@ def _ingest_raw(
         "total_exposure_s":   round(total_exp, 2),
         "input_format":       "raw",
         "detected_extensions": extensions,
+        "sensor":             sensor_summary,
     }
 
     return dataset, warnings, summary
@@ -301,6 +448,11 @@ def ingest_dataset(
     Always call this tool first. The returned dataset flows into all
     subsequent tools. Check summary.input_format — if 'raw', pass
     is_cfa=true to siril_calibrate (T03).
+
+    The returned dataset.acquisition_meta now includes sensor characterization:
+    black_level, white_level, bit_depth, raw_exposure_bias, sensor_type.
+    These values enable T02 to apply sensor-relative HITL thresholds for flat
+    quality, rather than hardcoded 16-bit constants.
     """
     root = Path(root_directory).expanduser().resolve()
     if not root.exists():

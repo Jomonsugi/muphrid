@@ -158,6 +158,7 @@ RAW FITS
   ▼
 ┌─────────────────── PRE-PROCESSING (deterministic) ──────────────────┐
 │ T01 ingest_dataset                                                  │
+│ T02b convert_sequence  (lights → FITSEQ; raw input path only)        │
 │ T02 build_masters  (bias → dark → flat)                             │
 │ T03 siril_calibrate  (apply masters to lights)                      │
 │ T04 siril_register   (star alignment)                               │
@@ -326,6 +327,12 @@ class AcquisitionMeta(TypedDict):
     camera_model: str | None
     telescope: str | None
     input_format: str | None           # "fits" | "raw" — set by T01, read by T03
+    # Sensor characterization — from T01, used by T02 for sensor-relative HITL thresholds
+    black_level: int | None           # pedestal ADU (e.g. 1022 for Fuji X-T30 II)
+    white_level: int | None            # sensor full-well ADU (e.g. 16383 for 14-bit)
+    bit_depth: int | None              # 12, 14, or 16
+    raw_exposure_bias: float | None    # stops (Fuji RAF:RawExposureBias; None for non-Fuji)
+    sensor_type: str | None            # "bayer" | "xtrans" — affects T03 debayer kernel
 ```
 
 ### 4.3 ProcessingPhase
@@ -351,12 +358,13 @@ class ProcessingPhase(str, Enum):
 
 ```python
 class FrameMetrics(TypedDict):
-    fwhm: float
-    eccentricity: float
-    star_count: int
-    background_level: float
-    noise_estimate: float
-    roundness: float
+    fwhm: float | None
+    eccentricity: float | None
+    star_count: int | None          # maps to number_of_stars in T05 .seq output
+    background_level: float | None  # maps to background_lvl in T05 .seq output
+    noise_estimate: float | None
+    roundness: float | None
+    laplacian_sharpness: float | None  # when has_star_metrics=false
 ```
 
 ### 4.5 ReportEntry
@@ -481,6 +489,50 @@ files are found in an unrecognized directory (not `lights/`, `darks/`,
 `flats/`, or `bias/`). `override_target_name` sets `AcquisitionMeta.target_name`
 when the object cannot be determined from headers or filename.
 
+**Phase 6 additions:** T01 now populates sensor characterization in
+`AcquisitionMeta`: `black_level`, `white_level`, `bit_depth`, `raw_exposure_bias`,
+`sensor_type`. Cross-validates calibration frames (flat ISO vs light ISO, dark
+exposure vs light, bias exposure near-zero). `summary.sensor` reports these
+values for agent visibility.
+
+---
+
+#### T02b — `convert_sequence`
+
+**Purpose:** Convert raw light frames to a Siril FITSEQ sequence. Required
+before T03 when input is camera RAW — Siril's `calibrate` operates on
+sequences, not loose files. T02 `build_masters` uses this internally for
+bias/dark/flat; for lights, call T02b explicitly so the sequence exists for T03.
+
+**Backend:** Siril CLI — `convert <name> -fitseq`. Copies raw files into
+working_dir with indexed names, runs convert, moves .fit and .seq to target.
+Note: single-file convert produces only .fit, not .seq; multi-file produces both.
+
+**Inputs:**
+
+```json
+{
+  "working_dir": "str",
+  "input_files": ["str"],
+  "sequence_name": "str",
+  "debayer": "bool = false"
+}
+```
+
+**Outputs:**
+
+```json
+{
+  "sequence_path": "str",
+  "fit_path": "str",
+  "seq_path": "str"
+}
+```
+
+**Agent notes:** Call after T01 for lights when `input_format == "raw"`.
+Use `sequence_name = "lights_seq"`. T03 expects `lights_sequence` to match.
+T02 build_masters invokes conversion internally for calibration frames.
+
 ---
 
 #### T02 — `build_masters`
@@ -500,9 +552,10 @@ Order constraint: bias first, then dark (optionally bias-subtracted), then flat
   "file_type": "bias | dark | flat",
   "input_files": ["str"],
   "master_bias_path": "str | null",
-  "stack_method": "average | median",
+  "stack_method": "median | mean",
   "rejection_method": "sigma_clipping | winsorized | none",
-  "rejection_sigma": [3.0, 3.0]
+  "rejection_sigma": [3.0, 3.0],
+  "acquisition_meta": "dict | null"
 }
 ```
 
@@ -511,11 +564,11 @@ Order constraint: bias first, then dark (optionally bias-subtracted), then flat
 ```json
 {
   "master_path": "str",
-  "stats": {
-    "mean_value": "float",
-    "median_value": "float",
-    "noise_estimate": "float",
-    "frame_count": "int"
+  "diagnostics": {
+    "quality_flags": "dict",
+    "warnings": ["str"],
+    "hitl_required": "bool",
+    "hitl_context": "str"
   }
 }
 ```
@@ -523,7 +576,14 @@ Order constraint: bias first, then dark (optionally bias-subtracted), then flat
 **Agent notes:** Use `median` stacking for bias (lowest noise floor). Use
 `sigma_clipping` rejection for darks and flats to eliminate cosmic rays and
 satellite trails. Pass `master_bias_path` when building master flat to remove
-bias pedestal before flat normalization.
+bias pedestal before flat normalization. Pass `acquisition_meta` from T01
+(`dataset.acquisition_meta`) to enable sensor-relative HITL thresholds — without
+it, T02 reads EXIF from the first input file as fallback.
+
+**HITL triggers (critical data issues):** `hitl_required` is true when: frame
+count < 2; bias mean exceeds sensor pedestal or all bias frames saturated; dark
+master too bright (wrong frame type) or darker than bias; flat median outside
+sensor-relative 30–55% fill range or < 2× bias median; rejection rate > 40%.
 
 ---
 
@@ -635,8 +695,10 @@ separate `select_frames` step for simple rejection.
 **Purpose:** Compute per-frame quality metrics on a registered sequence. These
 metrics feed the frame selection tool and give the agent statistical context.
 
-**Backend:** Siril CLI — `seqstat` + `seqpsf` (sequence statistics and PSF
-fitting).
+**Backend:** Parses the `.seq` file directly (R-lines: FWHM, roundness, star
+count; M-lines: mean, median, sigma, bgnoise). When star detection fails (short
+exposures, sparse fields), computes Laplacian variance from the FITSEQ pixel
+data as a sharpness proxy — no stars required.
 
 **Inputs:**
 
@@ -652,49 +714,62 @@ fitting).
 ```json
 {
   "frame_metrics": {
-    "<filename>": {
-      "fwhm": "float",
-      "eccentricity": "float",
-      "star_count": "int",
-      "background_level": "float",
-      "noise_estimate": "float",
-      "roundness": "float"
+    "<frame_idx>": {
+      "fwhm": "float | null",
+      "weighted_fwhm": "float | null",
+      "roundness": "float | null",
+      "quality": "float | null",
+      "background_lvl": "float | null",
+      "number_of_stars": "int | null",
+      "mean": "float | null",
+      "median": "float | null",
+      "sigma": "float | null",
+      "bgnoise": "float | null",
+      "laplacian_sharpness": "float | null"
     }
   },
   "summary": {
-    "median_fwhm": "float",
-    "std_fwhm": "float",
-    "median_roundness": "float",
+    "has_star_metrics": "bool",
+    "median_fwhm": "float | null",
+    "std_fwhm": "float | null",
+    "median_roundness": "float | null",
+    "median_laplacian_sharpness": "float | null",
     "best_frame": "str",
-    "worst_frame": "str"
+    "worst_frame": "str",
+    "outlier_frames": ["str"]
   }
 }
 ```
 
-**Agent notes:** The agent uses `summary.median_fwhm` and `summary.std_fwhm`
-to set rejection thresholds in `select_frames`. A high `std_fwhm` indicates
-variable seeing—tighter rejection is warranted.
+**Agent notes:** When `summary.has_star_metrics` is true, use standard
+FWHM/roundness/star_count path in `select_frames`. When false (sub-second
+exposures, sparse star field), pass `has_star_metrics=false` to T06 to use
+Laplacian-percentile ranking instead. A high `std_fwhm` (when present) indicates
+variable seeing — tighter rejection is warranted.
 
 ---
 
 #### T06 — `select_frames`
 
-**Purpose:** Accept or reject frames based on quality metrics. Rejection uses
-sigma-clipping relative to the median of each metric.
+**Purpose:** Accept or reject frames based on quality metrics. Two paths:
+star-metrics (sigma-clipping on FWHM, roundness, star count, background) and
+Laplacian-percentile (rank by sharpness, keep top N%) when star detection failed.
 
-**Backend:** Python — threshold logic on `analyze_frames` output.
+**Backend:** Python — threshold logic or percentile ranking on `analyze_frames` output.
 
 **Inputs:**
 
 ```json
 {
-  "frame_metrics": "dict[str, FrameMetrics]",
+  "frame_metrics": "dict[str, dict]",
   "criteria": {
     "max_fwhm_sigma": "float = 2.0",
     "min_roundness": "float = 0.5",
     "min_star_count": "int = 30",
-    "max_background_sigma": "float = 3.0"
-  }
+    "max_background_sigma": "float = 3.0",
+    "keep_percentile": "float = 0.85"
+  },
+  "has_star_metrics": "bool = true"
 }
 ```
 
@@ -706,17 +781,18 @@ sigma-clipping relative to the median of each metric.
   "rejected_frames": ["str"],
   "rejection_reasons": { "<filename>": "str" },
   "acceptance_rate": "float",
+  "selection_path": "str",
   "warnings": ["str"]
 }
 ```
 
-**Agent notes:** If `acceptance_rate < 0.5`, warn the user and consider
-loosening thresholds. For small datasets (< 15 subs), prefer lenient selection
-(`max_fwhm_sigma = 3.0`) to preserve integration time. The agent may
-iteratively adjust thresholds and re-evaluate. Precondition: `frame_metrics`
-must be non-empty. If empty, this tool raises an explicit error instructing the
-caller to run T05 first. For non-empty inputs, safety fallback guarantees
-`accepted_frames` is never empty.
+**Agent notes:** Pass `summary.has_star_metrics` from T05. When false, T06 uses
+Laplacian-percentile ranking (keeps best `keep_percentile` of frames by
+sharpness; default 85%). When true, uses standard sigma-clipping. Metric keys
+use `background_lvl` (from .seq R-lines) and `number_of_stars`. If
+`acceptance_rate < 0.5`, warn and consider loosening. For small datasets
+(< 15 subs), prefer `max_fwhm_sigma = 3.0`. Safety fallback: never returns
+empty `accepted_frames`.
 
 ---
 
@@ -760,7 +836,8 @@ stack registered_lights rej sigma_low sigma_high
   "rejection_sigma": [3.0, 3.0],
   "normalization": "addscale | multiplicative | none",
   "weighting": "noise | wfwhm | nbstars | none",
-  "output_32bit": "bool = true"
+  "output_32bit": "bool = true",
+  "total_frames_hint": "int | null"
 }
 ```
 
@@ -771,10 +848,14 @@ stack registered_lights rej sigma_low sigma_high
   "master_light_path": "str",
   "stack_metrics": {
     "stacked_count": "int",
+    "total_frames": "int",
+    "acceptance_rate": "float",
     "total_integration_s": "float",
     "estimated_snr_gain": "float",
     "background_noise": "float"
-  }
+  },
+  "hitl_required": "bool",
+  "hitl_context": "str"
 }
 ```
 
@@ -783,7 +864,10 @@ weighting to favor sharper subs. Use `winsorized` rejection for small datasets
 (< 15 frames) where sigma-clipping is unstable. Always stack in 32-bit float
 to preserve dynamic range for subsequent linear processing. The `accepted_frames`
 list comes directly from `select_frames` (T06); pass it unchanged so the
-frame-index mapping step can correctly drive `select`/`unselect`.
+frame-index mapping step can correctly drive `select`/`unselect`. Pass
+`total_frames_hint` from T05 `summary.frame_count` so acceptance rate is correct
+for HITL. **HITL triggers:** `hitl_required` is true when accepted count < 2 or
+acceptance rate < 15% with ≥ 5 total frames — entire session data may be unusable.
 
 ---
 

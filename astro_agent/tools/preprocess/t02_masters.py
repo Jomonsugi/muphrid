@@ -6,22 +6,43 @@ Stack calibration frames (bias, dark, or flat) into a single master frame.
 Order constraint (enforced by the agent, not this tool):
     bias → dark (bias-subtracted) → flat (bias-subtracted)
 
-Siril commands used:
-    convert <seq_name> -out=<working_dir>   # link/convert files into a sequence
-    stack   <seq_name> <method> ...         # stack into master_<type>.fit
+Siril commands used (verified against Siril 1.4 docs):
+    convert <name> -out=<dir> -fitseq         # build sequence
+    calibrate <seq> -bias=<path> [-fitseq]     # flat: subtract bias before stacking
+    stack <seq> median [-norm=] -out=<name>     # median stack (no rejection args)
+    stack <seq> rej <type> <lo> <hi> [-norm=]  # mean stack with rejection
+
+Rejection type codes for 'rej' (mean) stacking:
+    s = sigma clipping, w = winsorized, n = none, p = percentile,
+    m = median, l = linear-fit, g = generalized ESD, a = k-MAD
+
+Sensor-relative HITL thresholds:
+    HITL thresholds for flat and bias quality checks are computed from sensor
+    black_level and white_level (passed via acquisition_meta from T01). This
+    makes the checks correct for any camera — 14-bit mirrorless, 12-bit DSLR,
+    16-bit dedicated astro cam — rather than assuming 16-bit full range.
+
+    If acquisition_meta is not provided, the tool falls back to reading EXIF
+    from the first input file, and then to conservative 16-bit defaults.
 """
 
 from __future__ import annotations
 
 import re
-import shutil
-import tempfile
 from pathlib import Path
 
+import numpy as np
+from astropy.io import fits
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+from astro_agent.tools._sensor import (
+    flat_fill_state,
+    flat_siril_norm_thresholds,
+    read_frame_exif,
+)
 from astro_agent.tools._siril import SirilError, run_siril_script
+from astro_agent.tools.preprocess.t02b_convert_sequence import _convert_to_sequence
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -50,60 +71,334 @@ class BuildMastersInput(BaseModel):
         default="median",
         description=(
             "'median' (recommended for bias — lowest noise floor) or "
-            "'average' (mean — slightly higher SNR for darks/flats with good rejection)."
+            "'mean' (higher SNR for darks/flats with good rejection)."
         ),
     )
     rejection_method: str = Field(
-        default="sigma_clipping",
+        default="winsorized",
         description=(
-            "Statistical rejection to eliminate cosmic rays and satellite trails. "
-            "'sigma_clipping' (default), 'winsorized' (better for small N < 15), "
-            "or 'none'."
+            "Rejection algorithm (only used when stack_method='mean'). "
+            "'sigma' (sigma clipping), 'winsorized' (default, better for small N < 15), "
+            "or 'none'. Ignored for median stacking."
         ),
     )
     rejection_sigma: list[float] = Field(
         default=[3.0, 3.0],
         description="[low_sigma, high_sigma] for rejection. Default [3.0, 3.0].",
     )
-
-
-# ── Siril rejection method map ─────────────────────────────────────────────────
-
-_REJECTION_MAP = {
-    "sigma_clipping": "rej",
-    "winsorized":     "wrej",
-    "none":           "norej",
-}
-
-_STACK_METHOD_MAP = {
-    "median":  "median",
-    "average": "mean",
-}
-
-
-# ── Stats extraction ───────────────────────────────────────────────────────────
-
-def _extract_stats(stdout: str) -> dict:
-    """Pull mean, median, noise from Siril's stat output lines."""
-    stats: dict = {}
-
-    mean_match = re.search(r"Mean:\s*([\d.e+-]+)", stdout, re.IGNORECASE)
-    if mean_match:
-        stats["mean_value"] = float(mean_match.group(1))
-
-    med_match = re.search(r"Median:\s*([\d.e+-]+)", stdout, re.IGNORECASE)
-    if med_match:
-        stats["median_value"] = float(med_match.group(1))
-
-    noise_match = re.search(
-        r"(?:Noise|Background noise level|bgnoise):\s*([\d.e+-]+)",
-        stdout,
-        re.IGNORECASE,
+    acquisition_meta: dict | None = Field(
+        default=None,
+        description=(
+            "AcquisitionMeta dict from T01 ingest_dataset. When provided, the tool "
+            "reads black_level and white_level to compute sensor-relative HITL "
+            "thresholds for flat quality. If omitted, EXIF is read from the first "
+            "input file. Pass dataset['acquisition_meta'] from T01's output."
+        ),
     )
-    if noise_match:
-        stats["noise_estimate"] = float(noise_match.group(1))
 
-    return stats
+
+# ── Maps (verified against Siril 1.4 docs) ─────────────────────────────────────
+
+_TYPE_NORMALIZE = {
+    "bias":   "bias",
+    "biases": "bias",
+    "dark":   "dark",
+    "darks":  "dark",
+    "flat":   "flat",
+    "flats":  "flat",
+}
+
+_REJECTION_CODE = {
+    "sigma":        "s",
+    "sigma_clipping": "s",
+    "winsorized":   "w",
+    "none":         "n",
+    "percentile":   "p",
+    "median":       "m",
+    "linear":       "l",
+    "generalized":  "g",
+    "mad":          "a",
+}
+
+
+# ── Command builders ────────────────────────────────────────────────────────────
+
+def _build_stack_cmd(
+    seq_name: str,
+    stack_method: str,
+    rejection_method: str,
+    sigma_lo: float,
+    sigma_hi: float,
+    norm: str,
+    out_name: str,
+) -> str:
+    """Build a correctly-formed Siril stack command line."""
+    if stack_method == "median":
+        return f"stack {seq_name} median -norm={norm} -out={out_name}"
+
+    rej_code = _REJECTION_CODE.get(rejection_method, "w")
+    return (
+        f"stack {seq_name} rej {rej_code} {sigma_lo} {sigma_hi} "
+        f"-norm={norm} -out={out_name}"
+    )
+
+
+# ── Sensor level resolution ─────────────────────────────────────────────────────
+
+def _resolve_sensor_levels(
+    acquisition_meta: dict | None,
+    input_files: list[str],
+) -> tuple[int, int]:
+    """
+    Determine sensor black_level and white_level for threshold computation.
+
+    Priority:
+      1. acquisition_meta (from T01 — already paid for, most reliable)
+      2. EXIF from first input file (fallback if T01 wasn't run / not passed)
+      3. Conservative 16-bit defaults (last resort — never triggers false HITL)
+    """
+    if acquisition_meta:
+        black = acquisition_meta.get("black_level")
+        white = acquisition_meta.get("white_level")
+        if black is not None and white is not None and white > black:
+            return int(black), int(white)
+
+    if input_files:
+        try:
+            frame_exif = read_frame_exif(Path(input_files[0]))
+            s = frame_exif.sensor
+            if s.white_level > s.black_level:
+                return s.black_level, s.white_level
+        except Exception:
+            pass
+
+    # Conservative 16-bit default — thresholds will be correct for 16-bit
+    # and slightly permissive for lower bit-depth cameras, but never wrong.
+    return 0, 65535
+
+
+# ── Per-frame sequence reader ────────────────────────────────────────────────────
+
+def _read_fitseq_per_frame_medians(fitseq_path: Path) -> list[float]:
+    """
+    Read per-frame medians from a Siril FITSEQ (multi-extension FITS).
+
+    Siril stores each frame as a separate FITS extension. The primary HDU
+    (index 0) is usually an empty header with no image data. Returns a list
+    of median pixel values, one per frame, in ADU.
+    """
+    medians: list[float] = []
+    try:
+        with fits.open(str(fitseq_path)) as hdul:
+            for hdu in hdul:
+                if hdu.data is None or hdu.data.size == 0:
+                    continue
+                medians.append(float(np.median(hdu.data.astype(np.float64))))
+    except Exception:
+        pass
+    return medians
+
+
+# ── Diagnostics ─────────────────────────────────────────────────────────────────
+
+def _compute_diagnostics(
+    master_path: Path,
+    file_type: str,
+    frame_count: int,
+    siril_stdout: str,
+    master_bias_path: str | None,
+    acquisition_meta: dict | None = None,
+    input_files: list[str] | None = None,
+    seq_path: Path | None = None,
+) -> dict:
+    """
+    Compute quality flags, warnings, and HITL trigger from the master FITS.
+
+    HITL fires only for clearly broken situations — wrong frame type, impossible
+    signal levels, or batches too small to stack. Suboptimal-but-usable situations
+    are reported as warnings for the agent to reason about.
+
+    HITL thresholds are sensor-relative so they are correct for any camera.
+    """
+    quality_flags: dict = {"frame_count": frame_count}
+    warnings: list[str] = []
+    hitl_reasons: list[str] = []
+
+    black, white = _resolve_sensor_levels(acquisition_meta, input_files or [])
+    quality_flags["sensor_black"] = black
+    quality_flags["sensor_white"] = white
+
+    # ── Frame count: fire HITL only if clearly insufficient ───────────────
+    if frame_count < 2:
+        hitl_reasons.append(
+            f"Only {frame_count} {file_type} frame(s) provided. A minimum of 2 is "
+            f"required for any meaningful stacking or noise averaging. "
+            f"Capture more {file_type} frames before proceeding."
+        )
+    elif frame_count < 5:
+        warnings.append(
+            f"Low {file_type} frame count ({frame_count}). Stacking will succeed but "
+            f"noise averaging and rejection are limited. 15–30 frames is typical."
+        )
+
+    # ── Read master FITS for pixel-level diagnostics ──────────────────────
+    try:
+        with fits.open(str(master_path)) as hdul:
+            data = hdul[0].data.astype(np.float64)
+
+            quality_flags["mean"]   = float(np.mean(data))
+            quality_flags["median"] = float(np.median(data))
+            quality_flags["std"]    = float(np.std(data))
+            quality_flags["uniformity"] = float(
+                1.0 - (np.std(data) / np.mean(data)) if np.mean(data) > 0 else 0.0
+            )
+
+            if data.max() > 0:
+                quality_flags["hot_pixel_pct"] = float(
+                    np.sum(data > 0.95 * data.max()) / data.size * 100
+                )
+            else:
+                quality_flags["hot_pixel_pct"] = 0.0
+
+            if file_type == "flat":
+                quality_flags["flat_median_normalized"] = quality_flags["median"]
+
+            if file_type == "bias":
+                quality_flags["bias_mean"] = quality_flags["mean"]
+
+    except Exception as e:
+        warnings.append(f"Could not read master FITS for diagnostics: {e}")
+
+    # ── Parse rejection counts from Siril output ──────────────────────────
+    stacked_match  = re.search(r"(\d+)\s+frame[s]?\s+stacked",  siril_stdout, re.IGNORECASE)
+    rejected_match = re.search(r"(\d+)\s+frame[s]?\s+rejected", siril_stdout, re.IGNORECASE)
+    if stacked_match:
+        quality_flags["frames_stacked"]  = int(stacked_match.group(1))
+    if rejected_match:
+        quality_flags["frames_rejected"] = int(rejected_match.group(1))
+
+    rejection_rate = quality_flags.get("frames_rejected", 0) / max(frame_count, 1)
+    quality_flags["rejection_rate"] = rejection_rate
+
+    # ── Type-specific HITL checks ─────────────────────────────────────────
+
+    if file_type == "flat":
+        flat_med = quality_flags.get("flat_median_normalized", 0.0)
+
+        norm_min, norm_max = flat_siril_norm_thresholds(black, white)
+        quality_flags["flat_norm_threshold_min"] = round(norm_min, 4)
+        quality_flags["flat_norm_threshold_max"] = round(norm_max, 4)
+
+        if flat_med < norm_min or flat_med > norm_max:
+            fill_pct_approx = (flat_med * 65535) / max(white - black, 1) * 100
+            hitl_reasons.append(
+                f"Flat median ({flat_med:.3f} Siril-norm, ~{fill_pct_approx:.0f}% fill) "
+                f"outside sensor-relative safe range [{norm_min:.3f}, {norm_max:.3f}] "
+                f"(= 30–55% of usable ADU range: black={black}, white={white}). "
+                f"Likely under/overexposed or wrong frame type."
+            )
+
+        if master_bias_path:
+            try:
+                with fits.open(master_bias_path) as bhdul:
+                    bias_med = float(np.median(bhdul[0].data.astype(np.float64)))
+                    if flat_med > 0 and flat_med < 2 * bias_med:
+                        hitl_reasons.append(
+                            f"Flat median ({flat_med:.3f}) < 2× bias median ({bias_med:.3f}) "
+                            f"— flat signal too weak for reliable calibration."
+                        )
+            except Exception:
+                pass
+
+    if file_type == "bias":
+        bias_mean = quality_flags.get("bias_mean", 0.0)
+
+        # Existing check: bias pedestal should not exceed black_level + 5% usable
+        sensor_bias_threshold = (black + 0.05 * (white - black)) / 65535.0
+        quality_flags["bias_threshold"] = round(sensor_bias_threshold, 5)
+        if bias_mean > sensor_bias_threshold:
+            hitl_reasons.append(
+                f"Bias mean ({bias_mean:.5f}) exceeds sensor-relative threshold "
+                f"({sensor_bias_threshold:.5f} = black_level + 5% of usable range). "
+                f"Possible dark or flat mislabeled as bias."
+            )
+
+        # New: check whether ALL frames in the sequence are near saturation —
+        # the clearest signal that the entire bias batch is wrong frame type
+        if seq_path and seq_path.exists():
+            per_frame = _read_fitseq_per_frame_medians(seq_path)
+            if per_frame:
+                quality_flags["bias_per_frame_medians"] = [round(m, 1) for m in per_frame]
+                sat_threshold_adu = 0.85 * white
+                saturated_count = sum(1 for m in per_frame if m > sat_threshold_adu)
+                if saturated_count == len(per_frame):
+                    hitl_reasons.append(
+                        f"All {len(per_frame)} bias frames have median ADU > 85% of sensor "
+                        f"white level ({white}). These are not bias frames — they are "
+                        f"saturated. Check that the bias folder contains minimum-exposure "
+                        f"frames, not flats or lights."
+                    )
+                elif saturated_count > 0:
+                    warnings.append(
+                        f"{saturated_count}/{len(per_frame)} bias frames are near saturation. "
+                        f"Inspect the bias folder for mixed frame types."
+                    )
+
+    if file_type == "dark":
+        dark_mean = quality_flags.get("mean", 0.0)
+
+        # Dark master mean should not look like a flat or light:
+        # dark current on top of bias pedestal is modest for camera sensors;
+        # if dark_mean exceeds bias + 70% of usable range, something is wrong.
+        dark_max_threshold = (black + 0.70 * (white - black)) / 65535.0
+        quality_flags["dark_max_threshold"] = round(dark_max_threshold, 5)
+        if dark_mean > dark_max_threshold:
+            hitl_reasons.append(
+                f"Dark master mean ({dark_mean:.5f}) exceeds expected maximum "
+                f"({dark_max_threshold:.5f} = black_level + 70% of usable range). "
+                f"Dark frames appear too bright — possible flat or light mislabeled as dark."
+            )
+
+        # Compare to actual master bias if available
+        if master_bias_path:
+            try:
+                with fits.open(master_bias_path) as bhdul:
+                    bias_mean_norm = float(np.mean(bhdul[0].data.astype(np.float64)))
+                    quality_flags["bias_mean_for_dark_check"] = bias_mean_norm
+                    # Dark master (non-bias-subtracted) must have mean ≥ bias mean
+                    if dark_mean < bias_mean_norm * 0.95:
+                        hitl_reasons.append(
+                            f"Dark master mean ({dark_mean:.5f}) is lower than bias mean "
+                            f"({bias_mean_norm:.5f}). Dark frames cannot have less signal "
+                            f"than bias — possible accidental calibration or wrong folder."
+                        )
+            except Exception:
+                pass
+
+    # ── Universal: high rejection rate ────────────────────────────────────
+    if rejection_rate > 0.40:
+        hitl_reasons.append(
+            f"Rejection rate ({rejection_rate:.0%}) exceeds 40% — "
+            f"majority of frames are outliers; possible capture issue."
+        )
+
+    warnings.extend(hitl_reasons)
+    hitl_required = len(hitl_reasons) > 0
+
+    hitl_context = ""
+    if hitl_required:
+        hitl_context = (
+            f"Calibration master ({file_type}) quality check failed.\n"
+            + "\n".join(f"  - {r}" for r in hitl_reasons)
+            + f"\nQuality flags: {quality_flags}"
+        )
+
+    return {
+        "quality_flags": quality_flags,
+        "warnings": warnings,
+        "hitl_required": hitl_required,
+        "hitl_context": hitl_context,
+    }
 
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
@@ -115,80 +410,75 @@ def build_masters(
     input_files: list[str],
     master_bias_path: str | None = None,
     stack_method: str = "median",
-    rejection_method: str = "sigma_clipping",
+    rejection_method: str = "winsorized",
     rejection_sigma: list[float] | None = None,
+    acquisition_meta: dict | None = None,
 ) -> dict:
     """
     Stack calibration frames (bias/dark/flat) into a master calibration frame.
 
     Call in order: bias first, then dark (optionally with master_bias),
-    then flat (with master_bias). Returns master_path and frame statistics.
+    then flat (with master_bias). Returns master_path, frame statistics,
+    and diagnostics including HITL trigger flags for critical quality issues.
+
+    Pass acquisition_meta=dataset['acquisition_meta'] from T01's output to
+    enable sensor-relative HITL thresholds. Without it, T02 reads EXIF from
+    the first input file as a fallback.
     """
     if rejection_sigma is None:
         rejection_sigma = [3.0, 3.0]
 
-    file_type = file_type.lower().rstrip("s")  # normalise "darks" → "dark"
+    file_type = _TYPE_NORMALIZE.get(file_type.lower().strip(), file_type.lower().strip())
     if file_type not in ("bias", "dark", "flat"):
         raise ValueError(f"file_type must be 'bias', 'dark', or 'flat'. Got: {file_type!r}")
 
-    rej_code = _REJECTION_MAP.get(rejection_method, "rej")
-    stack_cmd = _STACK_METHOD_MAP.get(stack_method, "median")
+    if stack_method not in ("median", "mean"):
+        raise ValueError(f"stack_method must be 'median' or 'mean'. Got: {stack_method!r}")
 
     wdir = Path(working_dir)
     wdir.mkdir(parents=True, exist_ok=True)
 
-    # Copy input files into a temp subdir so Siril's convert can find them
-    # with clean, sequential naming it expects for sequence building.
-    with tempfile.TemporaryDirectory(dir=wdir, prefix=f"{file_type}_raw_") as tmpdir:
-        tmp = Path(tmpdir)
-        for i, src in enumerate(sorted(input_files)):
-            suffix = Path(src).suffix
-            dst = tmp / f"{file_type}_{i:04d}{suffix}"
-            shutil.copy2(src, dst)
+    seq_name = f"{file_type}_seq"
+    master_out = f"master_{file_type}"
 
-        seq_name = f"{file_type}_seq"
-        master_out = f"master_{file_type}"
+    # ── Step 1: Convert raw frames to a FITSEQ sequence ───────────────────
+    _convert_to_sequence(
+        working_dir=str(wdir),
+        input_files=input_files,
+        sequence_name=seq_name,
+        debayer=False,
+    )
 
-        commands: list[str] = [
-            f"convert {file_type}_seq -out={wdir} -fitseq",
-        ]
-
-        # Build the stack command
-        sigma_lo, sigma_hi = rejection_sigma[0], rejection_sigma[1]
-        stack_line = (
-            f"stack {seq_name} {stack_cmd} {rej_code} {sigma_lo} {sigma_hi} "
-            f"-norm=addscale -out={master_out}"
+    # ── Step 2: For flats, calibrate (bias-subtract) before stacking ──────
+    stack_seq = seq_name
+    if file_type == "flat" and master_bias_path:
+        run_siril_script(
+            [f"calibrate {seq_name} -bias={master_bias_path} -fitseq"],
+            working_dir=str(wdir),
+            timeout=300,
         )
+        stack_seq = f"pp_{seq_name}"
 
-        # For flat frames: subtract master bias before stacking
-        if file_type == "flat" and master_bias_path:
-            commands.append(
-                f"stack {seq_name} {stack_cmd} {rej_code} {sigma_lo} {sigma_hi} "
-                f"-bias={master_bias_path} -norm=mulscale -out={master_out}"
-            )
-        else:
-            commands.append(stack_line)
+    # ── Step 3: Stack ─────────────────────────────────────────────────────
+    norm = "mulscale" if file_type == "flat" else "addscale"
+    if file_type == "bias":
+        norm = "addscale"
 
-        try:
-            result = run_siril_script(commands, working_dir=str(tmp), timeout=300)
-        except SirilError:
-            # Re-run with working_dir = wdir (sequence was written there by -out)
-            result = run_siril_script(
-                [
-                    f"stack {seq_name} {stack_cmd} {rej_code} {sigma_lo} {sigma_hi} "
-                    + (
-                        f"-bias={master_bias_path} -norm=mulscale -out={master_out}"
-                        if file_type == "flat" and master_bias_path
-                        else f"-norm=addscale -out={master_out}"
-                    )
-                ],
-                working_dir=str(wdir),
-                timeout=300,
-            )
+    stack_cmd = _build_stack_cmd(
+        seq_name=stack_seq,
+        stack_method=stack_method,
+        rejection_method=rejection_method,
+        sigma_lo=rejection_sigma[0],
+        sigma_hi=rejection_sigma[1],
+        norm=norm,
+        out_name=master_out,
+    )
 
+    result = run_siril_script([stack_cmd], working_dir=str(wdir), timeout=300)
+
+    # ── Step 4: Locate master output ──────────────────────────────────────
     master_fits = wdir / f"{master_out}.fit"
     if not master_fits.exists():
-        # Siril sometimes writes .fits
         master_fits = wdir / f"{master_out}.fits"
     if not master_fits.exists():
         raise FileNotFoundError(
@@ -196,10 +486,21 @@ def build_masters(
             f"Siril stdout:\n{result.stdout[-1000:]}"
         )
 
-    stats = _extract_stats(result.stdout)
-    stats["frame_count"] = len(input_files)
+    # ── Step 5: Diagnostics ───────────────────────────────────────────────
+    # Pass the pre-stack sequence path so bias consistency can read per-frame medians
+    seq_fits = wdir / f"{seq_name}.fit"
+    diagnostics = _compute_diagnostics(
+        master_path=master_fits,
+        file_type=file_type,
+        frame_count=len(input_files),
+        siril_stdout=result.stdout,
+        master_bias_path=master_bias_path,
+        acquisition_meta=acquisition_meta,
+        input_files=input_files,
+        seq_path=seq_fits if seq_fits.exists() else None,
+    )
 
     return {
         "master_path": str(master_fits),
-        "stats": stats,
+        "diagnostics": diagnostics,
     }

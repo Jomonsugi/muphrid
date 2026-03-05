@@ -92,6 +92,7 @@ class SaturationAdjustInput(BaseModel):
         ),
     )
     amount: float = Field(
+        default=0.5,
         description=(
             "Saturation adjustment multiplier. "
             "> 0: increase saturation (0.3–1.0 typical). "
@@ -195,7 +196,8 @@ def saturation_adjust(
     hue_desc = HUE_RANGE_DESCRIPTIONS.get(hue_target, "all") if hue_target is not None else "all"
 
     return {
-        "saturated_image_path": str(output_path),
+        "processed_image_path": str(output_path),
+        "saturated_image_path": str(output_path),  # backward-compat alias
         "method": method,
         "amount": amount,
         "hue_target": hue_target,

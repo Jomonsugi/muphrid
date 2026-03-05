@@ -69,12 +69,18 @@ _STDOUT_PATTERNS: list[tuple[str, re.Pattern, str | int]] = [
     ("output_path",       re.compile(r"Saving FITS image:\s*(.+\.fit[s]?)"),    1),
 ]
 
+_SUCCESS_MARKER = "Script execution finished successfully"
+
+# Patterns that indicate a real script failure.  Applied only when the script
+# did NOT report success (the success marker gates pattern-based detection).
+# Verified against Siril 1.4.2 runtime output — "Error in line N" is the
+# definitive per-command failure message; "Script execution failed" is the
+# global failure message.
 _ERROR_PATTERNS: list[re.Pattern] = [
-    re.compile(r"^\s*ERROR\b",   re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^\s*FAILED\b",  re.IGNORECASE | re.MULTILINE),
-    re.compile(r"command not found", re.IGNORECASE),
-    re.compile(r"No such file or directory", re.IGNORECASE),
-    re.compile(r"Script error",  re.IGNORECASE),
+    re.compile(r"Error in line \d+",            re.IGNORECASE),
+    re.compile(r"Script execution failed",      re.IGNORECASE),
+    re.compile(r"command not found",            re.IGNORECASE),
+    re.compile(r"No such file or directory",    re.IGNORECASE),
 ]
 
 
@@ -98,6 +104,14 @@ def _check_for_errors(result: SirilResult, exit_code: int) -> None:
             f"stdout tail: {result.stdout[-500:].strip() or '(empty)'}",
             result,
         )
+
+    # If Siril itself reports success, trust it — do not second-guess with
+    # pattern matching.  The old broad "^\s*ERROR\b" regex was triggering on
+    # informational log lines that contained the word ERROR even when the
+    # script completed without any command failures.
+    if _SUCCESS_MARKER in result.stdout:
+        return
+
     combined = result.stdout + result.stderr
     for pattern in _ERROR_PATTERNS:
         if pattern.search(combined):

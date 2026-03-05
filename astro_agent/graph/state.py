@@ -145,6 +145,13 @@ class AcquisitionMeta(TypedDict):
     telescope:        str | None
     input_format:     str | None     # "fits" | "raw" — set by T01, read by T03
 
+    # Sensor characterization — populated by T01, used by T02 for sensor-relative thresholds
+    black_level:       int | None    # pedestal ADU (e.g. 1022 for Fuji X-T30 II)
+    white_level:       int | None    # sensor full-well ADU (e.g. 16383 for 14-bit)
+    bit_depth:         int | None    # raw bit depth: 12, 14, or 16
+    raw_exposure_bias: float | None  # stops (Fuji RAF:RawExposureBias; None for non-Fuji)
+    sensor_type:       str | None    # "bayer" | "xtrans" — affects T03 debayer kernel
+
 
 class FileInventory(TypedDict):
     lights: list[str]

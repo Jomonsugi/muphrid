@@ -364,7 +364,8 @@ def deconvolution(
     psf_fwhm_used = _parse_psf_fwhm(result.stdout)
 
     return {
-        "sharpened_image_path": str(output_path),
+        "processed_image_path": str(output_path),
+        "sharpened_image_path": str(output_path),  # backward-compat alias
         "method": method,
         "psf_source": psf_source,
         "psf_profile": makepsf_manual_options.profile if psf_source == "manual" else None,

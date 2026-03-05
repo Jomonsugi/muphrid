@@ -6,7 +6,7 @@ Two-pass registration automatically selects the best reference frame.
 
 Siril commands:
     register <seq> -2pass [-transf=<type>] [-maxstars=N]
-    seqapplyreg <seq> [-interp=<method>] [-drizzle] [-framing=max]
+    seqapplyreg <seq> [-interp=<method>] [-drizzle] [-framing=min|max|cog]
                 [-filter-fwhm=<pct>%] [-filter-round=<pct>%]
 """
 
@@ -78,6 +78,15 @@ class SirilRegisterInput(BaseModel):
             "Rejects elongated-star frames from tracking errors."
         ),
     )
+    framing: str = Field(
+        default="min",
+        description=(
+            "Frame boundary strategy for seqapplyreg. "
+            "'min' (default — intersection of all frames, safe for FITSEQ/SER), "
+            "'max' (union — larger canvas, requires individual FITS output), "
+            "'cog' (center-of-gravity weighted)."
+        ),
+    )
 
 
 # ── Output parsing ─────────────────────────────────────────────────────────────
@@ -120,6 +129,7 @@ def siril_register(
     drizzle_pixfrac: float = 1.0,
     filter_fwhm_pct: float | None = None,
     filter_round_pct: float | None = None,
+    framing: str = "min",
 ) -> dict:
     """
     Align calibrated light frames using two-pass star matching registration.
@@ -145,7 +155,8 @@ def siril_register(
     )
 
     # Pass 2: seqapplyreg (actually resample all frames)
-    applyreg_parts = [f"seqapplyreg {calibrated_sequence} -interp={interp} -framing=max"]
+    framing_val = framing if framing in ("min", "max", "cog") else "min"
+    applyreg_parts = [f"seqapplyreg {calibrated_sequence} -interp={interp} -framing={framing_val}"]
     if drizzle:
         applyreg_parts.append(f"-drizzle -pixfrac={drizzle_pixfrac}")
     if filter_fwhm_pct is not None:
