@@ -37,6 +37,7 @@ import exiftool
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+from astro_agent.equipment import resolve_focal_length, resolve_pixel_size
 from astro_agent.graph.state import AcquisitionMeta, Dataset, FileInventory
 from astro_agent.tools._sensor import sensor_info_from_tags
 
@@ -179,10 +180,17 @@ def _extract_raw_meta(
 
     sensor = sensor_info_from_tags(tags)
 
+    px_um: float | None = None
+    try:
+        px_um = resolve_pixel_size()
+    except ValueError:
+        pass
+
     return AcquisitionMeta(
         target_name=override_target_name,
-        focal_length_mm=focal,
-        pixel_size_um=None,                    # not in EXIF; known per sensor model
+        target_coords=None,  # populated later by T29 resolve_target
+        focal_length_mm=resolve_focal_length(focal),
+        pixel_size_um=px_um,
         exposure_time_s=exposure,
         iso=iso,
         gain=None,                             # DSLR/mirrorless has no ADU gain concept
@@ -203,6 +211,7 @@ def _extract_raw_meta(
 def _empty_meta(input_format: str, target_name: str | None = None) -> AcquisitionMeta:
     return AcquisitionMeta(
         target_name=target_name,
+        target_coords=None,
         focal_length_mm=None,
         pixel_size_um=None,
         exposure_time_s=None,

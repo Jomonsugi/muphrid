@@ -48,7 +48,9 @@ from scipy.ndimage import convolve1d
 B3_SPLINE_KERNEL = np.array([1 / 16, 4 / 16, 6 / 16, 4 / 16, 1 / 16], dtype=np.float32)
 
 
-def b3_atrous_decompose(data: np.ndarray, num_scales: int) -> list[np.ndarray]:
+def b3_atrous_decompose(
+    data: np.ndarray, num_scales: int, boundary_mode: str = "reflect",
+) -> list[np.ndarray]:
     """
     Compute the B3-spline à trous wavelet decomposition.
 
@@ -62,22 +64,19 @@ def b3_atrous_decompose(data: np.ndarray, num_scales: int) -> list[np.ndarray]:
 
     for i in range(num_scales):
         stride = 2 ** i
-        # Build sparse 1D kernel with interleaved zeros (holes)
-        # Length: 4 * stride + 1 (4 gaps between 5 kernel values)
         k_len = 4 * stride + 1
         sparse_kernel = np.zeros(k_len, dtype=np.float32)
         for j, c in enumerate(B3_SPLINE_KERNEL):
             sparse_kernel[j * stride] = c
 
-        # Apply separable 2D convolution (horizontal then vertical)
-        smooth_h = convolve1d(approx, sparse_kernel, axis=1, mode="reflect")
-        smooth = convolve1d(smooth_h, sparse_kernel, axis=0, mode="reflect")
+        smooth_h = convolve1d(approx, sparse_kernel, axis=1, mode=boundary_mode)
+        smooth = convolve1d(smooth_h, sparse_kernel, axis=0, mode=boundary_mode)
 
         detail = approx - smooth
         layers.append(detail)
         approx = smooth
 
-    layers.append(approx)  # Final approximation residual
+    layers.append(approx)
     return layers
 
 
@@ -99,6 +98,16 @@ def _soft_threshold(coeffs: np.ndarray, sigma_factor: float) -> np.ndarray:
     return sign * np.maximum(np.abs(coeffs) - threshold, 0.0)
 
 
+def _hard_threshold(coeffs: np.ndarray, sigma_factor: float) -> np.ndarray:
+    """
+    MAD-normalized hard thresholding. Coefficients below threshold are zeroed;
+    those above are kept at full value (no attenuation).
+    """
+    mad = float(np.median(np.abs(coeffs)))
+    threshold = sigma_factor * mad / 0.6745
+    return np.where(np.abs(coeffs) >= threshold, coeffs, 0.0)
+
+
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class ScaleOperation(BaseModel):
@@ -112,7 +121,7 @@ class ScaleOperation(BaseModel):
         description=(
             "Operation to apply at this scale:\n"
             "  'sharpen': multiply coefficients by weight (>1 = boost, <1 = reduce).\n"
-            "  'denoise': soft-threshold coefficients with MAD-normalized threshold.\n"
+            "  'denoise': threshold coefficients with MAD-normalized threshold.\n"
             "  'suppress': zero all coefficients (remove this scale entirely).\n"
             "  'passthrough': leave coefficients unchanged."
         )
@@ -132,6 +141,14 @@ class ScaleOperation(BaseModel):
             "Threshold = sigma * median(|coeffs|) / 0.6745. "
             "0.5 = moderate (scale 1). 0.2 = gentle (scale 2). "
             "Required when operation='denoise'."
+        ),
+    )
+    threshold_type: str = Field(
+        default="soft",
+        description=(
+            "Thresholding method for 'denoise' operation. "
+            "'soft': smooth attenuation (default, preserves gradients). "
+            "'hard': binary keep/discard (preserves peak values, can ring)."
         ),
     )
 
@@ -169,6 +186,15 @@ class MultiscaleProcessInput(BaseModel):
             "over-smoothing nebula structure."
         ),
     )
+    boundary_mode: str = Field(
+        default="reflect",
+        description=(
+            "Boundary handling for the wavelet convolution. "
+            "'reflect': mirror at edge (default, best for most images). "
+            "'nearest': extend edge pixels. 'constant': pad with zeros. "
+            "'wrap': periodic (use for tiled/seamless textures)."
+        ),
+    )
     per_channel: bool = Field(
         default=False,
         description=(
@@ -176,6 +202,17 @@ class MultiscaleProcessInput(BaseModel):
             "Preserves color ratios and prevents chromatic artifacts. "
             "If True: process each RGB channel independently. "
             "Use only when channels have very different noise characteristics."
+        ),
+    )
+    color_reconstruction: str = Field(
+        default="ratio",
+        description=(
+            "Method for recombining color after luminance-only processing "
+            "(ignored when per_channel=True). "
+            "'ratio': scale each channel by processed_lum / original_lum "
+            "(default, preserves color ratios). "
+            "'additive': add the luminance delta to each channel "
+            "(better for very dark regions where ratio method amplifies noise)."
         ),
     )
     output_stem: str | None = Field(
@@ -249,7 +286,10 @@ def _apply_operation(
                 f"Scale {scale_op.scale}: denoise_sigma must be > 0 "
                 "(e.g. 0.5 for scale 1, 0.2 for scale 2)."
             )
-        result = _soft_threshold(detail, sigma)
+        if scale_op.threshold_type == "hard":
+            result = _hard_threshold(detail, sigma)
+        else:
+            result = _soft_threshold(detail, sigma)
     elif op == "suppress":
         result = np.zeros_like(detail)
     elif op == "passthrough":
@@ -268,9 +308,10 @@ def _process_plane(
     plane: np.ndarray,
     num_scales: int,
     op_map: dict,
+    boundary_mode: str = "reflect",
 ) -> tuple[np.ndarray, list[dict]]:
     """Decompose, apply operations, reconstruct a single 2D plane."""
-    layers = b3_atrous_decompose(plane, num_scales)
+    layers = b3_atrous_decompose(plane, num_scales, boundary_mode=boundary_mode)
 
     per_scale_stats = []
     for scale_idx in range(1, num_scales + 1):
@@ -299,7 +340,9 @@ def multiscale_process(
     num_scales: int = 5,
     scale_operations: list[ScaleOperation] | None = None,
     mask_path: str | None = None,
+    boundary_mode: str = "reflect",
     per_channel: bool = False,
+    color_reconstruction: str = "ratio",
     output_stem: str | None = None,
 ) -> dict:
     """
@@ -341,35 +384,38 @@ def multiscale_process(
     per_scale_stats: list[dict] = []
 
     if not per_channel:
-        # Process luminance only, then recombine.
-        # For mono images (1, H, W) luminance IS the single channel.
-        # For color images (3, H, W) use rec.709 weights.
         if data.shape[0] == 1:
             lum = data[0]
-            processed_lum, stats = _process_plane(lum, num_scales, op_map)
+            processed_lum, stats = _process_plane(lum, num_scales, op_map, boundary_mode)
             per_scale_stats = stats
             output = np.stack([processed_lum], axis=0)
         else:
             lum = (0.2126 * data[0] + 0.7152 * data[1] + 0.0722 * data[2]).astype(np.float32)
-            processed_lum, stats = _process_plane(lum, num_scales, op_map)
+            processed_lum, stats = _process_plane(lum, num_scales, op_map, boundary_mode)
             per_scale_stats = stats
 
-            # Recombine: scale each channel by the luminance ratio
-            lum_safe = np.where(lum > 1e-6, lum, 1e-6)
-            ratio = processed_lum / lum_safe
-            output = np.stack([
-                np.clip(data[0] * ratio, 0.0, 1.0),
-                np.clip(data[1] * ratio, 0.0, 1.0),
-                np.clip(data[2] * ratio, 0.0, 1.0),
-            ], axis=0)
+            if color_reconstruction == "additive":
+                delta = processed_lum - lum
+                output = np.stack([
+                    np.clip(data[0] + delta, 0.0, 1.0),
+                    np.clip(data[1] + delta, 0.0, 1.0),
+                    np.clip(data[2] + delta, 0.0, 1.0),
+                ], axis=0)
+            else:
+                lum_safe = np.where(lum > 1e-6, lum, 1e-6)
+                ratio = processed_lum / lum_safe
+                output = np.stack([
+                    np.clip(data[0] * ratio, 0.0, 1.0),
+                    np.clip(data[1] * ratio, 0.0, 1.0),
+                    np.clip(data[2] * ratio, 0.0, 1.0),
+                ], axis=0)
     else:
-        # Process each channel independently
         output_channels = []
         for ch_idx in range(data.shape[0]):
-            processed_ch, stats = _process_plane(data[ch_idx], num_scales, op_map)
+            processed_ch, stats = _process_plane(data[ch_idx], num_scales, op_map, boundary_mode)
             output_channels.append(processed_ch)
             if ch_idx == 0:
-                per_scale_stats = stats  # Report stats from first channel
+                per_scale_stats = stats
         output = np.stack(output_channels, axis=0)
 
     # Optional mask blending

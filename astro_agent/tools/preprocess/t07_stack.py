@@ -14,7 +14,19 @@ Frame exclusion mechanism:
     IMPORTANT: Siril 1.4 select/unselect use 1-based indexing at runtime,
     verified by ground-truth testing against Siril 1.4.2.
 
-Always stack in 32-bit float to preserve dynamic range for linear processing.
+Siril docs:
+    stack seqname { sum | min | max } [-output_norm] [-out=] [-maximize] [-upscale] [-32b]
+    stack seqname { med | median } [-nonorm, -norm=] [-fastnorm] [-rgb_equal]
+        [-output_norm] [-out=] [-32b]
+    stack seqname { rej | mean } [rejection_type] [sigma_low sigma_high]
+        [-rejmap[s]] [-nonorm, -norm=] [-fastnorm] [-overlap_norm]
+        [-weight={noise|wfwhm|nbstars|nbstack}] [-feather=]
+        [-rgb_equal] [-output_norm] [-out=] [-maximize] [-upscale] [-32b]
+
+    Rejection types: n[one], p[ercentile], s[igma], m[edian], w[insorized],
+                     l[inear], g[eneralized], [m]a[d]
+
+    Normalization: -norm=add, -norm=mul, -norm=addscale, -norm=mulscale, -nonorm
 """
 
 from __future__ import annotations
@@ -42,54 +54,145 @@ class SirilStackInput(BaseModel):
     )
     accepted_frames: list[str] = Field(
         description=(
-            "List of accepted frame filenames from select_frames (T06). "
-            "Pass the accepted_frames list unchanged — filenames must match "
-            "those in the .seq file."
+            "List of accepted frame keys from select_frames (T06). "
+            "Must match frame keys in the .seq file."
         )
     )
+
+    # ── Stack method ──────────────────────────────────────────────────────
     stack_method: str = Field(
         default="mean",
-        description="'mean' (default, best SNR with rejection) or 'median'.",
+        description=(
+            "Stacking method. "
+            "'mean' (default — average with rejection, best SNR), "
+            "'median' (robust to outliers, no rejection needed, lower SNR), "
+            "'sum' (additive — for photometry), "
+            "'min' (minimum — for dark/hot pixel maps), "
+            "'max' (maximum — for satellite/meteor detection)."
+        ),
     )
+
+    # ── Rejection (only for mean/rej stacking) ────────────────────────────
     rejection_method: str = Field(
         default="sigma_clipping",
         description=(
-            "'sigma_clipping' (default), 'winsorized' (better for < 15 frames), "
-            "'linear_fit', or 'none'."
+            "Pixel rejection algorithm (only for stack_method='mean'). "
+            "'sigma_clipping' (default — standard sigma clip), "
+            "'winsorized' (better for < 15 frames — replaces outliers instead of removing), "
+            "'percentile' (fixed percentile rejection), "
+            "'median' (median-based rejection), "
+            "'linear_fit' (rejects based on linear fit residuals), "
+            "'generalized' (Generalized ESD test — robust for mixed populations), "
+            "'mad' (k-MAD clipping — robust to asymmetric distributions), "
+            "'none' (no rejection)."
         ),
     )
     rejection_sigma: list[float] = Field(
         default=[3.0, 3.0],
-        description="[low_sigma, high_sigma] for rejection.",
+        description=(
+            "[low_sigma, high_sigma] for rejection algorithms. "
+            "Tighter values (2.0) reject more aggressively; "
+            "looser values (4.0) preserve more but risk artifacts."
+        ),
     )
+
+    # ── Normalization ─────────────────────────────────────────────────────
     normalization: str = Field(
         default="addscale",
         description=(
-            "'addscale' (additive + scale normalization, default), "
-            "'multiplicative', or 'none'."
+            "Input normalization before stacking. "
+            "'addscale' (default — additive with scale, best general choice), "
+            "'mulscale' (multiplicative with scale), "
+            "'add' (additive only), "
+            "'mul' (multiplicative only), "
+            "'none' (no normalization)."
         ),
     )
+    fast_norm: bool = Field(
+        default=False,
+        description=(
+            "Use faster normalization estimators instead of IKSS. "
+            "Faster but slightly less accurate. Use for large datasets."
+        ),
+    )
+    overlap_norm: bool = Field(
+        default=False,
+        description=(
+            "Compute normalization on image overlaps instead of whole images. "
+            "Only valid with -maximize framing. Useful for mosaic stacking."
+        ),
+    )
+    output_norm: bool = Field(
+        default=False,
+        description="Rescale the stacked result to [0, 1] range.",
+    )
+
+    # ── Weighting ─────────────────────────────────────────────────────────
     weighting: str = Field(
         default="wfwhm",
         description=(
-            "Frame weighting strategy. "
-            "'wfwhm' (weight by FWHM — favors sharper frames), "
-            "'noise' (weight by noise level), 'nbstars', or 'none'."
+            "Frame weighting strategy (only for mean/rej stacking). "
+            "'wfwhm' (weight by weighted FWHM — favors sharper frames), "
+            "'noise' (weight by inverse background noise), "
+            "'nbstars' (weight by star count), "
+            "'nbstack' (weight by prior stacking count — for live stacking), "
+            "'none' (equal weight)."
         ),
     )
+
+    # ── Output options ────────────────────────────────────────────────────
     output_32bit: bool = Field(
         default=True,
+        description="Stack in 32-bit float. Always recommended for astrophotography.",
+    )
+    rgb_equal: bool = Field(
+        default=False,
         description=(
-            "Stack in 32-bit float. Always True for astrophotography — "
-            "preserves dynamic range for subsequent linear processing."
+            "Equalize RGB channel backgrounds during stacking. "
+            "Useful when PCC/SPCC or unlinked autostretch will not be used."
         ),
     )
+    output_name: str = Field(
+        default="master_light",
+        description="Output filename (without extension).",
+    )
+
+    # ── Framing ───────────────────────────────────────────────────────────
+    maximize: bool = Field(
+        default=False,
+        description=(
+            "Create full bounding-box output encompassing all frames. "
+            "Larger canvas with borders — use with framing='max' in T04."
+        ),
+    )
+    upscale: bool = Field(
+        default=False,
+        description="Upscale by 2× before stacking using registration data.",
+    )
+    feather: int | None = Field(
+        default=None,
+        description=(
+            "Apply feathering mask on image borders over this distance (pixels). "
+            "Smooths edge transitions for mosaic stacking."
+        ),
+    )
+
+    # ── Rejection maps ────────────────────────────────────────────────────
+    rejection_maps: str | None = Field(
+        default=None,
+        description=(
+            "Generate rejection maps. "
+            "'single' = one map showing all rejections, "
+            "'split' = separate low/high rejection maps."
+        ),
+    )
+
+    # ── HITL ──────────────────────────────────────────────────────────────
     total_frames_hint: int | None = Field(
         default=None,
         description=(
             "Total registered frames from T05 summary.frame_count. "
-            "Used to compute acceptance rate for HITL. If omitted, "
-            "the tool reads n_frames from the .seq file directly."
+            "Used to compute acceptance rate for HITL."
         ),
     )
 
@@ -99,15 +202,6 @@ class SirilStackInput(BaseModel):
 def _parse_seq_file(seq_path: Path) -> tuple[dict[str, int], int]:
     """
     Parse a Siril .seq file and return ({frame_key: frame_index}, n_frames).
-
-    Siril .seq format (v4+, from src/io/seqfile.c):
-        S 'name' beg number selnum fixed refimage version ...
-        I filenum incl [width,height]
-
-    For FITSEQ: filenum is 0-based frame index, frame_key = str(filenum).
-    For regular FITS: filenum maps to basename<filenum>.fit, frame_key = str(filenum).
-
-    Returns both the mapping and total frame count from the S line.
     """
     name_to_index: dict[str, int] = {}
     n_frames = 0
@@ -148,9 +242,8 @@ def _build_selection_commands(
     """
     Generate unselect-all + select-accepted Siril commands.
 
-    IMPORTANT: Siril 1.4 select/unselect use 1-based indexing at runtime,
-    verified by ground-truth testing.  The .seq file's I-line filenum is
-    0-based, but the select/unselect CLI commands are 1-based.
+    Siril 1.4 select/unselect use 1-based indexing at runtime.
+    The .seq file's I-line filenum is 0-based.
     """
     cmds: list[str] = [f"unselect {seq_name} 1 {n_frames}"]
 
@@ -166,39 +259,41 @@ def _build_selection_commands(
 
 
 # ── Siril method maps ──────────────────────────────────────────────────────────
-# Verified against Siril 1.4 docs:
-#   stack seqname { rej | mean } [rejection_type] [sigma_low sigma_high] [options]
-#   stack seqname { med | median } [options]    (no rejection args)
-#   stack seqname { sum | min | max } [options] (no rejection args)
-#
-# Rejection algorithm codes (the argument AFTER the stack type for rej/mean):
-#   n[one], s[igma], m[edian], w[insorized], l[inear], g[eneralized], ma[d]
-#
-# Note: "rej" is NOT a rejection algorithm — it is a stack type (synonym for "mean").
 
 _REJECTION_ALGO_MAP = {
-    "sigma_clipping": "s",    # Sigma clipping
-    "winsorized":     "w",    # Winsorized sigma clipping (recommended for < 15 frames)
-    "linear_fit":     "l",    # Linear-fit clipping
-    "none":           "n",    # No rejection
+    "sigma_clipping": "s",
+    "winsorized":     "w",
+    "percentile":     "p",
+    "median":         "m",
+    "linear_fit":     "l",
+    "generalized":    "g",
+    "mad":            "a",
+    "none":           "n",
 }
 
-# Maps agent stack_method name → Siril stack type token
 _STACK_TYPE_MAP = {
-    "mean":   "rej",    # rej and mean are synonyms in Siril; rej makes intent clear
+    "mean":   "rej",
     "median": "med",
     "sum":    "sum",
     "min":    "min",
     "max":    "max",
 }
 
-# Only these stack types support rejection parameters
 _REJECTION_STACK_TYPES = {"mean"}
+
+_NORM_MAP = {
+    "addscale": "-norm=addscale",
+    "mulscale": "-norm=mulscale",
+    "add":      "-norm=add",
+    "mul":      "-norm=mul",
+    "none":     "-nonorm",
+}
 
 _WEIGHTING_MAP = {
     "wfwhm":   "-weight=wfwhm",
     "noise":   "-weight=noise",
     "nbstars": "-weight=nbstars",
+    "nbstack": "-weight=nbstack",
     "none":    "",
 }
 
@@ -214,20 +309,35 @@ def siril_stack(
     rejection_method: str = "sigma_clipping",
     rejection_sigma: list[float] | None = None,
     normalization: str = "addscale",
+    fast_norm: bool = False,
+    overlap_norm: bool = False,
+    output_norm: bool = False,
     weighting: str = "wfwhm",
     output_32bit: bool = True,
+    rgb_equal: bool = False,
+    output_name: str = "master_light",
+    maximize: bool = False,
+    upscale: bool = False,
+    feather: int | None = None,
+    rejection_maps: str | None = None,
     total_frames_hint: int | None = None,
 ) -> dict:
     """
     Stack accepted registered frames into a master light FITS.
-    Uses Siril select/unselect to include only accepted_frames.
-    Always stack 32-bit float. Returns master_light_path, stack metrics,
-    and HITL flags if the accepted frame set is clearly too small to be useful.
 
-    HITL fires for two obvious failure modes:
-      - Fewer than 2 frames accepted (nothing meaningful to stack)
-      - Less than 15% of all registered frames accepted with ≥ 5 total
-        (overwhelming rejection — the entire session data may be unusable)
+    Uses Siril select/unselect to include only accepted_frames, then runs
+    the stack command with full control over rejection, normalization,
+    weighting, and output options.
+
+    Recommended settings by dataset size:
+      - < 10 frames:  rejection='winsorized', sigma=[2.5, 2.5]
+      - 10-30 frames: rejection='sigma_clipping', sigma=[3.0, 3.0]
+      - > 30 frames:  rejection='sigma_clipping', sigma=[2.5, 2.5] (can be tighter)
+      - > 100 frames: consider fast_norm=True for speed
+
+    HITL triggers when:
+      - Fewer than 2 frames accepted
+      - Less than 15% acceptance rate with ≥ 5 total frames
     """
     if rejection_sigma is None:
         rejection_sigma = [3.0, 3.0]
@@ -239,44 +349,69 @@ def siril_stack(
     if n_frames == 0:
         n_frames = max(name_to_index.values()) + 1 if name_to_index else len(accepted_frames)
 
-    # Use caller-supplied total if available (more reliable than .seq header for edge cases)
     total_frames = total_frames_hint if total_frames_hint is not None else n_frames
 
-    # Build selection preamble
     selection_cmds = _build_selection_commands(
         registered_sequence, n_frames, accepted_frames, name_to_index
     )
 
+    # ── Build stack command ───────────────────────────────────────────────
     siril_type = _STACK_TYPE_MAP.get(stack_method, "rej")
-    weight_str = _WEIGHTING_MAP.get(weighting, "")
-    sigma_lo, sigma_hi = rejection_sigma[0], rejection_sigma[1]
-
-    # Build the stack command — rejection args only apply to "mean"/"rej" stacks
     stack_parts: list[str] = [f"stack {registered_sequence}", siril_type]
 
     if stack_method in _REJECTION_STACK_TYPES:
-        # Verified Siril 1.4 syntax: stack seq rej {algo} {sigma_lo} {sigma_hi}
-        # Rejection algo codes: s=sigma, w=winsorized, l=linear, n=none
         rej_algo = _REJECTION_ALGO_MAP.get(rejection_method, "s")
+        sigma_lo, sigma_hi = rejection_sigma[0], rejection_sigma[1]
         stack_parts += [rej_algo, str(sigma_lo), str(sigma_hi)]
 
-    stack_parts += [f"-norm={normalization}", weight_str, "-out=master_light"]
+        if rejection_maps == "single":
+            stack_parts.append("-rejmap")
+        elif rejection_maps == "split":
+            stack_parts.append("-rejmaps")
+
+    # Normalization
+    norm_flag = _NORM_MAP.get(normalization, "-norm=addscale")
+    stack_parts.append(norm_flag)
+
+    if fast_norm:
+        stack_parts.append("-fastnorm")
+    if overlap_norm:
+        stack_parts.append("-overlap_norm")
+
+    # Weighting (only for mean/rej)
+    if stack_method in _REJECTION_STACK_TYPES:
+        weight_str = _WEIGHTING_MAP.get(weighting, "")
+        if weight_str:
+            stack_parts.append(weight_str)
+
+        if feather is not None:
+            stack_parts.append(f"-feather={feather}")
+
+    if rgb_equal:
+        stack_parts.append("-rgb_equal")
+    if output_norm:
+        stack_parts.append("-output_norm")
+
+    stack_parts.append(f"-out={output_name}")
+
+    if maximize:
+        stack_parts.append("-maximize")
+    if upscale:
+        stack_parts.append("-upscale")
     if output_32bit:
-        # Verified flag name: -32b (not -32bit) per Siril 1.4 docs
         stack_parts.append("-32b")
 
     stack_cmd = " ".join(p for p in stack_parts if p)
-
     commands = selection_cmds + [stack_cmd]
 
     result = run_siril_script(commands, working_dir=working_dir, timeout=1200)
 
-    master_path = wdir / "master_light.fit"
+    master_path = wdir / f"{output_name}.fit"
     if not master_path.exists():
-        master_path = wdir / "master_light.fits"
+        master_path = wdir / f"{output_name}.fits"
     if not master_path.exists():
         raise FileNotFoundError(
-            f"master_light.fit not found in {wdir} after stacking.\n"
+            f"{output_name}.fit not found in {wdir} after stacking.\n"
             f"Siril stdout:\n{result.stdout[-1000:]}"
         )
 
@@ -284,29 +419,26 @@ def siril_stack(
     acceptance_rate = n_accepted / max(total_frames, 1)
 
     stack_metrics = {
-        "stacked_count":      n_accepted,
-        "total_frames":       total_frames,
-        "acceptance_rate":    round(acceptance_rate, 3),
-        "total_integration_s": None,     # populated by caller if exposure_time_s known
-        "estimated_snr_gain": round(n_accepted ** 0.5, 3),
-        "background_noise":   result.parsed.get("background_noise"),
+        "stacked_count":       n_accepted,
+        "total_frames":        total_frames,
+        "acceptance_rate":     round(acceptance_rate, 3),
+        "total_integration_s": None,
+        "estimated_snr_gain":  round(n_accepted ** 0.5, 3),
+        "background_noise":    result.parsed.get("background_noise"),
     }
 
-    # ── HITL: clearly insufficient light frames ────────────────────────────
+    # ── HITL ──────────────────────────────────────────────────────────────
     hitl_reasons: list[str] = []
 
     if n_accepted < 2:
         hitl_reasons.append(
             f"Only {n_accepted} light frame(s) accepted for stacking. "
-            f"A minimum of 2 is needed for any meaningful integration. "
-            f"Review frame selection criteria (T06) or capture more frames."
+            f"A minimum of 2 is needed for meaningful integration."
         )
     elif total_frames >= 5 and acceptance_rate < 0.15:
         hitl_reasons.append(
             f"Only {n_accepted}/{total_frames} frames accepted ({acceptance_rate:.0%}). "
-            f"More than 85% of light frames were rejected — the session data may have "
-            f"a systematic issue (severe seeing, tracking failure, clouds, or overly "
-            f"strict selection thresholds in T06)."
+            f"More than 85% of light frames were rejected."
         )
 
     hitl_required = len(hitl_reasons) > 0

@@ -32,8 +32,14 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from skimage.filters import gaussian
 from skimage.measure import label, regionprops
-from skimage.morphology import binary_dilation, dilation, disk, erosion
+from skimage.morphology import binary_dilation, dilation, diamond, disk, erosion, square
 from skimage.feature import peak_local_max
+
+_FOOTPRINT_BUILDERS = {
+    "disk": disk,
+    "square": square,
+    "diamond": diamond,
+}
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -69,11 +75,28 @@ class ReduceStarsInput(BaseModel):
     kernel_radius: int = Field(
         default=1,
         description=(
-            "Radius of the morphological erosion disk element (pixels). "
+            "Radius of the morphological erosion footprint (pixels). "
             "1: gentlest (subtle tightening). "
             "2: moderate (noticeable bloom reduction). "
             "3: aggressive (only for severely bloated stars). "
             "Do not exceed 3 without previewing — stars become pixelated."
+        ),
+    )
+    structuring_element: str = Field(
+        default="disk",
+        description=(
+            "Shape of the erosion footprint. "
+            "'disk': circular (default, isotropic shrinkage). "
+            "'square': axis-aligned box (faster, minor axis bias). "
+            "'diamond': 45° rotated square."
+        ),
+    )
+    erosion_mode: str = Field(
+        default="reflect",
+        description=(
+            "Boundary handling for grayscale erosion. "
+            "'reflect': mirror at edge (default). 'nearest': extend edge pixels. "
+            "'constant': pad with cval (0.0). 'wrap': periodic."
         ),
     )
     iterations: int = Field(
@@ -99,6 +122,37 @@ class ReduceStarsInput(BaseModel):
             "preventing erosion from modifying the star core. "
             "Use when stars contain important color data (e.g. red giants). "
             "0 = no core protection (default)."
+        ),
+    )
+    peak_threshold_abs: float | None = Field(
+        default=None,
+        description=(
+            "Minimum absolute intensity a peak must have to qualify as a star "
+            "center (for core protection). None = no threshold. "
+            "0.8: only protect very bright stars. 0.5: protect moderate stars."
+        ),
+    )
+    peak_num_peaks: int | None = Field(
+        default=None,
+        description=(
+            "Maximum number of star peaks to detect for core protection. "
+            "None = unlimited. Use 500 to cap computation on dense fields."
+        ),
+    )
+    peak_exclude_border: bool = Field(
+        default=True,
+        description=(
+            "Exclude peaks within min_distance of the image border. "
+            "True: default (prevents partial star artifacts at edges). "
+            "False: include all peaks including border stars."
+        ),
+    )
+    label_connectivity: int = Field(
+        default=2,
+        description=(
+            "Pixel connectivity for counting distinct stars. "
+            "1: 4-connected (strict, may split elongated stars into two). "
+            "2: 8-connected (default, counts diagonal-touching pixels as same star)."
         ),
     )
     feather_px: int = Field(
@@ -158,24 +212,25 @@ def _erode_channel(
     core_exclusion: np.ndarray,
     kernel_radius: int,
     iterations: int,
+    footprint_fn=disk,
+    mode: str = "reflect",
 ) -> np.ndarray:
     """
     Apply morphological erosion to channel pixels within star_binary,
     excluding pixels in core_exclusion zone.
     """
-    struct = disk(kernel_radius)
+    struct = footprint_fn(kernel_radius)
     eroded = channel.copy()
     for _ in range(iterations):
-        e = erosion(eroded, struct)
-        # Apply only within star region, not in core exclusion zone
+        e = erosion(eroded, struct, mode=mode)
         apply_mask = star_binary & ~core_exclusion
         eroded = np.where(apply_mask, e, eroded)
     return eroded
 
 
-def _count_stars_affected(star_binary: np.ndarray) -> int:
+def _count_stars_affected(star_binary: np.ndarray, connectivity: int = 2) -> int:
     """Count distinct connected star regions."""
-    labeled = label(star_binary)
+    labeled = label(star_binary, connectivity=connectivity)
     return int(labeled.max())
 
 
@@ -188,9 +243,15 @@ def reduce_stars(
     star_mask_path: str | None = None,
     detection_threshold: float = 0.6,
     kernel_radius: int = 1,
+    structuring_element: str = "disk",
+    erosion_mode: str = "reflect",
     iterations: int = 1,
     blend_amount: float = 1.0,
     protect_core_radius: int = 0,
+    peak_threshold_abs: float | None = None,
+    peak_num_peaks: int | None = None,
+    peak_exclude_border: bool = True,
+    label_connectivity: int = 2,
     feather_px: int = 3,
     output_stem: str | None = None,
 ) -> dict:
@@ -215,13 +276,13 @@ def reduce_stars(
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
+    footprint_fn = _FOOTPRINT_BUILDERS.get(structuring_element, disk)
+
     data, is_color = _load_fits(img_path)
     lum = _compute_luminance(data)
 
-    # Build star mask
     if star_mask_path and Path(star_mask_path).exists():
         star_binary = _load_mask_channel(Path(star_mask_path))
-        # Resize if needed (mask might differ in shape from image)
         if star_binary.shape != lum.shape:
             from skimage.transform import resize
             star_binary = resize(
@@ -230,19 +291,22 @@ def reduce_stars(
     else:
         star_binary = lum > detection_threshold
 
-    # Core exclusion zone — protect innermost star centers.
-    # Find local brightness peaks within star regions and dilate those peaks,
-    # not the full star mask (dilating the full mask would always equal itself).
     if protect_core_radius > 0:
-        peaks = peak_local_max(
-            lum,
+        plm_kwargs: dict = dict(
             min_distance=max(1, protect_core_radius),
             labels=star_binary,
+            exclude_border=peak_exclude_border,
         )
+        if peak_threshold_abs is not None:
+            plm_kwargs["threshold_abs"] = peak_threshold_abs
+        if peak_num_peaks is not None:
+            plm_kwargs["num_peaks"] = peak_num_peaks
+
+        peaks = peak_local_max(lum, **plm_kwargs)
         peak_mask = np.zeros_like(star_binary, dtype=bool)
         if len(peaks) > 0:
             peak_mask[peaks[:, 0], peaks[:, 1]] = True
-        core_exclusion = binary_dilation(peak_mask, disk(protect_core_radius))
+        core_exclusion = binary_dilation(peak_mask, footprint_fn(protect_core_radius))
         core_exclusion = core_exclusion & star_binary
     else:
         core_exclusion = np.zeros_like(star_binary, dtype=bool)
@@ -258,11 +322,11 @@ def reduce_stars(
     # Track pre-erosion star pixel count for size-reduction reporting
     star_pixels_before = int(np.sum(star_binary))
 
-    # Apply erosion per channel
     output_data = data.copy()
     for ch_idx in range(data.shape[0]):
         eroded = _erode_channel(
-            data[ch_idx], star_binary, core_exclusion, kernel_radius, iterations
+            data[ch_idx], star_binary, core_exclusion, kernel_radius, iterations,
+            footprint_fn=footprint_fn, mode=erosion_mode,
         )
         # Blend eroded result with original via feathered mask
         blended = eroded * blend_amount + data[ch_idx] * (1.0 - blend_amount)
@@ -283,7 +347,7 @@ def reduce_stars(
         if star_pixels_before > 0
         else 0.0
     )
-    stars_affected_count = _count_stars_affected(star_binary)
+    stars_affected_count = _count_stars_affected(star_binary, connectivity=label_connectivity)
 
     # Save output
     out_stem = output_stem or f"{img_path.stem}_reduced_stars"

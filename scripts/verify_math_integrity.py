@@ -22,7 +22,7 @@ from astropy.io import fits
 from astro_agent.tools.preprocess.t05_analyze_frames import _compute_summary
 from astro_agent.tools.preprocess.t06_select_frames import (
     SelectionCriteria,
-    _select,
+    _select_frames,
     _sigma_threshold,
     select_frames,
 )
@@ -91,8 +91,8 @@ def test_t06_sigma_threshold_single_value() -> None:
 def test_t06_safety_fallback_all_bad() -> None:
     """When every frame fails, safety fallback returns ALL frames."""
     frames = {
-        "a.fits": {"fwhm": 10.0, "roundness": 0.1, "star_count": 5, "background_level": 0.9},
-        "b.fits": {"fwhm": 11.0, "roundness": 0.1, "star_count": 3, "background_level": 0.95},
+        "a.fits": {"fwhm": 10.0, "roundness": 0.1, "number_of_stars": 5, "background_lvl": 0.9},
+        "b.fits": {"fwhm": 11.0, "roundness": 0.1, "number_of_stars": 3, "background_lvl": 0.95},
     }
     criteria = SelectionCriteria(
         max_fwhm_sigma=0.01,
@@ -100,7 +100,7 @@ def test_t06_safety_fallback_all_bad() -> None:
         min_star_count=500,
         max_background_sigma=0.01,
     )
-    accepted, rejected, reasons = _select(frames, criteria)
+    accepted, rejected, reasons = _select_frames(frames, criteria)
     assert len(accepted) == 2, "safety fallback should return all frames"
     assert len(rejected) == 0
     _pass("T06 safety fallback when all frames bad")
@@ -109,13 +109,13 @@ def test_t06_safety_fallback_all_bad() -> None:
 def test_t06_selective_rejection() -> None:
     """One outlier frame should be rejected while good frames pass."""
     frames = {
-        "good1.fits": {"fwhm": 2.0, "roundness": 0.8, "star_count": 100, "background_level": 0.05},
-        "good2.fits": {"fwhm": 2.1, "roundness": 0.85, "star_count": 110, "background_level": 0.05},
-        "good3.fits": {"fwhm": 2.2, "roundness": 0.82, "star_count": 95, "background_level": 0.06},
-        "bad.fits":   {"fwhm": 8.0, "roundness": 0.3, "star_count": 20, "background_level": 0.05},
+        "good1.fits": {"fwhm": 2.0, "roundness": 0.8, "number_of_stars": 100, "background_lvl": 0.05},
+        "good2.fits": {"fwhm": 2.1, "roundness": 0.85, "number_of_stars": 110, "background_lvl": 0.05},
+        "good3.fits": {"fwhm": 2.2, "roundness": 0.82, "number_of_stars": 95, "background_lvl": 0.06},
+        "bad.fits":   {"fwhm": 8.0, "roundness": 0.3, "number_of_stars": 20, "background_lvl": 0.05},
     }
     criteria = SelectionCriteria(max_fwhm_sigma=2.0, min_roundness=0.5, min_star_count=30)
-    accepted, rejected, reasons = _select(frames, criteria)
+    accepted, rejected, reasons = _select_frames(frames, criteria)
     assert "bad.fits" in rejected, f"bad frame should be rejected, got accepted={accepted}"
     assert all(f in accepted for f in ["good1.fits", "good2.fits", "good3.fits"])
     _pass("T06 selective rejection of outlier frame")
@@ -683,29 +683,28 @@ def test_t05_compute_summary_known() -> None:
     """Verify summary statistics from _compute_summary with known frame metrics."""
     frames = {
         "f1.fits": {
-            "fwhm": 2.0, "eccentricity": 0.3, "roundness": 0.8,
-            "star_count": 100, "background_level": 0.05, "noise_estimate": 0.001,
+            "fwhm": 2.0, "weighted_fwhm": 2.2, "roundness": 0.8, "quality": 0.7,
+            "number_of_stars": 100, "background_lvl": 0.05, "bgnoise": 0.001,
         },
         "f2.fits": {
-            "fwhm": 3.0, "eccentricity": 0.4, "roundness": 0.7,
-            "star_count": 120, "background_level": 0.06, "noise_estimate": 0.002,
+            "fwhm": 3.0, "weighted_fwhm": 3.3, "roundness": 0.7, "quality": 0.6,
+            "number_of_stars": 120, "background_lvl": 0.06, "bgnoise": 0.002,
         },
         "f3.fits": {
-            "fwhm": 4.0, "eccentricity": 0.5, "roundness": 0.9,
-            "star_count": 80, "background_level": 0.04, "noise_estimate": 0.0015,
+            "fwhm": 4.0, "weighted_fwhm": 4.4, "roundness": 0.9, "quality": 0.5,
+            "number_of_stars": 80, "background_lvl": 0.04, "bgnoise": 0.0015,
         },
     }
-    s = _compute_summary(frames)
+    seq_data = {"reference_image": 0, "selected_indices": [0, 1, 2]}
+    s = _compute_summary(frames, seq_data)
     assert s["frame_count"] == 3
     assert abs(s["median_fwhm"] - 3.0) < 1e-4
-    assert abs(s["median_eccentricity"] - 0.4) < 1e-4
     assert abs(s["median_roundness"] - 0.8) < 1e-4
     assert s["median_star_count"] == 100
     assert abs(s["median_background"] - 0.05) < 1e-6
     assert abs(s["median_noise"] - 0.0015) < 1e-6
     assert s["best_frame"] == "f1.fits"     # lowest FWHM
     assert s["worst_frame"] == "f3.fits"    # highest FWHM
-    # std_fwhm should be stdev of [2.0, 3.0, 4.0]
     expected_std = statistics.stdev([2.0, 3.0, 4.0])
     assert abs(s["std_fwhm"] - round(expected_std, 4)) < 1e-4
     _pass("T05 _compute_summary aggregates correct")
@@ -715,11 +714,13 @@ def test_t05_compute_summary_all_none() -> None:
     """When all metrics are None, summary should still be valid (no crash)."""
     frames = {
         "f1.fits": {
-            "fwhm": None, "eccentricity": None, "roundness": None,
-            "star_count": None, "background_level": None, "noise_estimate": None,
+            "fwhm": None, "weighted_fwhm": None, "roundness": None,
+            "quality": None, "number_of_stars": None, "background_lvl": None,
+            "bgnoise": None,
         },
     }
-    s = _compute_summary(frames)
+    seq_data = {"reference_image": -1, "selected_indices": []}
+    s = _compute_summary(frames, seq_data)
     assert s["frame_count"] == 1
     assert s["median_fwhm"] is None
     assert s["best_frame"] is None

@@ -62,6 +62,15 @@ class SirilDenoiseOptions(BaseModel):
             "More iterations = stronger denoising but slower. 3–5 is typical."
         ),
     )
+    sos_rho: float | None = Field(
+        default=None,
+        description=(
+            "SOS rho parameter (0 < rho < 1). Controls the amount of noisy image "
+            "mixed in between iterations. Only used with method=sos. "
+            "Lower values = more aggressive denoising per iteration. "
+            "Null = Siril default."
+        ),
+    )
     independent_channels: bool = Field(
         default=False,
         description=(
@@ -168,7 +177,8 @@ def _run_siril_denoise(
         denoise_cmd += " -da3d"
     elif options.method == "sos":
         denoise_cmd += f" -sos={options.sos_iterations}"
-    # VST is incompatible with da3d and sos — only add for standard method
+        if options.sos_rho is not None:
+            denoise_cmd += f" -rho={options.sos_rho}"
     if options.use_vst and options.method == "standard":
         denoise_cmd += " -vst"
     if options.independent_channels:

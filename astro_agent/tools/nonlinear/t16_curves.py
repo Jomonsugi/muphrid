@@ -93,8 +93,13 @@ class GHTCurvesOptions(BaseModel):
     )
     channels: str = Field(
         default="all",
+        description="Which channels to apply to. all, R, G, B, RG, RB, GB.",
+    )
+    clip_mode: str = Field(
+        default="rgbblend",
         description=(
-            "Which channels to apply to. all, R, G, B, RG, RB, GB."
+            "How out-of-range values are handled. "
+            "'clip', 'rescale', 'rgbblend' (default), 'globalrescale'."
         ),
     )
 
@@ -141,6 +146,8 @@ def _build_ght_curves_cmd(opts: GHTCurvesOptions) -> str:
         cmd += f" -LP={opts.shadow_protection}"
     if opts.highlight_protection != 1.0:
         cmd += f" -HP={opts.highlight_protection}"
+    if opts.clip_mode != "rgbblend":
+        cmd += f" -clipmode={opts.clip_mode}"
     cmd += " -human"
     if opts.channels != "all":
         cmd += f" {opts.channels}"

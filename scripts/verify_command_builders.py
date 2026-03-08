@@ -328,6 +328,7 @@ from astro_agent.tools.linear.t10_color_calibrate import (
     _build_pcc_cmd,
     _build_spcc_cmd,
     SpccOptions,
+    SpccAtmosphericOptions,
 )
 
 # PCC defaults
@@ -345,18 +346,45 @@ pcc_bgtol = _build_pcc_cmd("gaia", bgtol_lower=-2.0, bgtol_upper=2.5)
 check("T10 PCC -bgtol=-2.0,2.5",
       "-bgtol=-2.0,2.5" in pcc_bgtol, got=pcc_bgtol)
 
-# SPCC with sensor and filter
-opts_spcc = SpccOptions(sensor_name="ZWO ASI294MC Pro", filter_name="Optolong L-eNhance",
-                         atmospheric_correction=True)
+# SPCC with OSC sensor and filter
+opts_spcc = SpccOptions(
+    osc_sensor_name="ZWO ASI294MC Pro",
+    osc_filter_name="Optolong L-eNhance",
+    atmospheric=SpccAtmosphericOptions(),
+)
 spcc_cmd = _build_spcc_cmd(opts_spcc, limitmag="+1")
 check("T10 SPCC -oscsensor= present",
       "-oscsensor=" in spcc_cmd, got=spcc_cmd)
 check("T10 SPCC -oscfilter= present",
       "-oscfilter=" in spcc_cmd, got=spcc_cmd)
-check("T10 SPCC -atmos present when atmos_correction=True",
+check("T10 SPCC -atmos present when atmospheric set",
       "-atmos" in spcc_cmd, got=spcc_cmd)
 check("T10 SPCC -limitmag= propagated",
       "-limitmag=+1" in spcc_cmd, got=spcc_cmd)
+
+# SPCC with mono sensor
+opts_mono = SpccOptions(
+    mono_sensor_name="QHY268M",
+    r_filter="Baader R",
+    g_filter="Baader G",
+    b_filter="Baader B",
+)
+spcc_mono_cmd = _build_spcc_cmd(opts_mono)
+check("T10 SPCC mono: -monosensor= present",
+      "-monosensor=" in spcc_mono_cmd, got=spcc_mono_cmd)
+check("T10 SPCC mono: -rfilter= present",
+      "-rfilter=" in spcc_mono_cmd, got=spcc_mono_cmd)
+
+# SPCC narrowband
+from astro_agent.tools.linear.t10_color_calibrate import SpccNarrowbandOptions
+opts_nb = SpccOptions(
+    narrowband=SpccNarrowbandOptions(r_wavelength=656.3, r_bandwidth=7.0, g_wavelength=500.7, g_bandwidth=3.0, b_wavelength=486.1, b_bandwidth=3.0),
+)
+spcc_nb_cmd = _build_spcc_cmd(opts_nb)
+check("T10 SPCC narrowband: -narrowband present",
+      "-narrowband" in spcc_nb_cmd, got=spcc_nb_cmd)
+check("T10 SPCC narrowband: -rwl= present",
+      "-rwl=656.3" in spcc_nb_cmd, got=spcc_nb_cmd)
 
 # ── T12 noise_reduction — denoise command flags ───────────────────────────────
 section("T12 noise_reduction — denoise command flags")
@@ -412,89 +440,93 @@ check("T12 independent_channels=True → -indep added",
 section("T13 deconvolution — makepsf and rl command strings")
 
 from astro_agent.tools.linear.t13_deconvolution import (
-    MakePsfManualOptions,
+    ManualPsfOptions,
+    StarsPsfOptions,
+    BlindPsfOptions,
+    PsfConfig,
     RLOptions,
     WienerOptions,
+    _build_makepsf_stars,
+    _build_makepsf_blind,
+    _build_makepsf_manual,
+    _build_rl_cmd,
+    _build_wiener_cmd,
 )
 
 # makepsf stars default (no -sym)
-mo_stars = MakePsfManualOptions()
-stars_cmd = "makepsf stars"
-if mo_stars.symmetric:
-    stars_cmd += " -sym"
+stars_cmd = _build_makepsf_stars(StarsPsfOptions(), PsfConfig())
 check("T13 makepsf stars: no -sym by default",
       stars_cmd == "makepsf stars", got=stars_cmd)
 
-# makepsf stars with -sym
-mo_sym = MakePsfManualOptions(symmetric=True)
-sym_cmd = "makepsf stars"
-if mo_sym.symmetric:
-    sym_cmd += " -sym"
+# makepsf stars with -sym + savepsf
+sym_cmd = _build_makepsf_stars(StarsPsfOptions(symmetric=True), PsfConfig(save_psf="my_psf.fits"))
 check("T13 makepsf stars -sym: appended",
-      sym_cmd == "makepsf stars -sym", got=sym_cmd)
+      "-sym" in sym_cmd, got=sym_cmd)
+check("T13 makepsf stars -savepsf: appended",
+      "-savepsf=my_psf.fits" in sym_cmd, got=sym_cmd)
+
+# makepsf blind with options
+blind_cmd = _build_makepsf_blind(BlindPsfOptions(use_l0=True, multiscale=True, regularization_lambda=0.01), PsfConfig(psf_kernel_size=63))
+check("T13 makepsf blind -l0: appended",
+      "-l0" in blind_cmd, got=blind_cmd)
+check("T13 makepsf blind -multiscale: appended",
+      "-multiscale" in blind_cmd, got=blind_cmd)
+check("T13 makepsf blind -lambda=: appended",
+      "-lambda=0.01" in blind_cmd, got=blind_cmd)
+check("T13 makepsf blind -ks=: appended",
+      "-ks=63" in blind_cmd, got=blind_cmd)
 
 # makepsf manual moffat
-mo_moffat = MakePsfManualOptions(profile="moffat", fwhm_px=2.5, moffat_beta=3.5)
-psf_cmd = f"makepsf manual -{mo_moffat.profile}"
-if mo_moffat.fwhm_px is not None:
-    psf_cmd += f" -fwhm={mo_moffat.fwhm_px}"
-if mo_moffat.profile == "moffat":
-    psf_cmd += f" -beta={mo_moffat.moffat_beta}"
-expected_moffat = "makepsf manual -moffat -fwhm=2.5 -beta=3.5"
+mo_moffat = ManualPsfOptions(profile="moffat", fwhm_px=2.5, moffat_beta=4.0)
+psf_cmd = _build_makepsf_manual(mo_moffat, PsfConfig())
+expected_moffat = "makepsf manual -moffat -fwhm=2.5 -beta=4.0"
 check("T13 makepsf manual moffat fwhm+beta",
       psf_cmd == expected_moffat, got=psf_cmd, expected=expected_moffat)
 
 # makepsf manual airy
-mo_airy = MakePsfManualOptions(
+mo_airy = ManualPsfOptions(
     profile="airy",
     airy_diameter_mm=130.0,
     airy_focal_length_mm=910.0,
     airy_wavelength_nm=656.0,
     airy_obstruction_pct=0.0,
 )
-airy_cmd = f"makepsf manual -{mo_airy.profile}"
-if mo_airy.airy_diameter_mm is not None:
-    airy_cmd += f" -dia={mo_airy.airy_diameter_mm}"
-if mo_airy.airy_focal_length_mm is not None:
-    airy_cmd += f" -fl={mo_airy.airy_focal_length_mm}"
-airy_cmd += f" -wl={mo_airy.airy_wavelength_nm}"
+airy_cmd = _build_makepsf_manual(mo_airy, PsfConfig())
 check("T13 makepsf manual airy has -airy -dia -fl -wl",
       "-airy" in airy_cmd and "-dia=" in airy_cmd and "-fl=" in airy_cmd and "-wl=" in airy_cmd,
       got=airy_cmd)
 
 # rl with total_variation + stop
-rl_opts = RLOptions(iterations=15, regularization="total_variation", alpha=3000.0, stop=1e-5)
-rl_cmd = f"rl -iters={rl_opts.iterations}"
-if rl_opts.regularization == "total_variation":
-    rl_cmd += f" -tv -alpha={rl_opts.alpha}"
-elif rl_opts.regularization == "hessian_frobenius":
-    rl_cmd += f" -fh -alpha={rl_opts.alpha}"
-if rl_opts.stop is not None:
-    rl_cmd += f" -stop={rl_opts.stop}"
-if rl_opts.use_multiplicative:
-    rl_cmd += " -mul"
+rl_cmd = _build_rl_cmd(RLOptions(iterations=15, regularization="total_variation", alpha=3000.0, stop=1e-5))
 check("T13 rl -iters -tv -alpha -stop all present",
       "-iters=15" in rl_cmd and "-tv" in rl_cmd and "-alpha=3000.0" in rl_cmd and "-stop=1e-05" in rl_cmd,
       got=rl_cmd)
 
 # rl with hessian_frobenius
-rl_fh = RLOptions(iterations=10, regularization="hessian_frobenius", alpha=5000.0)
-rl_fh_cmd = f"rl -iters={rl_fh.iterations}"
-if rl_fh.regularization == "hessian_frobenius":
-    rl_fh_cmd += f" -fh -alpha={rl_fh.alpha}"
+rl_fh_cmd = _build_rl_cmd(RLOptions(iterations=10, regularization="hessian_frobenius", alpha=5000.0))
 check("T13 rl -fh regularization uses -fh flag",
       "-fh" in rl_fh_cmd and "-tv" not in rl_fh_cmd, got=rl_fh_cmd)
+
+# rl with gdstep and loadpsf
+rl_gd_cmd = _build_rl_cmd(RLOptions(iterations=20, gdstep=0.001), loadpsf="saved_psf.fits")
+check("T13 rl -gdstep= present",
+      "-gdstep=0.001" in rl_gd_cmd, got=rl_gd_cmd)
+check("T13 rl -loadpsf= present",
+      "-loadpsf=saved_psf.fits" in rl_gd_cmd, got=rl_gd_cmd)
+
+# wiener with loadpsf
+wiener_cmd = _build_wiener_cmd(WienerOptions(alpha=0.005), loadpsf="my_psf.fits")
+check("T13 wiener -loadpsf= present",
+      "-loadpsf=my_psf.fits" in wiener_cmd, got=wiener_cmd)
 
 # ── T17 local_contrast_enhance — epf command ─────────────────────────────────
 section("T17 local_contrast_enhance — epf command string")
 
 from astro_agent.tools.nonlinear.t17_local_contrast import EpfOptions
 
-# Bilateral filter (default)
+# Bilateral filter (default) — uses -si= and -ss=
 o = EpfOptions(guided=False, diameter=5, intensity_sigma=0.02, spatial_sigma=0.02, mod=0.8)
 epf_cmd = "epf"
-if o.guided:
-    epf_cmd += " -guided"
 if o.diameter != 3:
     epf_cmd += f" -d={o.diameter}"
 epf_cmd += f" -si={o.intensity_sigma} -ss={o.spatial_sigma} -mod={o.mod}"
@@ -502,16 +534,14 @@ expected_epf = "epf -d=5 -si=0.02 -ss=0.02 -mod=0.8"
 check("T17 bilateral epf cmd exact match",
       epf_cmd == expected_epf, got=epf_cmd, expected=expected_epf)
 
-# Guided filter with default diameter (should omit -d=3)
-o_guided = EpfOptions(guided=True, diameter=3, intensity_sigma=0.03, spatial_sigma=0.03, mod=0.7)
-guided_cmd = "epf"
-if o_guided.guided:
-    guided_cmd += " -guided"
+# Guided filter — uses -sc= NOT -si/-ss
+o_guided = EpfOptions(guided=True, diameter=3, guided_sigma=0.05, mod=0.7)
+guided_cmd = "epf -guided"
 if o_guided.diameter != 3:
     guided_cmd += f" -d={o_guided.diameter}"
-guided_cmd += f" -si={o_guided.intensity_sigma} -ss={o_guided.spatial_sigma} -mod={o_guided.mod}"
-check("T17 guided epf: -guided present, no -d= when diameter=3 (default)",
-      "-guided" in guided_cmd and "-d=" not in guided_cmd, got=guided_cmd)
+guided_cmd += f" -sc={o_guided.guided_sigma} -mod={o_guided.mod}"
+check("T17 guided epf: -guided present, -sc= used instead of -si/-ss",
+      "-guided" in guided_cmd and "-sc=" in guided_cmd and "-si=" not in guided_cmd, got=guided_cmd)
 
 # Self-guided (no guide_image_stem)
 check("T17 epf no -guideimage= for self-guided",

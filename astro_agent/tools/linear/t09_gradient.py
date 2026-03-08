@@ -107,6 +107,14 @@ class SirilSubskyOptions(BaseModel):
             "Use when the gradient is very subtle — helps avoid banding artefacts."
         ),
     )
+    use_existing_samples: bool = Field(
+        default=False,
+        description=(
+            "Use pre-existing background samples (-existing) instead of computing "
+            "new ones. Samples can be set via Python script or prior run. "
+            "Useful for iterative refinement without re-sampling."
+        ),
+    )
 
 
 class RemoveGradientInput(BaseModel):
@@ -221,21 +229,20 @@ def _run_siril_subsky(
     stem = image_path.stem
     output_stem = f"{stem}_subsky"
 
-    # Siril subsky syntax (verified against Siril 1.4 docs):
-    #   subsky { -rbf | degree } [-dither] [-samples=N] [-tolerance=N] [-smooth=N]
     dither_flag = " -dither" if options.dither else ""
+    existing_flag = " -existing" if options.use_existing_samples else ""
     if options.model == "rbf":
         subsky_cmd = (
             f"subsky -rbf{dither_flag} "
             f"-samples={options.samples_per_line} "
             f"-tolerance={options.tolerance} "
-            f"-smooth={options.smoothing}"
+            f"-smooth={options.smoothing}{existing_flag}"
         )
     else:
         subsky_cmd = (
             f"subsky {options.polynomial_degree}{dither_flag} "
             f"-samples={options.samples_per_line} "
-            f"-tolerance={options.tolerance}"
+            f"-tolerance={options.tolerance}{existing_flag}"
         )
 
     commands = [

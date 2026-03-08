@@ -76,13 +76,17 @@ class Metadata(TypedDict):
     pixel_size_um:      float | None
 
 
-class FrameMetrics(TypedDict):
-    fwhm:             float
-    eccentricity:     float
-    star_count:       int
-    background_level: float
-    noise_estimate:   float
-    roundness:        float
+class FrameMetrics(TypedDict, total=False):
+    fwhm:             float | None
+    weighted_fwhm:    float | None
+    roundness:        float | None
+    quality:          float | None
+    background_lvl:   float | None
+    number_of_stars:  int | None
+    mean:             float | None
+    median:           float | None
+    sigma:            float | None
+    bgnoise:          float | None
 
 
 class Metrics(TypedDict):
@@ -134,6 +138,7 @@ class Metrics(TypedDict):
 
 class AcquisitionMeta(TypedDict):
     target_name:      str | None
+    target_coords:    dict | None   # {"ra": float, "dec": float} J2000, from T29 resolve_target
     focal_length_mm:  float | None
     pixel_size_um:    float | None
     exposure_time_s:  float | None   # per-frame exposure in seconds

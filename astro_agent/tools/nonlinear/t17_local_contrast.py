@@ -104,64 +104,59 @@ class EpfOptions(BaseModel):
     guided: bool = Field(
         default=False,
         description=(
-            "False: bilateral filter — edge-aware smoothing, excellent for reducing "
-            "noise in flat areas (background, faint nebula) while preserving sharp "
-            "edges (star edges, nebula filaments). "
-            "True: guided filter — uses a guide image (luminance or self) to drive "
-            "filtering. Guided is excellent for color denoising guided by luminance, "
-            "and for structure-preserving smoothing that is consistent with the "
-            "luminance channel. Self-guided (guide_image_stem=null) is the most "
-            "common use case."
+            "False: bilateral filter — edge-aware smoothing using -si= and -ss=. "
+            "True: guided filter — uses -sc= parameter only (si/ss are ignored). "
+            "Guided is excellent for color denoising guided by luminance."
         ),
     )
     diameter: int = Field(
         default=5,
         description=(
-            "Filter kernel diameter in pixels. "
-            "Larger = smoother result but more detail loss. "
-            "Bilateral: 3–7 for noise smoothing; 9–15 for aggressive smoothing. "
+            "Filter kernel diameter in pixels (-d=). "
+            "Bilateral: 3–7 for noise smoothing; 9–15 for aggressive. "
             "Values > 20 are computationally expensive. "
-            "Set to 0 to auto-compute from spatial_sigma."
+            "0 = auto-compute from spatial_sigma."
         ),
     )
     intensity_sigma: float = Field(
         default=0.02,
         description=(
-            "Intensity (radiometric) sigma for 32-bit images (0.0–1.0 range). "
-            "Controls the tonal range over which the filter acts — pixels within "
-            "this tonal distance are smoothed together. "
-            "0.01–0.02: smooth only nearly-identical tones (tight edge preservation). "
-            "0.05–0.1: smooth across a wider tonal range (stronger noise reduction, "
-            "more edge blurring). Corresponds to sigma_r in bilateral filter literature."
+            "Bilateral only (-si=). Intensity sigma for 32-bit images (0.0–1.0). "
+            "Controls tonal range over which the filter smooths. "
+            "0.01–0.02: tight edge preservation. 0.05–0.1: stronger smoothing. "
+            "Ignored when guided=True."
         ),
     )
     spatial_sigma: float = Field(
         default=0.02,
         description=(
-            "Spatial sigma for 32-bit images (0.0–1.0 range). "
-            "Controls the spatial extent of the filter's influence. "
-            "Works together with intensity_sigma to define the bilateral kernel. "
-            "0.01–0.03 for gentle; 0.05–0.1 for stronger spatial smoothing."
+            "Bilateral only (-ss=). Spatial sigma for 32-bit images (0.0–1.0). "
+            "Controls spatial extent of filter influence. "
+            "Ignored when guided=True."
+        ),
+    )
+    guided_sigma: float = Field(
+        default=0.04,
+        description=(
+            "Guided filter only (-sc=). Controls the guided filter's smoothing "
+            "strength. For 32-bit images: 0.0–1.0 range. "
+            "0.01–0.03: subtle smoothing. 0.04–0.1: moderate. 0.1+: aggressive. "
+            "Ignored when guided=False."
         ),
     )
     mod: float = Field(
         default=0.8,
         description=(
-            "Blend strength of the filtered result (0.0–1.0). "
-            "1.0: apply full filter. 0.0: no effect (returns original). "
-            "0.6–0.9: mix filtered with original — allows fine-tuning strength "
-            "without re-running with different parameters."
+            "Blend strength of the filtered result (-mod=, 0.0–1.0). "
+            "1.0: full filter. 0.0: no effect."
         ),
     )
     guide_image_stem: str | None = Field(
         default=None,
         description=(
-            "FITS stem of a guide image for the guided filter (guided=True). "
-            "The guide image must have the same dimensions as the input. "
-            "Null = self-guided (input image guides itself). "
-            "Common pattern: use the luminance channel or a lightly blurred "
-            "version as guide to denoise color channels while preserving "
-            "luminance-defined edges."
+            "FITS stem of guide image for guided filter (-guideimage=). "
+            "Guide must have same dimensions as input. "
+            "Null = self-guided (most common)."
         ),
     )
 
@@ -253,15 +248,19 @@ def local_contrast_enhance(
         ]
     elif method == "edge_preserve":
         # Siril epf syntax (verified Siril 1.4):
-        # epf [-guided] [-d=N] [-si=N] [-ss=N] [-mod=N] [-guideimage=stem]
-        # Sigma values for 32-bit images should be in 0–1 range.
+        # Bilateral: epf [-d=] [-si=] [-ss=] [-mod=]
+        # Guided:    epf -guided [-d=] [-sc=] [-mod=] [-guideimage=]
         o = epf_options
         epf_cmd = "epf"
         if o.guided:
             epf_cmd += " -guided"
         if o.diameter != 3:
             epf_cmd += f" -d={o.diameter}"
-        epf_cmd += f" -si={o.intensity_sigma} -ss={o.spatial_sigma} -mod={o.mod}"
+        if o.guided:
+            epf_cmd += f" -sc={o.guided_sigma}"
+        else:
+            epf_cmd += f" -si={o.intensity_sigma} -ss={o.spatial_sigma}"
+        epf_cmd += f" -mod={o.mod}"
         if o.guided and o.guide_image_stem:
             epf_cmd += f" -guideimage={o.guide_image_stem}"
         enhance_cmds = [epf_cmd]

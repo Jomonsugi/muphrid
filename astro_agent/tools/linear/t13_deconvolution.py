@@ -4,26 +4,30 @@ T13 — deconvolution
 Sharpen the image by reversing atmospheric and optical blur. Deconvolution
 reconstructs detail lost to atmospheric seeing and diffraction limits.
 
-Backend: Siril CLI — `makepsf stars` to estimate the PSF from detected
-stars, then `rl` (Richardson-Lucy) or `wiener` to apply the correction.
+Backend: Siril CLI — `makepsf` to estimate/load/construct the PSF, then `rl`
+(Richardson-Lucy) or `wiener` to apply the correction.
+
+Siril commands (verified against Siril 1.4 CLI docs):
+    makepsf clear
+    makepsf load filename
+    makepsf save [filename]
+    makepsf blind [-l0] [-si] [-multiscale] [-lambda=] [-comp=] [-ks=] [-savepsf=]
+    makepsf stars [-sym] [-ks=] [-savepsf=]
+    makepsf manual { -gaussian | -moffat | -disc | -airy }
+        [-fwhm=] [-angle=] [-ratio=] [-beta=]
+        [-dia=] [-fl=] [-wl=] [-pixelsize=] [-obstruct=]
+        [-ks=] [-savepsf=]
+    rl [-loadpsf=] [-alpha=] [-iters=] [-stop=] [-gdstep=] [-tv] [-fh] [-mul]
+    wiener [-loadpsf=] [-alpha=]
 
 CRITICAL CONSTRAINTS:
   - Only valid in linear space (before stretch).
   - Only attempt when SNR is adequate: snr_estimate > 50 from analyze_image.
-    Under-exposed or high-noise images will have ringing amplified, not reduced.
-  - Start conservative: rl_iterations=5–10. Increase only if the result
-    shows clear improvement with no ringing artifacts.
-  - Total Variation regularization (-tv) is the default and safest choice —
-    it suppresses ringing at the cost of slight smoothing of sharp edges.
-  - Always run analyze_image after to verify the image improved.
+  - Start conservative: rl iterations=5–10.
+  - Total Variation regularization (-tv) is the default and safest choice.
+  - Always run analyze_image after to verify improvement.
 
 HITL: requires_visual_review=True by default.
-Ringing (concentric halos around point sources) and over-sharpening are
-known artefact risks. Visual inspection is mandatory in V1 to catch these
-before they propagate through the rest of the pipeline.
-
-Future note: GraXpert 3.1.x will add dedicated stellar and object
-deconvolution AI models. Wire in when that release is stable.
 """
 
 from __future__ import annotations
@@ -37,56 +41,55 @@ from pydantic import BaseModel, Field
 from astro_agent.tools._siril import run_siril_script
 
 
-# ── Pydantic input schema ──────────────────────────────────────────────────────
+# ── Pydantic input schemas ────────────────────────────────────────────────────
 
 class RLOptions(BaseModel):
     iterations: int = Field(
         default=10,
         description=(
             "Number of Richardson-Lucy iterations. "
-            "Start conservative: 5–10 iterations for first pass. "
-            "10–20 for modest sharpening on adequate-SNR images. "
-            "Never exceed 30 — diminishing returns and ringing risk increase sharply. "
-            "Higher SNR images tolerate more iterations."
+            "Start conservative: 5–10 for first pass. 10–20 for modest sharpening. "
+            "Never exceed 30 — diminishing returns and ringing risk."
         ),
     )
     regularization: str = Field(
         default="total_variation",
         description=(
-            "total_variation: TV regularization (-tv) — suppresses ringing, "
-            "slight edge smoothing. Safest choice for most images. "
-            "hessian_frobenius: Frobenius norm of the Hessian matrix (-fh) — "
-            "preserves edges better than TV at the cost of more ringing risk. "
-            "Good for images with sharp linear features (galaxy arms, nebula filaments). "
-            "none: No regularization — maximum sharpening, high ringing risk. "
-            "Use only for very high-SNR images where TV is over-smoothing."
+            "'total_variation': TV regularization (-tv) — suppresses ringing, "
+            "slight edge smoothing. Safest default. "
+            "'hessian_frobenius': Frobenius norm of Hessian (-fh) — preserves edges "
+            "better, more ringing risk. Good for sharp features. "
+            "'none': No regularization — maximum sharpening, high ringing risk."
         ),
     )
     alpha: float = Field(
         default=3000.0,
         description=(
-            "Regularization strength. Lower = less regularization = sharper but "
-            "more ringing risk. Higher = softer but cleaner. "
-            "Note: lower alpha = more regularization (Siril convention). "
-            "3000 is a safe default. Range: 500 (aggressive) – 10000 (conservative)."
+            "Regularization strength. Lower value = MORE regularization = softer "
+            "but cleaner. Higher value = less regularization = sharper but ringing. "
+            "Range: 500 (aggressive regularization) – 10000 (minimal regularization)."
         ),
     )
     stop: float | None = Field(
         default=None,
         description=(
-            "Stopping criterion threshold (-stop=). When the residual change between "
-            "iterations drops below this value, RL terminates early. "
-            "Prevents over-iterating past the point of improvement. "
-            "Typical range: 1e-4 to 1e-6. Null disables early stopping (runs all "
-            "iterations). Recommended for automation to prevent over-deconvolution."
+            "Stopping criterion (-stop=). Terminates when residual change drops "
+            "below this value. Typical: 1e-4 to 1e-6. Null = run all iterations."
+        ),
+    )
+    gdstep: float | None = Field(
+        default=None,
+        description=(
+            "Gradient descent step size (-gdstep=). Default: 0.0005. "
+            "Larger steps converge faster but risk oscillation. "
+            "Smaller steps are more stable but slower."
         ),
     )
     use_multiplicative: bool = Field(
         default=False,
         description=(
             "Use multiplicative RL update instead of gradient descent (-mul). "
-            "Can improve convergence on Poisson-distributed data (raw photon counts). "
-            "Usually not needed for stacked, calibrated images."
+            "Can improve convergence on Poisson-distributed data."
         ),
     )
 
@@ -96,97 +99,125 @@ class WienerOptions(BaseModel):
         default=0.001,
         description=(
             "Wiener regularization parameter. Controls noise-sharpness tradeoff. "
-            "Lower values = sharper but more noise amplification. "
-            "0.001 is a reasonable starting point. "
-            "Range: 0.0001 (aggressive) – 0.01 (conservative)."
+            "Lower = sharper but more noise. "
+            "0.001 is a reasonable start. Range: 0.0001 – 0.01."
         ),
     )
 
 
-class MakePsfManualOptions(BaseModel):
+class BlindPsfOptions(BaseModel):
+    """Options for makepsf blind — blind PSF estimation from the image."""
+    use_l0: bool = Field(
+        default=False,
+        description="Use L0 descent method (-l0). Alternative to default method.",
+    )
+    use_spectral_irregularity: bool = Field(
+        default=False,
+        description="Use spectral irregularity method (-si).",
+    )
+    multiscale: bool = Field(
+        default=False,
+        description=(
+            "Multi-scale PSF estimation (-multiscale). Only with L0 method. "
+            "Better for images with varying PSF across the field."
+        ),
+    )
+    regularization_lambda: float | None = Field(
+        default=None,
+        description="Regularization constant (-lambda=). Controls smoothness of blind estimate.",
+    )
+    comp: float | None = Field(
+        default=None,
+        description="Compression parameter (-comp=).",
+    )
+
+
+class StarsPsfOptions(BaseModel):
+    """Options for makepsf stars — PSF from detected stars."""
+    symmetric: bool = Field(
+        default=False,
+        description=(
+            "Force circularly symmetric PSF (-sym). Use when tracking is round "
+            "but measurement noise causes asymmetry."
+        ),
+    )
+
+
+class ManualPsfOptions(BaseModel):
+    """Options for makepsf manual — analytically defined PSF."""
     profile: str = Field(
         default="moffat",
         description=(
-            "PSF function model for manual PSF construction. "
-            "moffat: Moffat profile — most accurate model for atmospheric seeing. "
-            "Stars in real astrophotos have Moffat-shaped PSFs, not pure Gaussians. "
-            "gaussian: Gaussian profile — simpler, slightly less accurate. "
-            "airy: Theoretical Airy diffraction pattern — requires telescope optics "
-            "parameters (diameter, focal_length). Best for diffraction-limited optics "
-            "in space or when seeing is excellent. "
-            "disc: Top-hat disc — for defocused or out-of-focus images."
+            "'moffat': Most accurate model for atmospheric seeing. "
+            "'gaussian': Simpler, slightly less accurate. "
+            "'airy': Theoretical diffraction pattern — for diffraction-limited optics. "
+            "'disc': Top-hat disc — for defocused images."
         ),
     )
     fwhm_px: float | None = Field(
         default=None,
         description=(
             "PSF full width at half maximum in pixels. "
-            "For moffat/gaussian: typical range 1.5–4.0 px for well-focused images. "
-            "Measure from analyze_image star metrics (median_fwhm_px). "
-            "If null, Siril uses its own estimate from the image."
+            "Typical: 1.5–4.0 px for well-focused images. "
+            "For disc profile, sets the disc diameter."
         ),
     )
     moffat_beta: float = Field(
         default=3.5,
         description=(
-            "Moffat beta parameter controlling the PSF wing extent. "
-            "Lower beta = broader wings (worse seeing, more scattered light). "
-            "Higher beta = narrower wings (approaches Gaussian). "
-            "Typical range for atmospheric seeing: 2.0 (poor) – 5.0 (excellent). "
-            "3.5 is a reliable default. Only used when profile=moffat."
+            "Moffat beta parameter (wing extent). "
+            "Lower = broader wings (worse seeing). Higher = narrower (Gaussian-like). "
+            "Range: 2.0 (poor seeing) – 5.0 (excellent). Only for profile=moffat."
         ),
     )
     aspect_ratio: float = Field(
         default=1.0,
         description=(
             "PSF aspect ratio (minor/major axis). 1.0 = circular. "
-            "Values < 1.0 model elongated stars from tracking errors or "
-            "atmospheric dispersion. Only used for moffat/gaussian."
+            "< 1.0 = elongated stars from tracking error."
         ),
     )
     angle_deg: float = Field(
         default=0.0,
-        description=(
-            "Angle of the PSF major axis in degrees. "
-            "Only relevant when aspect_ratio < 1.0."
-        ),
+        description="Angle of PSF major axis in degrees. Only relevant when aspect_ratio < 1.0.",
     )
     airy_diameter_mm: float | None = Field(
         default=None,
-        description=(
-            "Telescope primary aperture diameter in mm. Used when profile=airy. "
-            "Example: 130mm refractor → 130."
-        ),
+        description="Telescope primary aperture diameter in mm. For profile=airy.",
     )
     airy_focal_length_mm: float | None = Field(
         default=None,
-        description=(
-            "Telescope focal length in mm. Used when profile=airy. "
-            "Example: 900mm f/6.9 refractor → 900."
-        ),
+        description="Telescope focal length in mm. For profile=airy.",
     )
     airy_wavelength_nm: float = Field(
         default=525.0,
-        description=(
-            "Central wavelength in nm for Airy pattern calculation. "
-            "525nm = green (broadband default). "
-            "656nm = Hα, 500nm = OIII, 486nm = Hβ."
-        ),
+        description="Central wavelength in nm. 525=green, 656=Ha, 500=OIII, 486=Hb.",
+    )
+    airy_pixelsize_um: float | None = Field(
+        default=None,
+        description="Sensor pixel size in microns for Airy pattern. For profile=airy.",
     )
     airy_obstruction_pct: float = Field(
         default=0.0,
         description=(
-            "Central obstruction as a percentage of aperture area (0–100). "
-            "0 for refractors and apo lenses. "
-            "Typical SCT/Cassegrain: 25–35%. Typical Newt: 20–25%."
+            "Central obstruction as % of aperture area. "
+            "0 for refractors. 25–35 for SCT. 20–25 for Newtonians."
         ),
     )
-    symmetric: bool = Field(
-        default=False,
+
+
+class PsfConfig(BaseModel):
+    """Unified PSF configuration for all source types."""
+    psf_kernel_size: int | None = Field(
+        default=None,
+        description="PSF dimension in pixels (-ks=). Must be odd. Null = Siril default.",
+    )
+    save_psf: str | None = Field(
+        default=None,
         description=(
-            "Force the stars-based PSF to be circularly symmetric (-sym). "
-            "Only used when psf_source=stars. Useful when tracking is known to "
-            "be round but measurement noise is asymmetric."
+            "Save the generated PSF to this filename (-savepsf=). "
+            "Extension must be .fit, .fits, .fts, or .tif. "
+            "Useful for reusing a PSF across multiple deconvolution attempts."
         ),
     )
 
@@ -196,50 +227,124 @@ class DeconvolutionInput(BaseModel):
         description="Absolute path to the Siril working directory."
     )
     image_path: str = Field(
-        description=(
-            "Absolute path to the linear FITS image to sharpen. "
-            "Image must be noise-reduced (post T12) and have adequate SNR (>50)."
-        )
+        description="Absolute path to the linear FITS image to sharpen."
     )
     method: str = Field(
         default="richardson_lucy",
         description=(
-            "richardson_lucy: RL with optional regularization. "
-            "Recommended — iterative control, handles most cases well with tv. "
-            "wiener: Linear Wiener filter — faster, less iterative control, "
-            "good for very clean high-SNR images."
+            "'richardson_lucy': Iterative with optional regularization. Recommended. "
+            "'wiener': Linear Wiener filter — faster, less control, for clean high-SNR."
         ),
     )
     psf_source: str = Field(
         default="stars",
         description=(
-            "stars: Siril measures PSF from detected stars (makepsf stars) — most "
-            "accurate for well-focused star fields with sufficient star count. "
-            "blind: Blind PSF estimation (makepsf blind) — use when star count "
-            "is very low or stars are poorly resolved. "
-            "manual: Analytically defined PSF via makepsf_manual_options. Use when "
-            "you know the seeing FWHM or telescope optics precisely. "
-            "from_file: Load a pre-computed PSF FITS from psf_file path."
+            "'stars': PSF from detected stars (makepsf stars) — most accurate. "
+            "'blind': Blind PSF estimation (makepsf blind) — for low star count. "
+            "'manual': Analytical PSF via manual_psf_options. "
+            "'from_file': Load pre-computed PSF FITS from psf_file path. "
+            "'loadpsf': Load PSF inline with the rl/wiener command via -loadpsf=."
         ),
     )
     psf_file: str | None = Field(
         default=None,
         description=(
-            "Absolute path to a pre-computed PSF FITS file. "
-            "Only used when psf_source=from_file."
+            "Path to PSF FITS file. Used when psf_source='from_file' (with makepsf load) "
+            "or psf_source='loadpsf' (with rl -loadpsf= / wiener -loadpsf=)."
         ),
     )
-    makepsf_manual_options: MakePsfManualOptions = Field(
-        default_factory=MakePsfManualOptions,
-    )
+    blind_psf_options: BlindPsfOptions = Field(default_factory=BlindPsfOptions)
+    stars_psf_options: StarsPsfOptions = Field(default_factory=StarsPsfOptions)
+    manual_psf_options: ManualPsfOptions = Field(default_factory=ManualPsfOptions)
+    psf_config: PsfConfig = Field(default_factory=PsfConfig)
     rl_options: RLOptions = Field(default_factory=RLOptions)
     wiener_options: WienerOptions = Field(default_factory=WienerOptions)
 
 
-# ── PSF estimation ─────────────────────────────────────────────────────────────
+# ── PSF command builders ──────────────────────────────────────────────────────
+
+def _build_makepsf_stars(opts: StarsPsfOptions, cfg: PsfConfig) -> str:
+    cmd = "makepsf stars"
+    if opts.symmetric:
+        cmd += " -sym"
+    if cfg.psf_kernel_size is not None:
+        cmd += f" -ks={cfg.psf_kernel_size}"
+    if cfg.save_psf:
+        cmd += f" -savepsf={cfg.save_psf}"
+    return cmd
+
+
+def _build_makepsf_blind(opts: BlindPsfOptions, cfg: PsfConfig) -> str:
+    cmd = "makepsf blind"
+    if opts.use_l0:
+        cmd += " -l0"
+    if opts.use_spectral_irregularity:
+        cmd += " -si"
+    if opts.multiscale:
+        cmd += " -multiscale"
+    if opts.regularization_lambda is not None:
+        cmd += f" -lambda={opts.regularization_lambda}"
+    if opts.comp is not None:
+        cmd += f" -comp={opts.comp}"
+    if cfg.psf_kernel_size is not None:
+        cmd += f" -ks={cfg.psf_kernel_size}"
+    if cfg.save_psf:
+        cmd += f" -savepsf={cfg.save_psf}"
+    return cmd
+
+
+def _build_makepsf_manual(opts: ManualPsfOptions, cfg: PsfConfig) -> str:
+    cmd = f"makepsf manual -{opts.profile}"
+    if opts.fwhm_px is not None:
+        cmd += f" -fwhm={opts.fwhm_px}"
+    if opts.profile == "moffat" and opts.moffat_beta != 3.5:
+        cmd += f" -beta={opts.moffat_beta}"
+    if opts.aspect_ratio != 1.0:
+        cmd += f" -ratio={opts.aspect_ratio} -angle={opts.angle_deg}"
+    if opts.profile == "airy":
+        if opts.airy_diameter_mm is not None:
+            cmd += f" -dia={opts.airy_diameter_mm}"
+        if opts.airy_focal_length_mm is not None:
+            cmd += f" -fl={opts.airy_focal_length_mm}"
+        cmd += f" -wl={opts.airy_wavelength_nm}"
+        if opts.airy_pixelsize_um is not None:
+            cmd += f" -pixelsize={opts.airy_pixelsize_um}"
+        if opts.airy_obstruction_pct > 0:
+            cmd += f" -obstruct={opts.airy_obstruction_pct}"
+    if cfg.psf_kernel_size is not None:
+        cmd += f" -ks={cfg.psf_kernel_size}"
+    if cfg.save_psf:
+        cmd += f" -savepsf={cfg.save_psf}"
+    return cmd
+
+
+def _build_rl_cmd(opts: RLOptions, loadpsf: str | None = None) -> str:
+    cmd = f"rl -iters={opts.iterations}"
+    if loadpsf:
+        cmd += f" -loadpsf={loadpsf}"
+    if opts.regularization == "total_variation":
+        cmd += f" -tv -alpha={opts.alpha}"
+    elif opts.regularization == "hessian_frobenius":
+        cmd += f" -fh -alpha={opts.alpha}"
+    if opts.stop is not None:
+        cmd += f" -stop={opts.stop}"
+    if opts.gdstep is not None:
+        cmd += f" -gdstep={opts.gdstep}"
+    if opts.use_multiplicative:
+        cmd += " -mul"
+    return cmd
+
+
+def _build_wiener_cmd(opts: WienerOptions, loadpsf: str | None = None) -> str:
+    cmd = f"wiener -alpha={opts.alpha}"
+    if loadpsf:
+        cmd += f" -loadpsf={loadpsf}"
+    return cmd
+
+
+# ── Parse helpers ─────────────────────────────────────────────────────────────
 
 def _parse_psf_fwhm(stdout: str) -> float | None:
-    """Extract estimated PSF FWHM from Siril makepsf stdout."""
     m = re.search(r"PSF\s+FWHM[^=]*=\s*([\d.]+)", stdout, re.IGNORECASE)
     if m:
         return float(m.group(1))
@@ -258,7 +363,10 @@ def deconvolution(
     method: str = "richardson_lucy",
     psf_source: str = "stars",
     psf_file: str | None = None,
-    makepsf_manual_options: MakePsfManualOptions | None = None,
+    blind_psf_options: BlindPsfOptions | None = None,
+    stars_psf_options: StarsPsfOptions | None = None,
+    manual_psf_options: ManualPsfOptions | None = None,
+    psf_config: PsfConfig | None = None,
     rl_options: RLOptions | None = None,
     wiener_options: WienerOptions | None = None,
 ) -> dict:
@@ -267,28 +375,45 @@ def deconvolution(
 
     Prerequisites (verify with analyze_image before calling):
     - Image must be in linear space (is_linear=True).
-    - snr_estimate > 50. Low-SNR images will produce ringing, not sharpening.
+    - snr_estimate > 50. Low-SNR images produce ringing, not sharpening.
     - Image should be noise-reduced (T12 completed).
 
+    PSF source guidance:
+      stars  — measures PSF from the image's own stars. Almost always the best
+               choice for stacked astrophotography data.
+      blind  — blind estimation when star count is very low. Try l0 method
+               (-use_l0) or spectral irregularity (-use_spectral_irregularity).
+               Use multiscale for spatially varying PSF.
+      manual — analytical PSF when you have precise optics data. Moffat is the
+               most physically accurate model for atmospheric seeing.
+      from_file — load a previously saved PSF via makepsf load.
+      loadpsf — load PSF inline with the rl/wiener command (-loadpsf= flag).
+               Slightly different from from_file: skips the separate makepsf step.
+
     Algorithm guidance:
-    - richardson_lucy with regularization=total_variation is the default and
-      recommended method for most images. Start with iterations=5–10.
-    - wiener is appropriate for very clean, high-SNR images.
+      richardson_lucy with total_variation regularization is the default. Start
+      with iterations=5-10. Increase alpha (less regularization) for more
+      sharpening on high-SNR images. Use gdstep to tune gradient descent rate.
 
-    PSF: psf_source=stars uses makepsf stars to measure the PSF from the
-    image's own stars — almost always superior to a manually specified PSF
-    for stacked data. Use psf_source=manual with MakePsfManualOptions when
-    the star count is insufficient or you have precise telescope optics data.
+      wiener is faster for very clean high-SNR images with a well-known PSF.
 
-    HITL visual review is triggered automatically after this tool (V1).
-    If ringing or halos are visible, reduce iterations or increase alpha.
+    PSF can be saved (-savepsf via psf_config.save_psf) for reuse across
+    multiple deconvolution attempts with different rl/wiener parameters.
+
+    HITL visual review is triggered automatically (V1).
     """
+    if blind_psf_options is None:
+        blind_psf_options = BlindPsfOptions()
+    if stars_psf_options is None:
+        stars_psf_options = StarsPsfOptions()
+    if manual_psf_options is None:
+        manual_psf_options = ManualPsfOptions()
+    if psf_config is None:
+        psf_config = PsfConfig()
     if rl_options is None:
         rl_options = RLOptions()
     if wiener_options is None:
         wiener_options = WienerOptions()
-    if makepsf_manual_options is None:
-        makepsf_manual_options = MakePsfManualOptions()
 
     img_path = Path(image_path)
     if not img_path.exists():
@@ -297,59 +422,28 @@ def deconvolution(
     stem = img_path.stem
     output_stem = f"{stem}_deconv"
 
-    # Build commands
     commands: list[str] = [f"load {stem}"]
 
-    # PSF setup — verified Siril 1.4 makepsf syntax
-    if psf_source == "from_file" and psf_file:
-        psf_path = Path(psf_file)
-        if not psf_path.exists():
-            raise FileNotFoundError(f"PSF file not found: {psf_file}")
-        commands.append(f"makepsf load {psf_path.name}")
-    elif psf_source == "blind":
-        commands.append("makepsf blind")
-    elif psf_source == "manual":
-        mo = makepsf_manual_options
-        psf_cmd = f"makepsf manual -{mo.profile}"
-        if mo.fwhm_px is not None:
-            psf_cmd += f" -fwhm={mo.fwhm_px}"
-        if mo.profile == "moffat":
-            psf_cmd += f" -beta={mo.moffat_beta}"
-        if mo.aspect_ratio != 1.0:
-            psf_cmd += f" -ratio={mo.aspect_ratio} -angle={mo.angle_deg}"
-        if mo.profile == "airy":
-            if mo.airy_diameter_mm is not None:
-                psf_cmd += f" -dia={mo.airy_diameter_mm}"
-            if mo.airy_focal_length_mm is not None:
-                psf_cmd += f" -fl={mo.airy_focal_length_mm}"
-            psf_cmd += f" -wl={mo.airy_wavelength_nm}"
-            if mo.airy_obstruction_pct > 0:
-                psf_cmd += f" -obstruct={mo.airy_obstruction_pct}"
-        commands.append(psf_cmd)
-    else:
-        # stars: measures PSF from detected stars — most accurate for astrophotography
-        stars_cmd = "makepsf stars"
-        if makepsf_manual_options.symmetric:
-            stars_cmd += " -sym"
-        commands.append(stars_cmd)
+    loadpsf_path: str | None = None
 
-    # Deconvolution command — verified Siril 1.4 rl syntax
-    if method == "wiener":
-        commands.append(f"wiener -alpha={wiener_options.alpha}")
+    if psf_source == "loadpsf" and psf_file:
+        loadpsf_path = psf_file
+    elif psf_source == "from_file" and psf_file:
+        psf_p = Path(psf_file)
+        if not psf_p.exists():
+            raise FileNotFoundError(f"PSF file not found: {psf_file}")
+        commands.append(f"makepsf load {psf_p.name}")
+    elif psf_source == "blind":
+        commands.append(_build_makepsf_blind(blind_psf_options, psf_config))
+    elif psf_source == "manual":
+        commands.append(_build_makepsf_manual(manual_psf_options, psf_config))
     else:
-        rl_cmd = f"rl -iters={rl_options.iterations}"
-        if rl_options.regularization == "total_variation":
-            rl_cmd += f" -tv -alpha={rl_options.alpha}"
-        elif rl_options.regularization == "hessian_frobenius":
-            rl_cmd += f" -fh -alpha={rl_options.alpha}"
-        elif rl_options.regularization == "frobenius":
-            # legacy alias
-            rl_cmd += f" -alpha={rl_options.alpha}"
-        if rl_options.stop is not None:
-            rl_cmd += f" -stop={rl_options.stop}"
-        if rl_options.use_multiplicative:
-            rl_cmd += " -mul"
-        commands.append(rl_cmd)
+        commands.append(_build_makepsf_stars(stars_psf_options, psf_config))
+
+    if method == "wiener":
+        commands.append(_build_wiener_cmd(wiener_options, loadpsf_path))
+    else:
+        commands.append(_build_rl_cmd(rl_options, loadpsf_path))
 
     commands.append(f"save {output_stem}")
 
@@ -365,11 +459,12 @@ def deconvolution(
 
     return {
         "processed_image_path": str(output_path),
-        "sharpened_image_path": str(output_path),  # backward-compat alias
+        "sharpened_image_path": str(output_path),
         "method": method,
         "psf_source": psf_source,
-        "psf_profile": makepsf_manual_options.profile if psf_source == "manual" else None,
+        "psf_profile": manual_psf_options.profile if psf_source == "manual" else None,
         "psf_fwhm_used": psf_fwhm_used,
+        "psf_saved_to": psf_config.save_psf,
         "iterations_used": rl_options.iterations if method == "richardson_lucy" else None,
         "regularization": rl_options.regularization if method == "richardson_lucy" else None,
         "stop_criterion": rl_options.stop if method == "richardson_lucy" else None,

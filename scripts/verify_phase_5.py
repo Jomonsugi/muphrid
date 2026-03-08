@@ -11,7 +11,7 @@ Checks:
   - T26: erosion reduces pixel values in star regions
   - T27: wavelet='b3' is NOT used; scipy convolve1d is used instead
   - T23: _validate_stems raises FileNotFoundError on missing stems
-  - T21: _build_cmd uses positional coords (not -ra= flags)
+  - T21: build_platesolve_cmd uses positional coords (not -ra= flags)
   - T09: subsky polynomial uses -samples= and -tolerance= flags (not positional)
   - T09: subsky RBF uses -smooth= flag
   - T09: dither flag works
@@ -61,12 +61,12 @@ except Exception as e:
     analyze_image = None
 
 try:
-    from astro_agent.tools.utility.t21_plate_solve import plate_solve, _build_cmd
+    from astro_agent.tools.utility.t21_plate_solve import plate_solve, build_platesolve_cmd
     check("T21 plate_solve imports", True)
 except Exception as e:
     check("T21 plate_solve imports", False, str(e))
     plate_solve = None
-    _build_cmd = None
+    build_platesolve_cmd = None
 
 try:
     from astro_agent.tools.utility.t22_generate_preview import generate_preview
@@ -76,7 +76,7 @@ except Exception as e:
     generate_preview = None
 
 try:
-    from astro_agent.tools.utility.t23_pixel_math import pixel_math, _validate_stems
+    from astro_agent.tools.utility.t23_pixel_math import pixel_math, _validate_and_broadcast as _validate_stems
     check("T23 pixel_math imports", True)
 except Exception as e:
     check("T23 pixel_math imports", False, str(e))
@@ -141,11 +141,11 @@ if generate_preview is not None:
 # ── T21: platesolve coordinate order ──────────────────────────────────────────
 section("T21 plate_solve — CLI syntax verification")
 
-if _build_cmd is not None:
-    cmd_no_coords = _build_cmd(200.0, 3.77, None, False, False)
-    cmd_with_coords = _build_cmd(200.0, 3.77, {"ra": 150.5, "dec": -30.2}, False, False)
-    cmd_force = _build_cmd(200.0, 3.77, None, True, False)
-    cmd_localasnet = _build_cmd(200.0, 3.77, None, False, True)
+if build_platesolve_cmd is not None:
+    cmd_no_coords = build_platesolve_cmd(focal_length_mm=200.0, pixel_size_um=3.77)
+    cmd_with_coords = build_platesolve_cmd(focal_length_mm=200.0, pixel_size_um=3.77, approximate_coords={"ra": 150.5, "dec": -30.2})
+    cmd_force = build_platesolve_cmd(focal_length_mm=200.0, pixel_size_um=3.77, force_resolve=True)
+    cmd_localasnet = build_platesolve_cmd(focal_length_mm=200.0, pixel_size_um=3.77, use_local_astrometry_net=True)
 
     check("platesolve no coords: no -ra= flag", "-ra=" not in cmd_no_coords)
     check("platesolve with coords: positional (150.5 -30.2 before -focal)",
@@ -159,15 +159,20 @@ if _build_cmd is not None:
 section("T23 pixel_math — stem validation")
 
 if _validate_stems is not None:
+    import numpy as np
+    from astropy.io import fits as pyfits
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Create dummy FITS files
-        (Path(tmpdir) / "image1.fit").write_bytes(b"FITS")
-        (Path(tmpdir) / "image2.fit").write_bytes(b"FITS")
+        # Create valid FITS files for the validation function
+        hdu = pyfits.PrimaryHDU(np.zeros((100, 100), dtype=np.float32))
+        hdu.writeto(str(Path(tmpdir) / "image1.fit"), overwrite=True)
+        hdu.writeto(str(Path(tmpdir) / "image2.fit"), overwrite=True)
 
         # Valid expression with existing stems — should not raise
         try:
-            stems = _validate_stems("$image1$ * 0.7 + $image2$ * 0.3", tmpdir)
-            check("Valid stems detected correctly", stems == ["image1", "image2"])
+            result = _validate_stems("$image1$ * 0.7 + $image2$ * 0.3", tmpdir)
+            stems = result[0]  # returns (stems, expression, auto_broadcast)
+            check("Valid stems detected correctly", set(stems) == {"image1", "image2"})
         except Exception as e:
             check("Valid stems detected correctly", False, str(e))
 
@@ -376,8 +381,8 @@ section("T13 deconvolution — makepsf manual, rl -stop=, -fh")
 import astro_agent.tools.linear.t13_deconvolution as t13_module
 
 t13_src = inspect.getsource(t13_module)
-check("T13: MakePsfManualOptions class defined",
-      "MakePsfManualOptions" in t13_src)
+check("T13: ManualPsfOptions class defined",
+      "ManualPsfOptions" in t13_src)
 check("T13: makepsf manual -moffat supported",
       "-moffat" in t13_src or "moffat" in t13_src)
 check("T13: makepsf manual -airy supported",
@@ -394,28 +399,23 @@ check("T13: makepsf stars NOT using -auto",
       "makepsf -auto" not in t13_src)
 
 # Verify manual Moffat command builds correctly
-from astro_agent.tools.linear.t13_deconvolution import MakePsfManualOptions
+from astro_agent.tools.linear.t13_deconvolution import ManualPsfOptions, PsfConfig, _build_makepsf_manual
 
-mo = MakePsfManualOptions(profile="moffat", fwhm_px=2.5, moffat_beta=3.5)
-psf_cmd = f"makepsf manual -{mo.profile}"
-if mo.fwhm_px is not None:
-    psf_cmd += f" -fwhm={mo.fwhm_px}"
-psf_cmd += f" -beta={mo.moffat_beta}"
-check("T13: makepsf manual moffat command = 'makepsf manual -moffat -fwhm=2.5 -beta=3.5'",
-      psf_cmd == "makepsf manual -moffat -fwhm=2.5 -beta=3.5",
+mo = ManualPsfOptions(profile="moffat", fwhm_px=2.5, moffat_beta=4.0)
+psf_cmd = _build_makepsf_manual(mo, PsfConfig())
+check("T13: makepsf manual moffat command = 'makepsf manual -moffat -fwhm=2.5 -beta=4.0'",
+      psf_cmd == "makepsf manual -moffat -fwhm=2.5 -beta=4.0",
       detail=psf_cmd)
 
 # Verify Airy command builds correctly
-mo_airy = MakePsfManualOptions(
+mo_airy = ManualPsfOptions(
     profile="airy",
     airy_diameter_mm=130.0,
     airy_focal_length_mm=910.0,
     airy_wavelength_nm=656.0,
     airy_obstruction_pct=0.0,
 )
-airy_cmd = f"makepsf manual -{mo_airy.profile}"
-airy_cmd += f" -dia={mo_airy.airy_diameter_mm} -fl={mo_airy.airy_focal_length_mm}"
-airy_cmd += f" -wl={mo_airy.airy_wavelength_nm}"
+airy_cmd = _build_makepsf_manual(mo_airy, PsfConfig())
 check("T13: makepsf manual airy command builds",
       "-airy" in airy_cmd and "-dia=" in airy_cmd and "-wl=" in airy_cmd,
       detail=airy_cmd)

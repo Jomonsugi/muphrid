@@ -54,6 +54,7 @@ from astro_agent.tools.scikit.t25_create_mask import create_mask
 from astro_agent.tools.scikit.t27_multiscale import multiscale_process
 from astro_agent.tools.utility.t23_pixel_math import pixel_math
 from astro_agent.tools.utility.t24_export import export_final
+from astro_agent.tools.utility.t29_resolve_target import resolve_target
 
 
 def _step(name: str, fn, **kwargs):
@@ -77,10 +78,17 @@ def main() -> int:
         default=project_root / "manual_pipeline_output",
         help="Working directory for pipeline outputs",
     )
+    parser.add_argument(
+        "--target",
+        type=str,
+        required=True,
+        help="Astronomical target name for SIMBAD coordinate resolution (e.g. 'M42')",
+    )
     args = parser.parse_args()
 
     dataset_path = args.dataset.resolve()
     working_dir = args.output.resolve()
+    target_name = args.target
 
     if not dataset_path.exists():
         print(f"Error: dataset not found: {dataset_path}")
@@ -91,6 +99,7 @@ def main() -> int:
     print("=" * 60)
     print(f"Dataset:      {dataset_path}")
     print(f"Working dir:  {working_dir}")
+    print(f"Target:       {target_name}")
     print("=" * 60)
 
     working_dir.mkdir(parents=True, exist_ok=True)
@@ -102,13 +111,23 @@ def main() -> int:
         "T01 ingest",
         ingest_dataset,
         root_directory=str(dataset_path),
-        override_target_name="ManualPipeline",
+        override_target_name=target_name,
     )
     dataset = r01["dataset"]
     files = dataset["files"]
     meta = dataset.get("acquisition_meta", {})
-    focal_mm = meta.get("focal_length_mm") or 0.0
     camera_model = meta.get("camera_model")
+
+    # -------------------------------------------------------------------------
+    # T29 — Resolve target coordinates (mandatory before plate-solve steps)
+    # -------------------------------------------------------------------------
+    r29 = _step("T29 resolve_target", resolve_target, target_name=target_name)
+    if not r29["success"]:
+        print(f"  [T29] WARNING: {r29['error_msg']}")
+        target_coords = None
+    else:
+        target_coords = {"ra": r29["ra"], "dec": r29["dec"]}
+        print(f"       Resolved: RA={r29['ra']:.4f}°, DEC={r29['dec']:.4f}°")
 
     # -------------------------------------------------------------------------
     # T02b — Convert lights to sequence (needed before T03)
@@ -185,22 +204,29 @@ def main() -> int:
         calibrated_sequence=r03["calibrated_sequence"],
         framing="min",
     )
+    print(f"       Registered: {r04.get('registered_count', '?')} frames, "
+          f"failed: {r04.get('failed_count', 0)}")
 
     # -------------------------------------------------------------------------
-    # T05 — Analyze frames (parses .seq file directly)
+    # T05 — Analyze frames (parse calibrated .seq for registration data)
     # -------------------------------------------------------------------------
     r05 = _step(
         "T05 analyze_frames",
         analyze_frames,
         working_dir=str(working_dir),
-        registered_sequence=r04["registered_sequence"],
+        calibrated_sequence=r04["calibrated_sequence"],
     )
     summary = r05["summary"]
+    print(f"       Registration data: {summary.get('has_registration_data')}")
     print(f"       FWHM: median={summary.get('median_fwhm')}, "
           f"std={summary.get('std_fwhm')}, "
           f"seeing_stability={summary.get('seeing_stability')}")
+    print(f"       wFWHM: median={summary.get('median_weighted_fwhm')}")
     print(f"       Tracking: roundness={summary.get('tracking_quality')}, "
           f"stars={summary.get('median_star_count')}")
+    print(f"       Quality: median={summary.get('median_quality')}")
+    print(f"       Background: median={summary.get('median_background')}, "
+          f"sky_consistency={summary.get('sky_consistency')}")
     if summary.get("outlier_frames"):
         print(f"       Outlier frames: {summary['outlier_frames']}")
 
@@ -214,9 +240,16 @@ def main() -> int:
         criteria={},
     )
     accepted = r06["accepted_frames"]
+    print(f"       Accepted: {len(accepted)}/{summary.get('frame_count', '?')} "
+          f"({r06.get('acceptance_rate', 0):.0%})")
+    if r06.get("hitl_required"):
+        print(f"       HITL: {r06['hitl_context']}")
+    if r06.get("rejection_reasons"):
+        for frame_key, reason in r06["rejection_reasons"].items():
+            print(f"       Rejected frame {frame_key}: {reason}")
 
     # -------------------------------------------------------------------------
-    # T07 — Stack (1-based select/unselect, fixed FITSEQ parser)
+    # T07 — Stack
     # -------------------------------------------------------------------------
     r07 = _step(
         "T07 stack",
@@ -224,8 +257,11 @@ def main() -> int:
         working_dir=str(working_dir),
         registered_sequence=r04["registered_sequence"],
         accepted_frames=accepted,
+        total_frames_hint=summary.get("frame_count"),
     )
     current_image = r07["master_light_path"]
+    if r07.get("hitl_required"):
+        print(f"       HITL: {r07['hitl_context']}")
 
     # -------------------------------------------------------------------------
     # T08 — Crop
@@ -262,11 +298,12 @@ def main() -> int:
         color_calibrate,
         working_dir=str(working_dir),
         image_path=current_image,
-        focal_length_mm=focal_mm,
         camera_model=camera_model,
+        target_coords=target_coords,
     )
     if not r10.get("plate_solve_success"):
         print("  [T10] WARNING: plate solve failed, continuing without color calibration")
+        print(f"  [T10] error_msg: {r10.get('error_msg')}")
         if r10.get("calibrated_image_path"):
             current_image = r10["calibrated_image_path"]
     else:

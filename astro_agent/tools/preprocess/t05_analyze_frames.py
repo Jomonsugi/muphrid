@@ -1,30 +1,28 @@
 """
 T05 — analyze_frames
 
-Compute per-frame quality metrics on a registered sequence by parsing the
-.seq file directly.  Registration computes per-frame FWHM, roundness, quality,
-star count, and background; these are stored in the .seq file's R-lines.
-Per-frame statistics (mean, median, sigma, noise) are in the M-lines.
+Extract and present per-frame registration data from a Siril .seq file.
 
-This replaces the old seqstat/seqpsf approach which failed in headless mode.
+This is the agent's equivalent of Siril's "Plot" tab.  After registration
+(T04), Siril writes per-frame metrics to the *calibrated* sequence's .seq
+file as R-lines:
 
-.seq file format (v4+, verified from Siril source: src/io/seqfile.c):
-    S 'name' beg number selnum fixed refimage version ...
-    L nb_layers
-    I filenum incl [width,height]
     R{layer} fwhm weighted_fwhm roundness quality background_lvl nstars H h00..h22
-    M{layer}-{image_idx} total ngoodpix mean median sigma avgDev mad sqrtbwmv location scale min max normValue bgnoise
 
-## Two selection regimes
+And per-frame pixel statistics as M-lines:
 
-When star detection succeeds (R-lines populated), the agent uses FWHM,
-roundness, and star count as primary rejection criteria in T06.
+    M{layer}-{idx} total ngoodpix mean median sigma avgDev mad sqrtbwmv location scale min max normValue bgnoise
 
-When star detection fails — typical for sub-second exposures where individual
-frames don't expose enough stars — this tool falls back to Laplacian variance
-as a sharpness proxy. Laplacian variance measures high-frequency image content
-(focus, trailing, blur) directly from pixel data, without requiring stars.
-The `has_star_metrics` flag in the summary tells T06 which path to take.
+This tool parses both, computes summary statistics, and returns everything
+the agent needs to reason about frame quality and decide what to keep.
+
+The returned data mirrors what a human sees in Siril's registration output /
+Plot tab — FWHM, wFWHM, roundness, star count, background, quality — enabling
+the agent to make the same data-driven decisions a human would.
+
+IMPORTANT: Pass the *calibrated_sequence* name (the input to registration),
+NOT the registered output sequence.  Siril writes R-lines to the input .seq
+during `register`, not to the output `r_<seq>.seq` from `seqapplyreg`.
 """
 
 from __future__ import annotations
@@ -33,8 +31,6 @@ import re
 import statistics
 from pathlib import Path
 
-import numpy as np
-from astropy.io import fits
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
@@ -45,10 +41,11 @@ class AnalyzeFramesInput(BaseModel):
     working_dir: str = Field(
         description="Absolute path to the Siril working directory."
     )
-    registered_sequence: str = Field(
+    calibrated_sequence: str = Field(
         description=(
-            "Name of the registered sequence (without .seq extension). "
-            "Typically 'r_pp_lights_seq' from T04."
+            "Name of the calibrated sequence (without .seq extension). "
+            "This is the INPUT to registration — where Siril writes R-lines. "
+            "Typically 'pp_lights_seq' from T03.  NOT the r_<seq> output."
         )
     )
 
@@ -59,8 +56,23 @@ def _parse_seq_file(seq_path: Path) -> dict:
     """
     Parse a Siril .seq file and return structured registration and stats data.
 
+    .seq file format (v4+, verified from Siril source: src/io/seqfile.c):
+        S 'name' beg number selnum fixed refimage version ...
+        L nb_layers
+        I filenum incl [width,height]
+        R{layer} fwhm weighted_fwhm roundness quality background_lvl nstars H h00..h22
+        M{layer}-{idx} total ngoodpix mean median sigma avgDev mad sqrtbwmv
+                        location scale min max normValue bgnoise
+
+    Siril writes seq files in two layouts depending on sequence type:
+      - Interleaved: each I-line is immediately followed by its R-line(s).
+      - Block (FITSEQ): all I-lines first, then all R-lines in frame order.
+
+    Both are handled by tracking which layers have been seen for the current
+    R-frame group; a repeated layer signals a new frame.
+
     Returns dict with keys:
-        n_frames, selected_indices, regdata (dict of idx→dict), stats (dict of idx→dict)
+        n_frames, selected_indices, reference_image, regdata, stats
     """
     result: dict = {
         "n_frames": 0,
@@ -74,6 +86,12 @@ def _parse_seq_file(seq_path: Path) -> dict:
         return result
 
     lines = seq_path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    # frame_order: I-line frame indices in file order, used to map R-lines in
+    # block-format seq files where all I-lines precede all R-lines.
+    frame_order: list[int] = []
+    r_frame_counter: int = 0         # index into frame_order for current R-frame
+    r_seen_layers: set[int] = set()  # layers already recorded for this R-frame
 
     for line in lines:
         stripped = line.strip()
@@ -92,39 +110,56 @@ def _parse_seq_file(seq_path: Path) -> dict:
         elif stripped.startswith("I "):
             parts = stripped.split()
             if len(parts) >= 3:
-                filenum = int(parts[1])
+                frame_idx = int(parts[1])
+                frame_order.append(frame_idx)
                 included = int(parts[2])
                 if included:
-                    result["selected_indices"].append(filenum)
+                    result["selected_indices"].append(frame_idx)
 
         elif stripped[0] == "R" and len(stripped) > 1:
             layer_char = stripped[1]
-            if layer_char.isdigit() or layer_char == "*":
-                layer = 0 if layer_char == "*" else int(layer_char)
-                if layer != 0:
-                    continue  # only parse layer 0 (green/lum)
-                rest = stripped[2:].strip()
-                tokens = rest.split()
-                if len(tokens) >= 6:
-                    frame_idx = len(result["regdata"])
-                    result["regdata"][frame_idx] = {
-                        "fwhm":            float(tokens[0]),
-                        "weighted_fwhm":   float(tokens[1]),
-                        "roundness":       float(tokens[2]),
-                        "quality":         float(tokens[3]),
-                        "background_lvl":  float(tokens[4]),
-                        "number_of_stars": int(tokens[5]),
-                    }
+            if not (layer_char.isdigit() or layer_char == "*"):
+                continue
+
+            layer = int(layer_char) if layer_char.isdigit() else 0
+
+            # A repeated layer means we've moved to the next frame's R-lines.
+            if layer in r_seen_layers:
+                r_frame_counter += 1
+                r_seen_layers = {layer}
+            else:
+                r_seen_layers.add(layer)
+
+            if r_frame_counter >= len(frame_order):
+                continue
+
+            actual_idx = frame_order[r_frame_counter]
+            if actual_idx in result["regdata"]:
+                continue  # already captured a layer for this frame
+
+            rest = stripped[2:].strip()
+            tokens = rest.split()
+            if len(tokens) >= 6:
+                result["regdata"][actual_idx] = {
+                    "fwhm":            float(tokens[0]),
+                    "weighted_fwhm":   float(tokens[1]),
+                    "roundness":       float(tokens[2]),
+                    "quality":         float(tokens[3]),
+                    "background_lvl":  float(tokens[4]),
+                    "number_of_stars": int(tokens[5]),
+                }
 
         elif stripped[0] == "M" and len(stripped) > 1:
             m_match = re.match(r"M([0-9*])-(\d+)\s+(.*)", stripped)
             if m_match:
                 layer_char = m_match.group(1)
-                if layer_char != "0" and layer_char != "*":
-                    continue
                 img_idx = int(m_match.group(2))
+                # Accept any layer but only record the first M-line per frame
+                # (avoids overwriting with a lower-quality channel's stats).
+                if img_idx in result["stats"]:
+                    continue
                 tokens = m_match.group(3).split()
-                if len(tokens) >= 15:
+                if len(tokens) >= 14:
                     result["stats"][img_idx] = {
                         "total":     int(tokens[0]),
                         "ngoodpix":  int(tokens[1]),
@@ -145,84 +180,10 @@ def _parse_seq_file(seq_path: Path) -> dict:
     return result
 
 
-# ── Laplacian sharpness (star-free sharpness proxy) ────────────────────────────
-
-def _compute_laplacian_sharpness_fitseq(
-    fitseq_path: Path,
-    downsample: int = 4,
-) -> dict[int, float]:
-    """
-    Compute Laplacian variance as a per-frame sharpness proxy from a FITSEQ.
-
-    Laplacian variance = var(∇²I), where ∇²I is approximated as:
-        top + bottom + left + right − 4 × center
-
-    Higher value → sharper frame (more high-frequency content).
-    This works without star detection and is effective for blur, trailing,
-    focus drift, and atmospheric smearing — the same defects a human spots
-    when blinking through subs in PixInsight.
-
-    Downsamples by `downsample` before computing (default 4×) for speed on
-    large raw frames (6000×4000px → 1500×1000px, ~16× fewer operations).
-
-    Returns {frame_index: laplacian_variance} for all readable frames.
-    """
-    result: dict[int, float] = {}
-    if not fitseq_path.exists():
-        return result
-
-    try:
-        with fits.open(str(fitseq_path), memmap=True) as hdul:
-            frame_idx = 0
-            for hdu in hdul:
-                if hdu.data is None or hdu.data.size == 0:
-                    continue
-
-                data = hdu.data.astype(np.float32)
-
-                # For color FITS (NAXIS=3), extract the green channel.
-                # Siril color FITSEQs store channels as (3, H, W) or (H, W, 3).
-                if data.ndim == 3:
-                    if data.shape[0] == 3:
-                        data = data[1]          # (3, H, W) → green
-                    elif data.shape[2] == 3:
-                        data = data[:, :, 1]    # (H, W, 3) → green
-                    else:
-                        data = data[0]          # fallback: first plane
-
-                # Subsample for speed
-                if downsample > 1:
-                    data = data[::downsample, ::downsample]
-
-                h, w = data.shape
-                if h < 3 or w < 3:
-                    frame_idx += 1
-                    continue
-
-                # Discrete 2D Laplacian via finite differences
-                lap = (
-                    data[:-2, 1:-1] +   # top neighbor
-                    data[2:,  1:-1] +   # bottom neighbor
-                    data[1:-1, :-2] +   # left neighbor
-                    data[1:-1,  2:] -   # right neighbor
-                    4.0 * data[1:-1, 1:-1]
-                )
-                result[frame_idx] = float(np.var(lap))
-                frame_idx += 1
-
-    except Exception:
-        pass
-
-    return result
-
-
 # ── Metric assembly ─────────────────────────────────────────────────────────────
 
-def _build_frame_metrics(
-    seq_data: dict,
-    laplacian: dict[int, float],
-) -> dict[str, dict]:
-    """Merge regdata, stats, and Laplacian sharpness into per-frame dicts."""
+def _build_frame_metrics(seq_data: dict) -> dict[str, dict]:
+    """Build per-frame metric dicts from parsed .seq R-lines and M-lines."""
     metrics: dict[str, dict] = {}
 
     all_indices = set(seq_data["regdata"].keys()) | set(seq_data["stats"].keys())
@@ -231,25 +192,24 @@ def _build_frame_metrics(
 
     for idx in sorted(all_indices):
         entry: dict = {
-            # R-line (star-detection based)
             "fwhm":               None,
             "weighted_fwhm":      None,
             "roundness":          None,
             "quality":            None,
             "background_lvl":     None,
             "number_of_stars":    None,
-            # M-line (pixel statistics, always present if Siril computed them)
             "mean":               None,
             "median":             None,
             "sigma":              None,
             "bgnoise":            None,
-            # Laplacian sharpness (computed from FITSEQ pixel data)
-            "laplacian_sharpness": laplacian.get(idx),
         }
 
         reg = seq_data["regdata"].get(idx, {})
         if reg:
-            entry.update({k: reg[k] for k in entry if k in reg})
+            for k in ("fwhm", "weighted_fwhm", "roundness", "quality",
+                       "background_lvl", "number_of_stars"):
+                if k in reg:
+                    entry[k] = reg[k]
 
         stat = seq_data["stats"].get(idx, {})
         if stat:
@@ -264,11 +224,10 @@ def _build_frame_metrics(
 
 def _compute_summary(frame_metrics: dict[str, dict], seq_data: dict) -> dict:
     """
-    Compute summary statistics and diagnostic flags from per-frame metrics.
+    Compute summary statistics from per-frame metrics.
 
-    Always returns `has_star_metrics` so T06 can choose the right selection path:
-      True  → FWHM/roundness/star_count available → standard sigma-clipping path
-      False → No star data → Laplacian-percentile path
+    Returns a rich summary dict analogous to what a human reads from Siril's
+    Plot tab: medians, standard deviations, outlier detection, diagnostic flags.
     """
     def _collect(key: str, positive_only: bool = True) -> list[float]:
         vals = [v[key] for v in frame_metrics.values() if v.get(key) is not None]
@@ -283,18 +242,16 @@ def _compute_summary(frame_metrics: dict[str, dict], seq_data: dict) -> dict:
     backgrounds = _collect("background_lvl")
     noises      = _collect("bgnoise")
     sigmas      = _collect("sigma")
-    sharpnesses = _collect("laplacian_sharpness")
 
     n = len(frame_metrics)
-    has_star_metrics = bool(fwhms)
+    has_registration_data = bool(fwhms)
 
-    # ── Star-based metrics (None when not available) ──────────────────────
-    med_fwhm, std_fwhm = None, None
-    seeing_stability, tracking_quality, sky_consistency = None, None, None
+    med_fwhm = std_fwhm = None
+    seeing_stability = tracking_quality = sky_consistency = None
     outlier_frames: list[str] = []
-    best_frame, worst_frame = None, None
+    best_frame = worst_frame = None
 
-    if has_star_metrics:
+    if has_registration_data:
         med_fwhm = statistics.median(fwhms)
         std_fwhm = statistics.stdev(fwhms) if len(fwhms) > 1 else 0.0
 
@@ -321,48 +278,29 @@ def _compute_summary(frame_metrics: dict[str, dict], seq_data: dict) -> dict:
                 if v.get("fwhm") is not None and v["fwhm"] > threshold
             ]
 
-    elif sharpnesses:
-        # No FWHM — rank by Laplacian sharpness for best/worst
-        sorted_by_sharp = sorted(
-            [(k, v["laplacian_sharpness"]) for k, v in frame_metrics.items()
-             if v.get("laplacian_sharpness") is not None],
-            key=lambda x: x[1],
-            reverse=True,   # higher = sharper
-        )
-        best_frame  = sorted_by_sharp[0][0]  if sorted_by_sharp else None
-        worst_frame = sorted_by_sharp[-1][0] if sorted_by_sharp else None
-
     return {
-        # Selection regime flag — T06 reads this to pick the right path
-        "has_star_metrics": has_star_metrics,
+        "has_registration_data": has_registration_data,
 
         "frame_count":      n,
         "reference_image":  seq_data.get("reference_image", -1),
         "selected_count":   len(seq_data.get("selected_indices", [])),
 
-        # Star-based (None when has_star_metrics=False)
-        "median_fwhm":         round(med_fwhm, 4) if med_fwhm is not None else None,
-        "std_fwhm":            round(std_fwhm, 4) if std_fwhm is not None else None,
+        "median_fwhm":          round(med_fwhm, 4) if med_fwhm is not None else None,
+        "std_fwhm":             round(std_fwhm, 4) if std_fwhm is not None else None,
         "median_weighted_fwhm": round(statistics.median(wfwhms), 4) if wfwhms else None,
-        "median_roundness":    round(statistics.median(roundnesses), 4) if roundnesses else None,
-        "median_quality":      round(statistics.median(qualities), 6) if qualities else None,
-        "median_star_count":   int(statistics.median(star_counts)) if star_counts else None,
-        "seeing_stability":    seeing_stability,
-        "tracking_quality":    tracking_quality,
-        "sky_consistency":     sky_consistency,
-        "outlier_frames":      outlier_frames,
+        "median_roundness":     round(statistics.median(roundnesses), 4) if roundnesses else None,
+        "median_quality":       round(statistics.median(qualities), 6) if qualities else None,
+        "median_star_count":    int(statistics.median(star_counts)) if star_counts else None,
+        "seeing_stability":     seeing_stability,
+        "tracking_quality":     tracking_quality,
+        "sky_consistency":      sky_consistency,
+        "outlier_frames":       outlier_frames,
 
-        # Stats-based (from M-lines, available regardless of star detection)
-        "median_background":   round(statistics.median(backgrounds), 6) if backgrounds else None,
-        "std_background":      round(statistics.stdev(backgrounds), 6) if len(backgrounds) > 1 else None,
-        "median_noise":        round(statistics.median(noises), 6) if noises else None,
-        "median_sigma":        round(statistics.median(sigmas), 6) if sigmas else None,
+        "median_background":    round(statistics.median(backgrounds), 6) if backgrounds else None,
+        "std_background":       round(statistics.stdev(backgrounds), 6) if len(backgrounds) > 1 else None,
+        "median_noise":         round(statistics.median(noises), 6) if noises else None,
+        "median_sigma":         round(statistics.median(sigmas), 6) if sigmas else None,
 
-        # Laplacian sharpness (from FITSEQ pixel data, always attempted)
-        "median_laplacian_sharpness": round(statistics.median(sharpnesses), 4) if sharpnesses else None,
-        "std_laplacian_sharpness":    round(statistics.stdev(sharpnesses), 4) if len(sharpnesses) > 1 else None,
-
-        # Best/worst frame key
         "best_frame":  best_frame,
         "worst_frame": worst_frame,
     }
@@ -373,47 +311,42 @@ def _compute_summary(frame_metrics: dict[str, dict], seq_data: dict) -> dict:
 @tool(args_schema=AnalyzeFramesInput)
 def analyze_frames(
     working_dir: str,
-    registered_sequence: str,
+    calibrated_sequence: str,
 ) -> dict:
     """
-    Compute per-frame quality metrics on a registered sequence.
+    Extract per-frame registration data from a Siril .seq file.
 
-    Primary path: parses FWHM, roundness, star count, background from .seq
-    R-lines (written by Siril's star-detection during registration).
+    This is the agent's "Plot tab" — after registration (T04), this tool reads
+    the per-frame metrics that Siril computed (FWHM, wFWHM, roundness, quality,
+    background, star count) and returns them with summary statistics.
 
-    Fallback path: when star detection failed (short exposures, sparse fields),
-    computes Laplacian variance sharpness directly from the FITSEQ pixel data.
-    This measures blur, trailing, and focus drift without needing stars.
+    IMPORTANT: Pass the calibrated_sequence name (input to register), NOT the
+    registered output (r_<seq>).  Siril writes R-lines to the input .seq file
+    during registration.  T04 returns both names — use calibrated_sequence.
 
-    Always returns `summary.has_star_metrics` (bool) so the agent can tell T06
-    which selection strategy to use:
-      True  → pass frame_metrics to select_frames with standard criteria
-      False → pass frame_metrics to select_frames with has_star_metrics=False
-               and a keep_percentile (default 0.85) to rank by sharpness
+    The returned data enables the same frame selection decisions a human makes:
+      - median_fwhm + std_fwhm → set FWHM rejection thresholds
+      - tracking_quality (median roundness) → detect mount/tracking issues
+      - seeing_stability (FWHM CV) → assess atmospheric consistency
+      - sky_consistency (background CV) → detect clouds / moon interference
+      - outlier_frames → frames > 2σ above median FWHM
+      - per-frame metrics → feed into T06 for sigma-clipping selection
 
-    Use summary.median_fwhm and summary.std_fwhm to set rejection thresholds
-    when has_star_metrics=True.
-    High seeing_stability (CV > 0.3) means variable seeing — tighten rejection.
-    Low tracking_quality (< 0.7) means elongation — investigate mount issues.
+    If has_registration_data is False, registration did not produce star
+    metrics.  Re-run T04 with tuned findstar parameters (lower sigma,
+    increased radius, relax=True) before concluding the data is unusable.
     """
     wdir = Path(working_dir)
-    seq_path = wdir / f"{registered_sequence}.seq"
+    seq_path = wdir / f"{calibrated_sequence}.seq"
     if not seq_path.exists():
         raise FileNotFoundError(
             f"Sequence file not found: {seq_path}. "
-            f"Ensure registration (T04) completed successfully."
+            f"Ensure calibration (T03) and registration (T04) completed. "
+            f"Pass the calibrated sequence name, NOT the registered output."
         )
 
     seq_data = _parse_seq_file(seq_path)
-
-    # Compute Laplacian sharpness from the FITSEQ pixel data.
-    # Try both .fit and .fits extensions.
-    fitseq_path = wdir / f"{registered_sequence}.fit"
-    if not fitseq_path.exists():
-        fitseq_path = wdir / f"{registered_sequence}.fits"
-    laplacian = _compute_laplacian_sharpness_fitseq(fitseq_path)
-
-    frame_metrics = _build_frame_metrics(seq_data, laplacian)
+    frame_metrics = _build_frame_metrics(seq_data)
     summary = _compute_summary(frame_metrics, seq_data)
 
     return {

@@ -93,6 +93,16 @@ class GHSOptions(BaseModel):
             "R, G, B: single channel. RG, RB, GB: channel pairs."
         ),
     )
+    clip_mode: str = Field(
+        default="rgbblend",
+        description=(
+            "How out-of-range values are handled after stretch. "
+            "'clip': hard clip to [0,1]. "
+            "'rescale': rescale to fit. "
+            "'rgbblend': blend RGB to preserve color (default, recommended). "
+            "'globalrescale': rescale uniformly across all channels."
+        ),
+    )
 
 
 class AsinhOptions(BaseModel):
@@ -115,6 +125,13 @@ class AsinhOptions(BaseModel):
         description=(
             "human: preserves L*a*b* lightness (recommended for color). "
             "default: simple channel mean for luminance calculation."
+        ),
+    )
+    clip_mode: str = Field(
+        default="rgbblend",
+        description=(
+            "How out-of-range values are handled. "
+            "'clip', 'rescale', 'rgbblend' (default), 'globalrescale'."
         ),
     )
 
@@ -193,7 +210,8 @@ def _build_ghs_cmd(opts: GHSOptions) -> str:
         cmd += f" -LP={opts.shadow_protection}"
     if opts.highlight_protection != 1.0:
         cmd += f" -HP={opts.highlight_protection}"
-    # Always emit the color model flag: -human, -even, or -independent
+    if opts.clip_mode != "rgbblend":
+        cmd += f" -clipmode={opts.clip_mode}"
     cmd += f" -{opts.color_model}"
     if opts.channels != "all":
         cmd += f" {opts.channels}"
@@ -207,6 +225,8 @@ def _build_asinh_cmd(opts: AsinhOptions) -> str:
     cmd += f" {opts.stretch_factor}"
     if opts.black_point_offset != 0.0:
         cmd += f" {opts.black_point_offset}"
+    if opts.clip_mode != "rgbblend":
+        cmd += f" -clipmode={opts.clip_mode}"
     return cmd
 
 

@@ -10,37 +10,15 @@ Build an agentic astrophotography pipeline that matches PixInsight-quality outpu
 using open source software. Every decision — package choice, algorithm, architecture —
 should be made with that bar in mind.
 
+When a human post-process raw image files to final stacked image, the process is not linear, it is iterative. The human uses many tools and each tool has many options. Which tools are used and which options are selected is never deterministic, it is situational. To be successful, the LLM agent will need access to all the same tools and options. The output of tools will be data that the LLM can reason over to decide on the next step to take, just as a human would do.
+
 ## Gold Standard Over Convenient
 
 Always choose the most robust, comprehensive, and trusted tool for a job.
 
-| Don't choose | Choose instead | Why |
-|---|---|---|
-| `exifread` | `pyexiftool` + ExifTool binary | ExifTool reads every format including Fujifilm proprietary maker notes; Lightroom/Capture One use it |
-| `rawpy` metadata | ExifTool | rawpy is for pixel data, not metadata |
-| Convenience library | Industry standard | The agent's decisions are only as good as the data it gets |
-
-**The ExifTool decision is the reference example.** When evaluating options, ask:
-- Is this what professional tools (Lightroom, Capture One, PixInsight) use under the hood?
-- Does it handle the full range of formats and edge cases, not just today's use case?
-- Is it actively maintained and trusted by the community?
-
-## External Binaries Are Expected
-
-This system already requires Siril, GraXpert, and StarNet — adding ExifTool is not a burden.
-External binaries managed via `.env` are a first-class pattern here.
-Do not reject a better tool solely because it requires a system dependency.
-
-## Data Quality Drives Agent Quality
-
-The agent makes decisions based on metrics and EXIF/FITS metadata.
+The agent makes decisions based on data.
 **Garbage in = garbage decisions.** Every tool in the pipeline should extract
 the most complete, accurate data possible. Richer data = better agent.
-
-This applies to:
-- EXIF extraction (T01) — get all maker notes, not just basic tags
-- Image metrics (T20 `analyze_image`) — expose every meaningful statistic
-- Siril output parsing (`_siril.py`) — extract all parseable metrics from stdout
 
 ## When Evaluating New Packages
 

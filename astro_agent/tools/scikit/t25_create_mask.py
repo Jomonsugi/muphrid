@@ -29,7 +29,13 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from skimage.color import rgb2gray
 from skimage.filters import gaussian
-from skimage.morphology import binary_dilation, binary_erosion, disk
+from skimage.morphology import binary_dilation, binary_erosion, diamond, disk, square
+
+_FOOTPRINT_BUILDERS = {
+    "disk": disk,
+    "square": square,
+    "diamond": diamond,
+}
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -100,18 +106,61 @@ class CreateMaskInput(BaseModel):
             "5px: conservative (stars, fine detail). 15–30px: large-scale regions."
         ),
     )
+    feather_truncate: float = Field(
+        default=4.0,
+        description=(
+            "Truncate the Gaussian filter at this many standard deviations. "
+            "4.0: default, smooth tail. 2.0: faster, sharper cutoff. "
+            "Higher values extend the transition zone but cost more compute."
+        ),
+    )
+    feather_mode: str = Field(
+        default="nearest",
+        description=(
+            "Boundary handling for the Gaussian feather filter. "
+            "'nearest': extend edge pixels (default, good for most masks). "
+            "'reflect': mirror at boundary. 'constant': pad with zeros. 'wrap': periodic."
+        ),
+    )
     expand_px: int = Field(
         default=0,
         description=(
-            "Morphologically dilate the binary mask by this many pixels before "
+            "Structuring element radius for morphological dilation before "
             "feathering. Use 5 on a star mask to ensure halos are included."
         ),
     )
     contract_px: int = Field(
         default=0,
         description=(
-            "Morphologically erode the binary mask by this many pixels before "
+            "Structuring element radius for morphological erosion before "
             "feathering. Use to tighten a mask bleeding into adjacent regions."
+        ),
+    )
+    morphology_iterations: int = Field(
+        default=1,
+        description=(
+            "Number of times to repeat dilation/erosion. "
+            "expand_px=2, iterations=3 gives a very different result from "
+            "expand_px=6, iterations=1 — repeated small operations are rounder, "
+            "single large operations follow the footprint shape more strictly."
+        ),
+    )
+    structuring_element: str = Field(
+        default="disk",
+        description=(
+            "Shape of the morphological footprint for expand/contract. "
+            "'disk': circular (default, isotropic). "
+            "'square': axis-aligned box. "
+            "'diamond': 45° rotated square (Manhattan distance ball)."
+        ),
+    )
+    luminance_model: str = Field(
+        default="rec709",
+        description=(
+            "Luminance weighting for mask computation. "
+            "'rec709': standard Rec.709 weights (0.2126R + 0.7152G + 0.0722B). "
+            "'equal': equal weight (R+G+B)/3. "
+            "'max': per-pixel max(R,G,B) — captures any channel being bright."
         ),
     )
     invert: bool = Field(
@@ -132,7 +181,10 @@ class CreateMaskInput(BaseModel):
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _load_channels(image_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _load_channels(
+    image_path: Path,
+    luminance_model: str = "rec709",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load FITS, return (lum, r, g, b) all as float32 (H, W)."""
     with astropy_fits.open(image_path) as hdul:
         data = hdul[0].data.astype(np.float32)
@@ -148,7 +200,12 @@ def _load_channels(image_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
         mono = data.squeeze()
         r = g = b = mono
 
-    lum = (0.2126 * r + 0.7152 * g + 0.0722 * b)
+    if luminance_model == "equal":
+        lum = (r + g + b) / 3.0
+    elif luminance_model == "max":
+        lum = np.maximum(np.maximum(r, g), b)
+    else:
+        lum = (0.2126 * r + 0.7152 * g + 0.0722 * b)
     return lum, r, g, b
 
 
@@ -207,8 +264,13 @@ def create_mask(
     range_options: RangeOptions | None = None,
     channel_diff_options: ChannelDiffOptions | None = None,
     feather_radius: float = 5.0,
+    feather_truncate: float = 4.0,
+    feather_mode: str = "nearest",
     expand_px: int = 0,
     contract_px: int = 0,
+    morphology_iterations: int = 1,
+    structuring_element: str = "disk",
+    luminance_model: str = "rec709",
     invert: bool = False,
     output_stem: str | None = None,
 ) -> dict:
@@ -243,26 +305,27 @@ def create_mask(
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    lum, r, g, b = _load_channels(img_path)
+    footprint_fn = _FOOTPRINT_BUILDERS.get(structuring_element, disk)
 
-    # Build binary mask
+    lum, r, g, b = _load_channels(img_path, luminance_model)
+
     binary = _build_binary_mask(
         mask_type, lum, r, g, b,
         luminance_options, range_options, channel_diff_options,
     )
 
-    # Morphological expand/contract
-    if expand_px > 0:
-        binary = binary_dilation(binary, disk(expand_px))
-    if contract_px > 0:
-        binary = binary_erosion(binary, disk(contract_px))
+    for _ in range(morphology_iterations):
+        if expand_px > 0:
+            binary = binary_dilation(binary, footprint_fn(expand_px))
+        if contract_px > 0:
+            binary = binary_erosion(binary, footprint_fn(contract_px))
 
-    # Convert to float for feathering
     mask = binary.astype(np.float32)
 
-    # Feather edges with Gaussian blur
     if feather_radius > 0:
-        mask = gaussian(mask, sigma=feather_radius).astype(np.float32)
+        mask = gaussian(
+            mask, sigma=feather_radius, truncate=feather_truncate, mode=feather_mode,
+        ).astype(np.float32)
         mask = np.clip(mask, 0.0, 1.0)
 
     # Optional inversion

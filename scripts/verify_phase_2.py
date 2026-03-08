@@ -138,20 +138,21 @@ try:
     for i, fwhm in enumerate(fwhms):
         frame_metrics[f"frame_{i:04d}.fit"] = {
             "fwhm":             fwhm,
-            "eccentricity":     0.1,
+            "weighted_fwhm":    fwhm * 1.1,
             "roundness":        0.92,
-            "star_count":       80,
-            "background_level": 0.05,
-            "noise_estimate":   0.002,
+            "quality":          0.8,
+            "number_of_stars":  80,
+            "background_lvl":   0.05,
+            "bgnoise":          0.002,
         }
     # Two bad frames: high FWHM and low star count
     frame_metrics["bad_fwhm.fit"] = {
-        "fwhm": 8.0, "eccentricity": 0.3, "roundness": 0.7,
-        "star_count": 80, "background_level": 0.05, "noise_estimate": 0.002,
+        "fwhm": 8.0, "weighted_fwhm": 9.0, "roundness": 0.7,
+        "quality": 0.2, "number_of_stars": 80, "background_lvl": 0.05, "bgnoise": 0.002,
     }
     frame_metrics["bad_stars.fit"] = {
-        "fwhm": 2.1, "eccentricity": 0.1, "roundness": 0.9,
-        "star_count": 5, "background_level": 0.05, "noise_estimate": 0.002,
+        "fwhm": 2.1, "weighted_fwhm": 2.3, "roundness": 0.9,
+        "quality": 0.5, "number_of_stars": 5, "background_lvl": 0.05, "bgnoise": 0.002,
     }
 
     result = select_frames.invoke({"frame_metrics": frame_metrics})
@@ -164,8 +165,8 @@ try:
 
     # Safety test: all frames bad → still returns all accepted
     all_bad = {f"f{i}.fit": {
-        "fwhm": 50.0, "roundness": 0.1, "star_count": 1,
-        "background_level": 99.0, "noise_estimate": 0.1
+        "fwhm": 50.0, "roundness": 0.1, "number_of_stars": 1,
+        "background_lvl": 99.0, "bgnoise": 0.1
     } for i in range(5)}
     safety_result = select_frames.invoke({"frame_metrics": all_bad})
     check("T06 safety: never empty accepted list",

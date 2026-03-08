@@ -3,15 +3,15 @@ T21 — plate_solve
 
 Determine precise celestial coordinates and pixel scale via astrometric plate
 solving. This is a standalone tool exposing the plate-solve capability
-independently of color calibration. T10 calls this internally; T21 is for
-cases where the agent needs WCS data without immediately running color
-calibration (e.g., to get pixel_scale_arcsec for deconvolution PSF sizing).
-
-Reuses _build_platesolve_cmd and _parse_plate_solve_result from T10.
+independently of color calibration. T10 calls the shared _build_platesolve_cmd
+helper; T21 is for cases where the agent needs WCS data without immediately
+running color calibration (e.g. pixel_scale_arcsec for deconvolution PSF sizing).
 
 Siril commands (verified against Siril 1.4 CLI docs):
-    load <stem>
-    platesolve [ra dec] [-focal=<fl>] [-pixelsize=<px>] [-force] [-localasnet]
+    platesolve [-force] [image_center_coords] [-focal=] [-pixelsize=]
+               [-noflip] [-downscale] [-order=] [-radius=] [-disto=]
+               [-limitmag=[+-]] [-catalog=] [-nocrop]
+               [-localasnet [-blindpos] [-blindres]]
 """
 
 from __future__ import annotations
@@ -22,11 +22,9 @@ from pathlib import Path
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+from astro_agent.equipment import resolve_pixel_size, resolve_target_coords
 from astro_agent.tools._siril import SirilError, run_siril_script
-from astro_agent.tools.linear.t10_color_calibrate import (
-    _parse_plate_solve_result,
-    resolve_pixel_size,
-)
+from astro_agent.tools.linear.t10_color_calibrate import _parse_plate_solve_result
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -38,20 +36,25 @@ class PlateSolveInput(BaseModel):
     image_path: str = Field(
         description="Absolute path to the FITS image to plate solve."
     )
+    target_name: str | None = Field(
+        default=None,
+        description=(
+            "Astronomical target name resolved via SIMBAD to RA/DEC (e.g. 'M42'). "
+            "Used as position hint when approximate_coords is not provided. "
+            "Prefer calling T29 resolve_target first and passing approximate_coords explicitly."
+        ),
+    )
     approximate_coords: dict | None = Field(
         default=None,
         description=(
             "Hint coordinates for the image center: {'ra': float, 'dec': float} "
-            "in decimal degrees (J2000). Not required but significantly improves "
-            "success rate and speed. Obtain from acquisition metadata or target name lookup."
+            "in decimal degrees (J2000). Significantly improves success rate and "
+            "speed. Takes precedence over target_name."
         ),
     )
     focal_length_mm: float | None = Field(
         default=None,
-        description=(
-            "Imaging focal length in mm. Required for scale-constrained solving. "
-            "From acquisition_meta.focal_length_mm."
-        ),
+        description="Imaging focal length in mm. Overrides image/settings values.",
     )
     pixel_size_um: float | None = Field(
         default=None,
@@ -66,54 +69,158 @@ class PlateSolveInput(BaseModel):
     )
     force_resolve: bool = Field(
         default=False,
+        description="Force a new solve even if WCS already present in the FITS header.",
+    )
+    no_flip: bool = Field(
+        default=False,
         description=(
-            "Force plate solving even if WCS is already present in the FITS header. "
-            "Use when WCS data is suspected to be inaccurate."
+            "Do not auto-flip the image if detected as upside-down. "
+            "Use when you know the orientation is correct."
+        ),
+    )
+    downscale: bool = Field(
+        default=False,
+        description=(
+            "Downsample the image for faster star detection. "
+            "Use for large images (> 6000px wide) where solving is slow."
+        ),
+    )
+    sip_order: int | None = Field(
+        default=None,
+        description=(
+            "SIP distortion polynomial order (1–5). Higher orders model more "
+            "distortion but need more stars. Default from Siril preferences."
+        ),
+    )
+    search_radius: float | None = Field(
+        default=None,
+        description=(
+            "Cone search radius in degrees for near-search when initial solve fails. "
+            "0 disables near search. Default from Siril preferences."
+        ),
+    )
+    save_disto: str | None = Field(
+        default=None,
+        description="Save the plate solve solution as a distortion file at this path.",
+    )
+    limitmag: str | None = Field(
+        default=None,
+        description=(
+            "Override automatic star magnitude limit. "
+            "'+2': deeper (more stars). '-2': shallower (brighter only). "
+            "'12': absolute magnitude limit."
+        ),
+    )
+    catalog: str | None = Field(
+        default=None,
+        description=(
+            "Force a specific star catalog: 'tycho2', 'nomad', 'localgaia', "
+            "'gaia', 'ppmxl', 'brightstars', 'apass'. "
+            "Default: auto-selected based on FOV and magnitude."
+        ),
+    )
+    no_crop: bool = Field(
+        default=False,
+        description=(
+            "Disable center crop for wide-field images (FOV > 5°). "
+            "Without this, Siril crops to center for star detection."
         ),
     )
     use_local_astrometry_net: bool = Field(
         default=False,
         description=(
-            "Use local Astrometry.net installation for blind solving. "
-            "More powerful for fields with missing coordinate hints but requires "
-            "local index files installed."
+            "Use local Astrometry.net solve-field for solving. More powerful "
+            "for unknown fields but requires local index files installed."
+        ),
+    )
+    blind_pos: bool = Field(
+        default=False,
+        description=(
+            "Solve blindly for position (with -localasnet). "
+            "Use when image location is completely unknown."
+        ),
+    )
+    blind_res: bool = Field(
+        default=False,
+        description=(
+            "Solve blindly for resolution (with -localasnet). "
+            "Use when image sampling/scale is completely unknown."
+        ),
+    )
+    findstar: dict | None = Field(
+        default=None,
+        description=(
+            "setfindstar options to apply before platesolve. Accepts the same fields "
+            "as T04's findstar parameter: sigma, relax, radius, roundness, convergence, "
+            "profile, focal, pixelsize, reset. "
+            "Example: {'sigma': 0.5, 'relax': True}. "
+            "Use when platesolve reports 'not enough stars detected'."
         ),
     )
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Command builder ────────────────────────────────────────────────────────────
 
-def _build_cmd(
-    focal_length_mm: float | None,
-    pixel_size_um: float | None,
-    approximate_coords: dict | None,
-    force_resolve: bool,
-    use_local_astrometry_net: bool,
+def build_platesolve_cmd(
+    focal_length_mm: float | None = None,
+    pixel_size_um: float | None = None,
+    approximate_coords: dict | None = None,
+    force_resolve: bool = False,
+    no_flip: bool = False,
+    downscale: bool = False,
+    sip_order: int | None = None,
+    search_radius: float | None = None,
+    save_disto: str | None = None,
+    limitmag: str | None = None,
+    catalog: str | None = None,
+    no_crop: bool = False,
+    use_local_astrometry_net: bool = False,
+    blind_pos: bool = False,
+    blind_res: bool = False,
 ) -> str:
-    """Build the Siril platesolve command string."""
+    """Build the Siril platesolve command string with all available options."""
     parts = ["platesolve"]
 
-    # Positional coords come first (verified against Siril 1.4 docs)
+    if force_resolve:
+        parts.append("-force")
+
     if approximate_coords:
         ra = approximate_coords.get("ra")
         dec = approximate_coords.get("dec")
         if ra is not None and dec is not None:
             parts.append(f"{ra} {dec}")
 
-    if focal_length_mm is not None:
+    if focal_length_mm is not None and focal_length_mm > 0:
         parts.append(f"-focal={focal_length_mm}")
-    if pixel_size_um is not None:
+    if pixel_size_um is not None and pixel_size_um > 0:
         parts.append(f"-pixelsize={pixel_size_um}")
-    if force_resolve:
-        parts.append("-force")
+    if no_flip:
+        parts.append("-noflip")
+    if downscale:
+        parts.append("-downscale")
+    if sip_order is not None:
+        parts.append(f"-order={sip_order}")
+    if search_radius is not None:
+        parts.append(f"-radius={search_radius}")
+    if save_disto is not None:
+        parts.append(f"-disto={save_disto}")
+    if limitmag is not None:
+        parts.append(f"-limitmag={limitmag}")
+    if catalog is not None:
+        parts.append(f"-catalog={catalog}")
+    if no_crop:
+        parts.append("-nocrop")
     if use_local_astrometry_net:
         parts.append("-localasnet")
+        if blind_pos:
+            parts.append("-blindpos")
+        if blind_res:
+            parts.append("-blindres")
 
     return " ".join(parts)
 
 
 def _parse_field_of_view(stdout: str) -> dict | None:
-    """Parse field of view dimensions from Siril plate solve output."""
     m_w = re.search(r"field.*?width[^\d]*([\d.]+)\s*['\"]", stdout, re.IGNORECASE)
     m_h = re.search(r"field.*?height[^\d]*([\d.]+)\s*['\"]", stdout, re.IGNORECASE)
     if m_w and m_h:
@@ -125,7 +232,6 @@ def _parse_field_of_view(stdout: str) -> dict | None:
 
 
 def _parse_rotation(stdout: str) -> float | None:
-    """Parse image rotation from Siril plate solve output."""
     m = re.search(r"rotation[^\d\-]*([\-\d.]+)\s*deg", stdout, re.IGNORECASE)
     if m:
         return float(m.group(1))
@@ -138,54 +244,88 @@ def _parse_rotation(stdout: str) -> float | None:
 def plate_solve(
     working_dir: str,
     image_path: str,
+    target_name: str | None = None,
     approximate_coords: dict | None = None,
     focal_length_mm: float | None = None,
     pixel_size_um: float | None = None,
     camera_model: str | None = None,
     force_resolve: bool = False,
+    no_flip: bool = False,
+    downscale: bool = False,
+    sip_order: int | None = None,
+    search_radius: float | None = None,
+    save_disto: str | None = None,
+    limitmag: str | None = None,
+    catalog: str | None = None,
+    no_crop: bool = False,
     use_local_astrometry_net: bool = False,
+    blind_pos: bool = False,
+    blind_res: bool = False,
+    findstar: dict | None = None,
 ) -> dict:
     """
-    Astrometric plate solving — determines the celestial coordinates and
-    pixel scale (arcsec/pixel) of the image.
+    Astrometric plate solving — determines celestial coordinates and pixel
+    scale (arcsec/pixel) of the image.
 
     Called automatically by color_calibrate (T10) before PCC/SPCC. Call T21
     directly when WCS data is needed without color calibration — most commonly
-    to get pixel_scale_arcsec for deconvolution PSF sizing in T13.
+    for pixel_scale_arcsec for deconvolution PSF sizing in T13.
 
-    If approximate_coords are unknown, try use_local_astrometry_net=True for
-    blind solving (requires local index files). If solving fails, check that
-    focal_length_mm and pixel_size_um are correct — wrong scale is the most
-    common cause of failure.
-
-    Returns pixel_scale_arcsec in the output — this value is critical input
-    for T13 deconvolution (determines PSF star size in pixels).
+    Troubleshooting failed solves:
+      - Provide approximate_coords (even rough RA/DEC helps enormously)
+      - Verify focal_length_mm and pixel_size_um (wrong scale = #1 failure cause)
+      - Try downscale=True for large images (> 6000px)
+      - Try a different catalog (gaia, nomad, tycho2)
+      - Increase limitmag ('+2' or '+3') for sparse fields
+      - Try use_local_astrometry_net=True with blind_pos/blind_res for unknown fields
+      - Set search_radius to widen the cone search
     """
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    # Resolve pixel size
     resolved_px_um: float | None = None
     try:
-        resolved_px_um = resolve_pixel_size(pixel_size_um, camera_model)
+        resolved_px_um = resolve_pixel_size(pixel_size_um)
     except ValueError:
-        pass  # Proceed without pixel size if unavailable
+        pass
 
-    cmd = _build_cmd(
+    # Resolve position hint: explicit coords > target_name SIMBAD lookup
+    resolved_coords = approximate_coords
+    if resolved_coords is None and target_name:
+        resolved_coords = resolve_target_coords(target_name)
+
+    cmd = build_platesolve_cmd(
         focal_length_mm=focal_length_mm,
         pixel_size_um=resolved_px_um,
-        approximate_coords=approximate_coords,
+        approximate_coords=resolved_coords,
         force_resolve=force_resolve,
+        no_flip=no_flip,
+        downscale=downscale,
+        sip_order=sip_order,
+        search_radius=search_radius,
+        save_disto=save_disto,
+        limitmag=limitmag,
+        catalog=catalog,
+        no_crop=no_crop,
         use_local_astrometry_net=use_local_astrometry_net,
+        blind_pos=blind_pos,
+        blind_res=blind_res,
     )
 
-    try:
-        result = run_siril_script(
-            [f"load {img_path.stem}", cmd],
-            working_dir=working_dir,
-            timeout=120,
+    script: list[str] = [f"load {img_path.stem}"]
+    if findstar is not None:
+        from astro_agent.tools.preprocess.t04_register import (
+            SetFindStarOptions,
+            _build_setfindstar_cmd,
         )
+        fs_cmd = _build_setfindstar_cmd(SetFindStarOptions(**findstar))
+        if fs_cmd:
+            script.append(fs_cmd)
+    script.append(cmd)
+
+    try:
+        result = run_siril_script(script, working_dir=working_dir, timeout=120)
         wcs_info = _parse_plate_solve_result(result)
         fov = _parse_field_of_view(result.stdout)
         rotation = _parse_rotation(result.stdout)
@@ -213,8 +353,9 @@ def plate_solve(
                 "rotation_deg": None,
                 "error_msg": (
                     f"Plate solving failed. Suggestions: provide approximate_coords, "
-                    f"verify focal_length_mm and pixel_size_um, or try "
-                    f"use_local_astrometry_net=True. "
+                    f"verify focal_length_mm and pixel_size_um, try downscale=True, "
+                    f"try a different catalog, increase limitmag, or try "
+                    f"use_local_astrometry_net=True with blind_pos/blind_res. "
                     f"Siril: {exc.result.stderr[:300]}"
                 ),
             }

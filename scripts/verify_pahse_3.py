@@ -56,9 +56,9 @@ try:
     from astro_agent.tools.linear.t10_color_calibrate import (
         color_calibrate,
         ColorCalibrateInput,
-        CAMERA_PIXEL_SIZE_UM,
         resolve_pixel_size,
     )
+    from astro_agent.equipment import load_equipment
     ok("T10 color_calibrate imports")
 except Exception as e:
     fail(f"T10 import failed: {e}")
@@ -117,54 +117,38 @@ for name, fn in [
         fail(f"{name} decoration check failed: {e}")
 
 
-# ── 3. T10 pixel size lookup ───────────────────────────────────────────────────
+# ── 3. T10 pixel size — equipment.toml config ─────────────────────────────────
 
-print("\n── 3. T10 pixel size lookup ─────────────────────────────────────────────")
+print("\n── 3. T10 pixel size (equipment.toml) ───────────────────────────────────")
 
 try:
-    # X-T30 II must resolve to 3.77
-    px = resolve_pixel_size(None, "FUJIFILM X-T30 II")
-    if abs(px - 3.77) < 0.01:
-        ok(f"X-T30 II lookup = {px} µm (expected 3.77)")
+    equip = load_equipment()
+    camera = equip.get("camera", {})
+    px_config = camera.get("pixel_size_um")
+    if px_config is not None and px_config > 0:
+        ok(f"equipment.toml pixel_size_um = {px_config} µm (camera: {camera.get('model', '?')})")
     else:
-        fail(f"X-T30 II lookup = {px} µm (expected 3.77)")
+        fail("equipment.toml [camera] pixel_size_um is missing or zero")
 except Exception as e:
-    fail(f"X-T30 II lookup failed: {e}")
+    fail(f"equipment.toml load failed: {e}")
 
 try:
-    # Explicit argument takes priority
-    px = resolve_pixel_size(4.5, "FUJIFILM X-T30 II")
+    px = resolve_pixel_size(None)
+    if abs(px - 3.76) < 0.01:
+        ok(f"resolve_pixel_size(None) = {px} µm from equipment.toml")
+    else:
+        fail(f"resolve_pixel_size(None) = {px} µm, expected ~3.76 from config")
+except Exception as e:
+    fail(f"resolve_pixel_size(None) failed: {e}")
+
+try:
+    px = resolve_pixel_size(4.5)
     if px == 4.5:
-        ok("Explicit pixel_size_um overrides lookup table")
+        ok("Explicit pixel_size_um overrides equipment.toml")
     else:
         fail(f"Explicit override failed: got {px}, expected 4.5")
 except Exception as e:
     fail(f"Explicit override check failed: {e}")
-
-try:
-    # Env var priority (temporarily set)
-    os.environ["PIXEL_SIZE_UM"] = "5.1"
-    px = resolve_pixel_size(None, "FUJIFILM X-T30 II")
-    del os.environ["PIXEL_SIZE_UM"]
-    if abs(px - 5.1) < 0.001:
-        ok("PIXEL_SIZE_UM env var takes priority over lookup table")
-    else:
-        fail(f"Env var priority failed: got {px}, expected 5.1")
-except Exception as e:
-    if "PIXEL_SIZE_UM" in os.environ:
-        del os.environ["PIXEL_SIZE_UM"]
-    fail(f"Env var priority check failed: {e}")
-
-try:
-    # Unknown camera should raise ValueError
-    resolve_pixel_size(None, "Unknown Camera XYZ")
-    fail("resolve_pixel_size should raise ValueError for unknown camera")
-except ValueError as e:
-    ok(f"Unknown camera raises ValueError: {str(e)[:60]}…")
-except Exception as e:
-    fail(f"Unexpected error for unknown camera: {e}")
-
-ok(f"Camera lookup table has {len(CAMERA_PIXEL_SIZE_UM)} entries")
 
 
 # ── 4. GraXpert model cache check ─────────────────────────────────────────────

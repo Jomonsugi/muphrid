@@ -70,6 +70,13 @@ class GHTSatOptions(BaseModel):
             "Lower SP for images with mostly unsaturated colors."
         ),
     )
+    clip_mode: str = Field(
+        default="rgbblend",
+        description=(
+            "How out-of-range values are handled. "
+            "'clip', 'rescale', 'rgbblend' (default), 'globalrescale'."
+        ),
+    )
 
 
 class SaturationAdjustInput(BaseModel):
@@ -175,6 +182,8 @@ def saturation_adjust(
             cmd += f" -B={opts.local_intensity}"
         if opts.symmetry_point != 0.5:
             cmd += f" -SP={opts.symmetry_point}"
+        if opts.clip_mode != "rgbblend":
+            cmd += f" -clipmode={opts.clip_mode}"
     elif method == "hue_targeted" and hue_target is not None:
         cmd = f"satu {amount} {background_factor} {hue_target}"
     else:

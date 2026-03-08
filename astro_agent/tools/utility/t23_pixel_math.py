@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import numpy as np
 from astropy.io import fits
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -135,12 +136,15 @@ def _validate_and_broadcast(expression: str, working_dir: str) -> tuple[list[str
         for mono_stem in mono_stems:
             rgb_stem = f"{mono_stem}_rgb3"
             if _find_fits(wd, rgb_stem) is None:
-                run_siril_script(
-                    [f"load {mono_stem}",
-                     f"rgbcomp {mono_stem} {mono_stem} {mono_stem} -out={rgb_stem}"],
-                    working_dir=working_dir,
-                    timeout=60,
-                )
+                # Broadcast mono→RGB in Python to guarantee pixel-exact dimensions.
+                # Siril's rgbcomp can lose 1 pixel due to internal crop/pad behavior.
+                mono_path = _find_fits(wd, mono_stem)
+                with fits.open(str(mono_path)) as hdul:
+                    mono_data = hdul[0].data.astype(np.float32)
+                mono_2d = mono_data.squeeze()
+                rgb_data = np.stack([mono_2d, mono_2d, mono_2d], axis=0)
+                hdu = fits.PrimaryHDU(data=rgb_data)
+                hdu.writeto(str(wd / f"{rgb_stem}.fits"), overwrite=True)
             expression = expression.replace(f"${mono_stem}$", f"${rgb_stem}$")
 
     return list(set(re.findall(r"\$([^$]+)\$", expression))), expression, auto_broadcast

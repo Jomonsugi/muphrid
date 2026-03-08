@@ -1,37 +1,34 @@
 """
 T06 — select_frames
 
-Accept or reject frames based on per-frame quality metrics from T05.
+Accept or reject frames based on per-frame registration metrics from T05.
 
-## Two selection paths
+Sigma-clipping on FWHM, wFWHM, roundness, star count, background, and quality.
+Each criterion can be independently tuned — the agent should adjust thresholds
+based on T05 summary statistics and the specific dataset.
 
-### Star-metrics path (has_star_metrics=True, default)
-Sigma-clipping on FWHM, roundness, star count, and background level.
-Use when T05 detected stars and populated R-lines (normal long-exposure subs).
+This mirrors how a human uses Siril's Plot tab and stacking UI: examine the
+per-frame data, decide which metrics to filter on, and choose how aggressively
+to cut.  The agent has the same levers:
 
-### Laplacian-percentile path (has_star_metrics=False)
-Used when Siril could not detect stars — typical for sub-second exposures,
-sparse star fields, or short DSO subs. Instead of hard thresholds, frames
-are ranked by Laplacian sharpness (blur/trailing proxy) and the bottom
-(1 - keep_percentile) fraction is dropped. Default keeps the best 85%.
+  - max_fwhm_sigma / max_wfwhm_sigma: tighten for consistent seeing, loosen
+    for variable conditions or small datasets
+  - min_roundness: tighten to reject tracking errors
+  - min_star_count: reject frames where detection failed or clouds intervened
+  - max_background_sigma: reject frames with anomalous sky brightness
+  - min_quality: Siril's composite quality metric (0-1), higher is better
 
-This matches the PixInsight SubframeSelector philosophy: rank frames by a
-quality metric, keep a percentage, let stacking rejection handle residual
-outliers. It is deliberately conservative — keeping more rather than fewer
-is safer than aggressive pre-stack rejection on short exposures.
-
-Safety constraint: never returns an empty accepted_frames list.
+Safety: never returns an empty accepted_frames list.
+HITL: triggers when >50% of frames are rejected — a human would want to
+review the data and thresholds before proceeding.
 """
 
 from __future__ import annotations
 
-import math
 import statistics
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
-
-from astro_agent.graph.state import FrameMetrics
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -40,41 +37,49 @@ class SelectionCriteria(BaseModel):
     max_fwhm_sigma: float = Field(
         default=2.0,
         description=(
-            "Reject frames with FWHM > median + max_fwhm_sigma * std_fwhm. "
+            "Reject frames with FWHM > median + max_fwhm_sigma × std. "
             "Use 3.0 for small datasets (< 15 subs) to preserve integration time. "
-            "Only used in the star-metrics path (has_star_metrics=True)."
+            "Use 1.5 for excellent seeing when you want only the sharpest frames."
+        ),
+    )
+    max_wfwhm_sigma: float | None = Field(
+        default=None,
+        description=(
+            "Reject frames with weighted FWHM > median + max_wfwhm_sigma × std. "
+            "wFWHM accounts for star brightness — often a better quality indicator "
+            "than raw FWHM.  None = no wFWHM filtering (default)."
         ),
     )
     min_roundness: float = Field(
         default=0.5,
         description=(
-            "Reject frames with roundness below this threshold (0–1). "
-            "Low roundness indicates tracking errors or elongated stars. "
-            "Only used in the star-metrics path."
+            "Reject frames with roundness below this (0–1). "
+            "1.0 = perfect circles. Below 0.6 indicates significant elongation. "
+            "Tighten to 0.7 for quality-focused selection."
         ),
     )
     min_star_count: int = Field(
         default=30,
         description=(
-            "Reject frames with fewer detected stars than this minimum. "
-            "Only used in the star-metrics path."
+            "Reject frames with fewer detected stars. Low star count indicates "
+            "clouds, fog, or detection failure.  Adjust based on T05 "
+            "summary.median_star_count — set to ~50% of median for safety."
         ),
     )
     max_background_sigma: float = Field(
         default=3.0,
         description=(
-            "Reject frames with background level > median + max_background_sigma * std. "
-            "Catches frames with passing clouds or moon interference. "
-            "Only used in the star-metrics path."
+            "Reject frames with background > median + max_background_sigma × std. "
+            "Catches frames affected by passing clouds, moon, or light pollution spikes."
         ),
     )
-    keep_percentile: float = Field(
-        default=0.85,
+    min_quality: float | None = Field(
+        default=None,
         description=(
-            "Fraction of frames to keep when using the Laplacian-percentile path "
-            "(has_star_metrics=False). 0.85 = keep the best 85% by sharpness. "
-            "Range: 0.5–1.0. Lower values are more aggressive; default is conservative "
-            "to preserve integration time on short subs."
+            "Reject frames with Siril quality score below this threshold (0–1). "
+            "Quality is Siril's composite metric combining FWHM, roundness, and "
+            "star count.  None = no quality filtering (default).  Set to ~50% "
+            "of T05 summary.median_quality for moderate filtering."
         ),
     )
 
@@ -83,28 +88,21 @@ class SelectFramesInput(BaseModel):
     frame_metrics: dict = Field(
         description=(
             "Per-frame quality metrics dict from analyze_frames (T05). "
-            "Keys are frame indices (strings); values have fwhm, roundness, "
-            "number_of_stars, background_lvl, sigma, bgnoise, and "
-            "laplacian_sharpness fields."
+            "Keys are frame indices (strings); values contain fwhm, "
+            "weighted_fwhm, roundness, quality, number_of_stars, "
+            "background_lvl, and pixel stats."
         )
     )
     criteria: SelectionCriteria = Field(
         default_factory=SelectionCriteria,
         description="Rejection thresholds. Defaults are appropriate for most datasets.",
     )
-    has_star_metrics: bool = Field(
-        default=True,
-        description=(
-            "Pass summary.has_star_metrics from T05. "
-            "True → standard FWHM/roundness/star_count sigma-clipping. "
-            "False → Laplacian-percentile path (for short exposures, sparse fields)."
-        ),
-    )
 
 
-# ── Star-metrics path ──────────────────────────────────────────────────────────
+# ── Selection logic ───────────────────────────────────────────────────────────
 
 def _sigma_threshold(values: list[float], sigma_mult: float) -> float:
+    """Compute median + sigma_mult × stdev threshold."""
     if len(values) < 2:
         return float("inf")
     med = statistics.median(values)
@@ -112,30 +110,39 @@ def _sigma_threshold(values: list[float], sigma_mult: float) -> float:
     return med + sigma_mult * std
 
 
-def _select_by_star_metrics(
+def _select_frames(
     frame_metrics: dict[str, dict],
     criteria: SelectionCriteria,
 ) -> tuple[list[str], list[str], dict[str, str]]:
     """
-    Standard sigma-clipping path. Requires FWHM, roundness, star_count.
+    Sigma-clipping selection on registration metrics.
     Returns (accepted, rejected_list, rejection_reasons).
     Safety: if all frames would be rejected, returns all as accepted.
     """
     rejected: dict[str, str] = {}
 
-    fwhms = [v["fwhm"] for v in frame_metrics.values() if v.get("fwhm") is not None]
-    bgs   = [v["background_lvl"] for v in frame_metrics.values()
-             if v.get("background_lvl") is not None]
+    fwhms = [v["fwhm"] for v in frame_metrics.values() if v.get("fwhm") is not None and v["fwhm"] > 0]
+    bgs   = [v["background_lvl"] for v in frame_metrics.values() if v.get("background_lvl") is not None]
 
     fwhm_threshold = _sigma_threshold(fwhms, criteria.max_fwhm_sigma)
-    bg_threshold   = _sigma_threshold(bgs,   criteria.max_background_sigma)
+    bg_threshold   = _sigma_threshold(bgs, criteria.max_background_sigma)
 
-    for filename, metrics in frame_metrics.items():
+    wfwhm_threshold = float("inf")
+    if criteria.max_wfwhm_sigma is not None:
+        wfwhms = [v["weighted_fwhm"] for v in frame_metrics.values()
+                  if v.get("weighted_fwhm") is not None and v["weighted_fwhm"] > 0]
+        wfwhm_threshold = _sigma_threshold(wfwhms, criteria.max_wfwhm_sigma)
+
+    for frame_key, metrics in frame_metrics.items():
         reasons: list[str] = []
 
         fwhm = metrics.get("fwhm")
         if fwhm is not None and fwhm > fwhm_threshold:
             reasons.append(f"FWHM {fwhm:.3f} > threshold {fwhm_threshold:.3f}")
+
+        wfwhm = metrics.get("weighted_fwhm")
+        if criteria.max_wfwhm_sigma is not None and wfwhm is not None and wfwhm > wfwhm_threshold:
+            reasons.append(f"wFWHM {wfwhm:.3f} > threshold {wfwhm_threshold:.3f}")
 
         roundness = metrics.get("roundness")
         if roundness is not None and roundness < criteria.min_roundness:
@@ -147,10 +154,14 @@ def _select_by_star_metrics(
 
         bg = metrics.get("background_lvl")
         if bg is not None and bg > bg_threshold:
-            reasons.append(f"background {bg:.4f} > threshold {bg_threshold:.4f}")
+            reasons.append(f"background {bg:.6f} > threshold {bg_threshold:.6f}")
+
+        quality = metrics.get("quality")
+        if criteria.min_quality is not None and quality is not None and quality < criteria.min_quality:
+            reasons.append(f"quality {quality:.6f} < min {criteria.min_quality}")
 
         if reasons:
-            rejected[filename] = "; ".join(reasons)
+            rejected[frame_key] = "; ".join(reasons)
 
     accepted = [f for f in frame_metrics if f not in rejected]
 
@@ -161,88 +172,31 @@ def _select_by_star_metrics(
     return accepted, list(rejected.keys()), rejected
 
 
-# ── Laplacian-percentile path ──────────────────────────────────────────────────
-
-def _select_by_ranking(
-    frame_metrics: dict[str, dict],
-    keep_percentile: float,
-) -> tuple[list[str], list[str], dict[str, str]]:
-    """
-    Percentile-based selection using Laplacian sharpness as quality metric.
-
-    Ranks all frames with available sharpness data from best (highest
-    Laplacian variance) to worst. Drops the bottom (1 - keep_percentile)
-    fraction. Frames without sharpness data are always kept — we can't
-    evaluate what we can't measure.
-
-    Returns (accepted, rejected_list, rejection_reasons).
-    Safety: if all frames would be rejected, returns all as accepted.
-    """
-    # Partition: frames with and without sharpness data
-    with_sharpness = [
-        (k, v["laplacian_sharpness"])
-        for k, v in frame_metrics.items()
-        if v.get("laplacian_sharpness") is not None
-    ]
-    without_sharpness = [
-        k for k, v in frame_metrics.items()
-        if v.get("laplacian_sharpness") is None
-    ]
-
-    # Sort by sharpness descending (best = highest Laplacian variance)
-    with_sharpness.sort(key=lambda x: x[1], reverse=True)
-
-    n_with = len(with_sharpness)
-    n_keep = max(1, math.ceil(n_with * keep_percentile))
-
-    accepted_ranked = [k for k, _ in with_sharpness[:n_keep]]
-    rejected_ranked = [k for k, _ in with_sharpness[n_keep:]]
-
-    # Frames without sharpness data are always accepted (can't evaluate)
-    accepted = accepted_ranked + without_sharpness
-    rejected_reasons: dict[str, str] = {
-        k: (
-            f"Laplacian sharpness in bottom {(1 - keep_percentile):.0%} of batch "
-            f"(sharpness={v:.1f})"
-        )
-        for k, v in with_sharpness[n_keep:]
-    }
-
-    if not accepted:
-        accepted = list(frame_metrics.keys())
-        rejected_ranked = []
-        rejected_reasons = {}
-
-    return accepted, rejected_ranked, rejected_reasons
-
-
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
 @tool(args_schema=SelectFramesInput)
 def select_frames(
     frame_metrics: dict,
     criteria: dict | None = None,
-    has_star_metrics: bool = True,
 ) -> dict:
     """
-    Accept or reject frames based on per-frame quality metrics from T05.
+    Accept or reject frames based on per-frame registration metrics from T05.
 
-    Pass summary.has_star_metrics from T05 to select the right strategy:
+    Sigma-clipping on FWHM, wFWHM, roundness, star count, background, and
+    quality.  Each threshold is independently tunable.
 
-    has_star_metrics=True (default):
-      Sigma-clipping on FWHM, roundness, star count, background.
-      Standard path for normal long-exposure subs.
+    Recommended workflow:
+      1. Run T05 to get summary statistics
+      2. Review summary — median_fwhm, tracking_quality, sky_consistency
+      3. Set criteria based on the data:
+         - Small dataset (< 15 subs): max_fwhm_sigma=3.0 (preserve integration)
+         - Variable seeing (seeing_stability > 0.3): max_fwhm_sigma=1.5 (be selective)
+         - Tracking issues (tracking_quality < 0.7): raise min_roundness to 0.6
+         - Dense field: lower min_star_count based on median_star_count
+      4. If >50% rejected, review data before proceeding (HITL triggered)
 
-    has_star_metrics=False:
-      Percentile ranking on Laplacian sharpness. Keeps the best 85% of frames
-      (configurable via criteria.keep_percentile). Use for sub-second exposures
-      or any dataset where Siril couldn't detect stars per-frame.
-      Conservative by default — stacking with sigma-clipping (T07) handles
-      residual outliers.
-
-    Never returns an empty accepted_frames list.
-    For small datasets (< 15 subs), set criteria.max_fwhm_sigma=3.0 to
-    preserve integration time.
+    Never returns an empty accepted_frames list — if all frames fail every
+    criterion, all are returned with a warning.
     """
     if not frame_metrics:
         raise ValueError(
@@ -255,25 +209,34 @@ def select_frames(
     else:
         parsed_criteria = SelectionCriteria(**(criteria or {}))
 
-    if has_star_metrics:
-        accepted, rejected_list, rejection_reasons = _select_by_star_metrics(
-            frame_metrics, parsed_criteria
-        )
-        selection_path = "star_metrics"
-    else:
-        accepted, rejected_list, rejection_reasons = _select_by_ranking(
-            frame_metrics, parsed_criteria.keep_percentile
-        )
-        selection_path = f"laplacian_percentile_{parsed_criteria.keep_percentile:.0%}"
+    accepted, rejected_list, rejection_reasons = _select_frames(
+        frame_metrics, parsed_criteria
+    )
 
     n_total = len(frame_metrics)
     acceptance_rate = len(accepted) / n_total if n_total > 0 else 1.0
 
     warnings: list[str] = []
+    hitl_required = False
+    hitl_context = ""
+
     if acceptance_rate < 0.5:
+        hitl_required = True
+        hitl_context = (
+            f"Frame selection rejected {len(rejected_list)}/{n_total} frames "
+            f"({1 - acceptance_rate:.0%}).  More than half the data is being discarded. "
+            f"Review the rejection reasons and consider loosening thresholds, or "
+            f"inspect the worst frames for systematic issues (tracking, clouds, focus)."
+        )
         warnings.append(
             f"Acceptance rate is {acceptance_rate:.0%} ({len(accepted)}/{n_total} frames). "
-            "Consider loosening thresholds or increasing keep_percentile."
+            "More than 50% rejected — HITL triggered."
+        )
+
+    if len(accepted) < 3 and n_total >= 3:
+        warnings.append(
+            f"Only {len(accepted)} frames accepted from {n_total}. "
+            "Stacking quality will be limited. Consider loosening criteria."
         )
 
     return {
@@ -281,6 +244,7 @@ def select_frames(
         "rejected_frames":   rejected_list,
         "rejection_reasons": rejection_reasons,
         "acceptance_rate":   round(acceptance_rate, 4),
-        "selection_path":    selection_path,
+        "hitl_required":     hitl_required,
+        "hitl_context":      hitl_context,
         "warnings":          warnings,
     }
