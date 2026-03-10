@@ -135,14 +135,92 @@ def _check_siril(siril_bin: str) -> None:
         )
 
 
+def configure_siril_for_equipment() -> str:
+    """
+    Write Siril demosaic preferences derived from equipment.toml.
+
+    Siril has no per-command flag for Markesteijn pass count — it is a global
+    preference in ~/.config/siril/siril.cfg. This function sets it correctly
+    for the declared sensor type so the agent never needs to reason about it:
+
+      xtrans → xtrans_passes=3  (Markesteijn 3-pass, best quality)
+      bayer  → xtrans_passes=1  (Markesteijn not used for Bayer; reset to default)
+      mono   → xtrans_passes=1  (no CFA demosaic needed)
+
+    Returns the sensor_type string for logging.
+    Raises ConfigError if equipment.toml is missing or sensor_type is unrecognised.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore[no-reuse-def]
+
+    equipment_path = Path(__file__).resolve().parent.parent / "equipment.toml"
+    if not equipment_path.exists():
+        raise ConfigError(
+            f"equipment.toml not found at {equipment_path}. "
+            "Create it from the project root template."
+        )
+
+    with open(equipment_path, "rb") as f:
+        equipment = tomllib.load(f)
+
+    sensor_type = equipment.get("camera", {}).get("sensor_type", "").lower()
+    if sensor_type not in ("xtrans", "bayer", "mono"):
+        raise ConfigError(
+            f"equipment.toml camera.sensor_type={sensor_type!r} is not recognised. "
+            "Valid values: 'xtrans' | 'bayer' | 'mono'."
+        )
+
+    xtrans_passes = 3 if sensor_type == "xtrans" else 1
+
+    cfg_dir = Path.home() / ".config" / "siril"
+    cfg_file = cfg_dir / "siril.cfg"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+
+    # Parse existing config preserving all other settings, update xtrans_passes
+    lines: list[str] = cfg_file.read_text().splitlines() if cfg_file.exists() else []
+    in_core = False
+    found_core = False
+    found_key = False
+    out: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "[core]":
+            in_core = True
+            found_core = True
+            out.append(line)
+        elif stripped.startswith("[") and in_core:
+            if not found_key:
+                out.append(f"xtrans_passes={xtrans_passes}")
+                found_key = True
+            in_core = False
+            out.append(line)
+        elif in_core and stripped.startswith("xtrans_passes"):
+            out.append(f"xtrans_passes={xtrans_passes}")
+            found_key = True
+        else:
+            out.append(line)
+
+    if not found_core:
+        out.append("[core]")
+    if not found_key:
+        out.append(f"xtrans_passes={xtrans_passes}")
+
+    cfg_file.write_text("\n".join(out) + "\n")
+    return sensor_type
+
+
 def _check_graxpert(graxpert_bin: str) -> None:
-    if not shutil.which(graxpert_bin):
+    if not shutil.which(graxpert_bin) and not Path(graxpert_bin).exists():
         raise DependencyError(
             f"GraXpert binary not found at '{graxpert_bin}'. "
             "Install GraXpert ≥ 3.0 and ensure the binary is on your PATH, "
             "or set GRAXPERT_BIN in .env. "
             "Download: https://github.com/Steffenhir/GraXpert/releases"
         )
+
 
 
 def _check_starnet(starnet_bin: str, starnet_weights: str) -> None:
@@ -245,6 +323,7 @@ def check_dependencies(settings: Settings | None = None) -> None:
     _check_starnet(settings.starnet_bin, settings.starnet_weights)
     _check_exiftool()
     _check_python_libs()
+    configure_siril_for_equipment()
 
 
 # ── LLM factory (used by graph/planner.py in Phase 7) ─────────────────────────

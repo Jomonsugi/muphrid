@@ -1,18 +1,20 @@
 """
-T08 — auto_crop
+T08 — crop
 
-Remove black border artifacts introduced by registration (edge regions where
-not all input frames overlap after alignment and resampling).
+Two modes:
 
-Strategy:
-    1. Load the stacked FITS with astropy.
-    2. Compute a per-pixel signal mask: pixel is "good" if max across channels > threshold.
-    3. Find the bounding box of the good region using numpy.
-    4. Apply a 5-pixel safety inset on all sides.
-    5. Issue Siril `crop <x> <y> <w> <h>` to perform the actual crop.
+  auto (default): detects the non-black signal bounding box in Python, applies
+      a 5-pixel safety inset, then issues Siril crop. Run after siril_stack to
+      remove registration edge artifacts. If pixels_removed_pct > 15, registration
+      had poor frame overlap — note in the processing report.
 
-Always run after siril_stack. If pixels_removed_pct > 15, registration had
-poor frame overlap — note in the processing report.
+  manual: crops to explicit (x, y, w, h) pixel coordinates provided by the user.
+      Use for compositional reframing or removing a known noisy edge. This mode
+      is a HITL operation — the agent must present the image to the user and
+      obtain coordinates before calling. Coordinates follow Siril convention:
+      x/y = top-left corner in pixels, w/h = width/height in pixels.
+
+Siril command: crop <x> <y> <w> <h>
 """
 
 from __future__ import annotations
@@ -35,16 +37,45 @@ class AutoCropInput(BaseModel):
     )
     image_path: str = Field(
         description=(
-            "Absolute path to the stacked master light FITS to crop. "
-            "Typically master_light.fit from siril_stack (T07)."
+            "Absolute path to the stacked FITS to crop. "
+            "Typically master_light.fit from siril_stack (T07), or any intermediate "
+            "FITS at any pipeline stage."
         )
+    )
+    mode: str = Field(
+        default="auto",
+        description=(
+            "auto: detect and remove black registration borders automatically. "
+            "Run after siril_stack; no user input needed.\n"
+            "manual: crop to explicit coordinates provided by the user. "
+            "HITL required — present the image to the user and obtain (x, y, w, h) "
+            "before calling. Never call manual mode without prior user confirmation "
+            "of the crop region."
+        ),
     )
     threshold: float = Field(
         default=0.01,
         description=(
             "Pixel value threshold (0–1 normalized) below which a pixel is "
-            "considered a black border artifact. 0.01 works for most stacks."
+            "considered a black border artifact. Only used in auto mode. "
+            "0.01 works for most stacks."
         ),
+    )
+    x: int | None = Field(
+        default=None,
+        description="Manual mode only. Left edge of the crop rectangle in pixels.",
+    )
+    y: int | None = Field(
+        default=None,
+        description="Manual mode only. Top edge of the crop rectangle in pixels.",
+    )
+    w: int | None = Field(
+        default=None,
+        description="Manual mode only. Width of the crop rectangle in pixels.",
+    )
+    h: int | None = Field(
+        default=None,
+        description="Manual mode only. Height of the crop rectangle in pixels.",
     )
 
 
@@ -111,21 +142,39 @@ def _find_crop_bounds(image_path: Path, threshold: float) -> tuple[int, int, int
 def auto_crop(
     working_dir: str,
     image_path: str,
+    mode: str = "auto",
     threshold: float = 0.01,
+    x: int | None = None,
+    y: int | None = None,
+    w: int | None = None,
+    h: int | None = None,
 ) -> dict:
     """
-    Remove black border registration artifacts from the stacked master light.
-    Detects the non-black bounding box in Python, then uses Siril crop command.
+    Crop a FITS image, either automatically (border removal) or manually
+    (user-specified coordinates).
 
-    Always run after siril_stack. If pixels_removed_pct > 15, check
-    registration quality — poor overlap indicates frames may need to be
-    re-registered with looser framing settings.
+    Auto mode: run after siril_stack to remove black registration borders.
+    If pixels_removed_pct > 15, check registration quality — poor overlap
+    indicates frames may need to be re-registered with looser framing settings.
+
+    Manual mode: executes a crop the user has already decided on. HITL is
+    required before calling this mode — present the image, get coordinates
+    from the user, then call with mode='manual' and the confirmed x/y/w/h.
+    Do not infer or guess crop coordinates autonomously.
     """
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    x, y, w, h = _find_crop_bounds(img_path, threshold)
+    if mode == "manual":
+        if any(v is None for v in (x, y, w, h)):
+            raise ValueError(
+                "manual mode requires all of: x, y, w, h. "
+                "Obtain these from the user before calling."
+            )
+        crop_x, crop_y, crop_w, crop_h = x, y, w, h  # type: ignore[assignment]
+    else:
+        crop_x, crop_y, crop_w, crop_h = _find_crop_bounds(img_path, threshold)
 
     with fits.open(str(img_path)) as hdul:
         data = hdul[0].data
@@ -135,14 +184,13 @@ def auto_crop(
             full_h, full_w = data.shape[0], data.shape[1]
 
     original_pixels = full_h * full_w
-    cropped_pixels  = w * h
+    cropped_pixels  = crop_w * crop_h
     removed_pct     = round((1.0 - cropped_pixels / original_pixels) * 100, 2)
 
-    # Load the image in Siril and apply crop
-    image_name = img_path.stem   # e.g. "master_light"
+    image_name = img_path.stem
     commands = [
         f"load {image_name}",
-        f"crop {x} {y} {w} {h}",
+        f"crop {crop_x} {crop_y} {crop_w} {crop_h}",
         f"save {image_name}_crop",
     ]
 
@@ -154,11 +202,12 @@ def auto_crop(
     if not cropped_path.exists():
         raise FileNotFoundError(
             f"Cropped image not found at {cropped_path}. "
-            f"Siril crop geometry was: x={x} y={y} w={w} h={h}"
+            f"Siril crop geometry was: x={crop_x} y={crop_y} w={crop_w} h={crop_h}"
         )
 
     return {
         "cropped_image_path": str(cropped_path),
-        "crop_geometry": {"x": x, "y": y, "w": w, "h": h},
+        "mode": mode,
+        "crop_geometry": {"x": crop_x, "y": crop_y, "w": crop_w, "h": crop_h},
         "pixels_removed_pct": removed_pct,
     }

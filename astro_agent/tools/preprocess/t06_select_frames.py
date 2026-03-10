@@ -59,11 +59,13 @@ class SelectionCriteria(BaseModel):
         ),
     )
     min_star_count: int = Field(
-        default=30,
         description=(
-            "Reject frames with fewer detected stars. Low star count indicates "
-            "clouds, fog, or detection failure.  Adjust based on T05 "
-            "summary.median_star_count — set to ~50% of median for safety."
+            "Reject frames with fewer detected stars than this threshold. "
+            "Low star count indicates clouds, fog, or detection failure. "
+            "Must be derived from T05 summary.median_star_count — "
+            "set to ~50% of median for a balanced filter that catches "
+            "problem frames without discarding variable-but-valid ones. "
+            "Example: median_star_count=402 → min_star_count=200."
         ),
     )
     max_background_sigma: float = Field(
@@ -94,8 +96,11 @@ class SelectFramesInput(BaseModel):
         )
     )
     criteria: SelectionCriteria = Field(
-        default_factory=SelectionCriteria,
-        description="Rejection thresholds. Defaults are appropriate for most datasets.",
+        description=(
+            "Rejection thresholds. All sigma-based thresholds adapt to the dataset "
+            "distribution, but min_star_count must be set explicitly from T05 "
+            "summary.median_star_count (~50% of median is a safe starting point)."
+        ),
     )
 
 

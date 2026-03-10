@@ -87,15 +87,17 @@ class WaveletOptions(BaseModel):
         ),
     )
     layer_weights: list[float] = Field(
-        default=[1.2, 1.1, 1.0, 1.0, 1.0, 1.0],
+        default=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         description=(
             "Reconstruction weights for each layer (num_layers + 1 values). "
             "Layers ordered finest to coarsest: [layer1, layer2, ..., residual]. "
-            "Weight > 1.0 = sharpen (boost that frequency). "
-            "Weight = 1.0 = passthrough (no change). "
-            "Weight < 1.0 = suppress (reduce that frequency). "
-            "Example: [1.3, 1.1, 1.0, 1.0, 1.0, 1.0] sharpens finest two layers "
-            "while leaving coarse structure and residual untouched."
+            "Default is all 1.0 (passthrough — no change). Set weights > 1.0 to "
+            "sharpen, < 1.0 to suppress. Must be chosen based on target type:\n"
+            "  Nebulae with fine filaments: [1.3, 1.1, 1.0, 1.0, 1.0, 1.0]\n"
+            "  Galaxy spiral arms (mid-scale): [1.0, 1.2, 1.1, 1.0, 1.0, 1.0]\n"
+            "  Star fields / globular clusters: keep all 1.0 — wavelet sharpening "
+            "emphasizes star halos on star-dominated images. Use unsharp or clahe instead.\n"
+            "Start conservative (1.1–1.2) on fine layers only and iterate."
         ),
     )
 
@@ -211,13 +213,14 @@ def local_contrast_enhance(
     halos around bright stars from CLAHE and ringing from wavelet sharpening.
 
     Method guidance:
-    - wavelet: surgical control per spatial scale. Use layer_weights > 1.0 only
-      on fine layers (1–2); leave coarse layers (3+) at 1.0 to avoid global
-      brightness shift. Start conservative (1.1–1.3) and iterate.
+    - wavelet: surgical control per spatial scale. Default layer_weights are all
+      1.0 (passthrough — no effect). Set weights > 1.0 on fine layers to sharpen.
+      Do NOT use on star fields or globular clusters — wavelet sharpening enhances
+      star halos. Use unsharp or clahe for those targets instead.
     - clahe: effective for revealing faint nebula structure but noisy. Always
       apply after noise reduction (T12). Use clip_limit 1.5–2.0.
-    - unsharp: simplest and gentlest. Good for mild enhancement before more
-      aggressive wavelet processing.
+    - unsharp: simplest and gentlest. Good for star fields, mild enhancement,
+      or as a first pass before more aggressive wavelet processing.
 
     Run analyze_image before and after to confirm the detail improvement
     without significant noise amplification.

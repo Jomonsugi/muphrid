@@ -74,17 +74,19 @@ class SirilStackInput(BaseModel):
 
     # ── Rejection (only for mean/rej stacking) ────────────────────────────
     rejection_method: str = Field(
-        default="sigma_clipping",
         description=(
             "Pixel rejection algorithm (only for stack_method='mean'). "
-            "'sigma_clipping' (default — standard sigma clip), "
-            "'winsorized' (better for < 15 frames — replaces outliers instead of removing), "
-            "'percentile' (fixed percentile rejection), "
-            "'median' (median-based rejection), "
-            "'linear_fit' (rejects based on linear fit residuals), "
-            "'generalized' (Generalized ESD test — robust for mixed populations), "
-            "'mad' (k-MAD clipping — robust to asymmetric distributions), "
-            "'none' (no rejection)."
+            "Must be chosen based on accepted frame count from T06:\n"
+            "  'winsorized': < 15 frames — replaces outliers without removing them, "
+            "statistically valid for small N.\n"
+            "  'sigma_clipping': 15–50 frames — standard sigma clip, "
+            "requires sufficient N to estimate distribution.\n"
+            "  'linear_fit': > 50 frames — most accurate for large datasets.\n"
+            "  'generalized': mixed populations (e.g. dithered mosaic frames).\n"
+            "  'mad': asymmetric noise distributions.\n"
+            "  'percentile': fixed percentile bounds regardless of distribution.\n"
+            "  'none': no rejection (use only when frame count is too low for any "
+            "statistical rejection, e.g. < 5 frames)."
         ),
     )
     rejection_sigma: list[float] = Field(
@@ -305,8 +307,8 @@ def siril_stack(
     working_dir: str,
     registered_sequence: str,
     accepted_frames: list[str],
+    rejection_method: str,
     stack_method: str = "mean",
-    rejection_method: str = "sigma_clipping",
     rejection_sigma: list[float] | None = None,
     normalization: str = "addscale",
     fast_norm: bool = False,

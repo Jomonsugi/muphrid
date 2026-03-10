@@ -50,7 +50,7 @@ print("\nPhase 2 \u2014 Tool imports")
 tools_to_check = [
     ("T01 ingest_dataset",     "astro_agent.tools.preprocess.t01_ingest",        "ingest_dataset"),
     ("T02 build_masters",      "astro_agent.tools.preprocess.t02_masters",       "build_masters"),
-    ("T03 siril_calibrate",    "astro_agent.tools.preprocess.t03_calibrate",     "siril_calibrate"),
+    ("T03 calibrate",          "astro_agent.tools.preprocess.t03_calibrate",     "calibrate"),
     ("T04 siril_register",     "astro_agent.tools.preprocess.t04_register",      "siril_register"),
     ("T05 analyze_frames",     "astro_agent.tools.preprocess.t05_analyze_frames","analyze_frames"),
     ("T06 select_frames",      "astro_agent.tools.preprocess.t06_select_frames", "select_frames"),
@@ -155,7 +155,10 @@ try:
         "quality": 0.5, "number_of_stars": 5, "background_lvl": 0.05, "bgnoise": 0.002,
     }
 
-    result = select_frames.invoke({"frame_metrics": frame_metrics})
+    result = select_frames.invoke({
+        "frame_metrics": frame_metrics,
+        "criteria": {"min_star_count": 20},  # 5 stars (bad_stars.fit) should be rejected
+    })
 
     check("T06 returns accepted_frames",       len(result["accepted_frames"]) > 0)
     check("T06 rejects bad FWHM frame",        "bad_fwhm.fit" in result["rejected_frames"])
@@ -168,7 +171,10 @@ try:
         "fwhm": 50.0, "roundness": 0.1, "number_of_stars": 1,
         "background_lvl": 99.0, "bgnoise": 0.1
     } for i in range(5)}
-    safety_result = select_frames.invoke({"frame_metrics": all_bad})
+    safety_result = select_frames.invoke({
+        "frame_metrics": all_bad,
+        "criteria": {"min_star_count": 20},
+    })
     check("T06 safety: never empty accepted list",
           len(safety_result["accepted_frames"]) == 5)
 

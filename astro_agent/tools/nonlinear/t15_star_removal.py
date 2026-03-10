@@ -2,8 +2,8 @@
 T15 — star_removal
 
 Separate stars from extended objects (nebulae, galaxies) using StarNet v2
-neural network inference. Produces a starless image and a star mask, enabling
-independent processing of nebulosity vs stars.
+neural network inference. Produces a color starless image and a star mask,
+enabling independent processing of nebulosity vs stars.
 
 Backend: StarNet2 MPS build (PyTorch with Apple Silicon CoreML acceleration)
 called directly via subprocess using STARNET_BIN and STARNET_WEIGHTS.
@@ -12,8 +12,9 @@ argument control and to avoid dependency on Siril's internal StarNet config.
 
 Format pipeline:
   StarNet2 does not accept FITS. The conversion chain is:
-    1. Siril: load FITS → savetif → 16-bit TIF
-    2. StarNet2: TIF in → starless TIF + mask TIF
+    1. Siril: load FITS → savetif → 16-bit TIF (Siril's savetif is 16-bit
+       by default; savetif8 would cause StarNet to fall back to mono output)
+    2. StarNet2: TIF in → starless TIF + mask TIF (both color if input is color)
     3. Siril: load TIF → save FITS (×2, for starless + mask)
 
 HITL: requires_visual_review=True by default.
@@ -50,11 +51,13 @@ class StarRemovalInput(BaseModel):
         )
     )
     upscale: bool = Field(
-        default=False,
         description=(
             "Apply 2× intermediate upsampling before star removal (-u flag). "
-            "Use when stars are very small (tight FWHM < 2px) and StarNet is "
-            "partially missing them. Increases processing time significantly."
+            "Must be chosen from T05 summary.median_fwhm:\n"
+            "  True:  FWHM < 2px (under-sampled, tight stars) — StarNet will "
+            "partially miss tight stars without upscaling. Doubles processing time.\n"
+            "  False: FWHM ≥ 2px — upscale adds no benefit and costs time.\n"
+            "Always read median_fwhm from T05 before calling."
         ),
     )
     generate_star_mask: bool = Field(
@@ -74,8 +77,8 @@ def _run_starnet(
     starless_out: Path,
     mask_out: Path | None,
     upscale: bool,
-) -> None:
-    """Call StarNet2 MPS binary directly via subprocess."""
+) -> str:
+    """Call StarNet2 MPS binary directly via subprocess. Returns stdout."""
     settings = load_settings()
 
     cmd: list[str] = [
@@ -103,6 +106,8 @@ def _run_starnet(
             f"stdout: {result.stdout}"
         )
 
+    return result.stdout
+
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
@@ -110,23 +115,25 @@ def _run_starnet(
 def star_removal(
     working_dir: str,
     image_path: str,
-    upscale: bool = False,
+    upscale: bool,
     generate_star_mask: bool = True,
 ) -> dict:
     """
     Remove stars from the stretched image using StarNet v2 neural network.
 
-    Produces a starless image and optionally a star mask. The starless image
-    becomes the working canvas for all non-linear processing (T16–T18, T25–T27).
-    The star mask is recombined with the processed starless image in T19.
+    Produces a color starless image and optionally a star mask. The starless
+    image becomes the working canvas for all non-linear processing
+    (T16–T18, T25–T27). The star mask is recombined with the processed
+    starless image in T19.
 
     Processing pipeline (internal):
-      1. Convert FITS → 16-bit TIF (Siril savetif)
+      1. Convert FITS → 16-bit TIF (Siril savetif16)
       2. Run StarNet2 MPS on TIF → starless TIF + mask TIF
-      3. Convert both TIFs back → FITS (Siril save)
+      3. Convert TIFs back → FITS (Siril save)
 
-    Use upscale=True only if stars are very small (tight PSF) and StarNet is
-    visibly missing them — it doubles processing time.
+    Set upscale from T05 median_fwhm: True if FWHM < 2px (under-sampled),
+    False otherwise. Never leave this to chance — wrong choice either wastes
+    time (False on tight stars → incomplete removal) or doubles runtime needlessly.
 
     HITL visual review is triggered automatically after this tool (V1).
     Check: nebula structure intact, no dark halos around removed stars.
@@ -144,7 +151,9 @@ def star_removal(
     starless_tif  = Path(working_dir) / f"{starless_stem}.tif"
     mask_tif      = Path(working_dir) / f"{mask_stem}.tif" if generate_star_mask else None
 
-    # Step 1: FITS → 16-bit TIF
+    # Step 1: FITS → 16-bit TIF.
+    # Siril's `savetif` saves 16-bit TIFF by default. `savetif8` would produce
+    # 8-bit output, which causes StarNet to fall back to grayscale processing.
     siril_export = [
         f"load {stem}",
         f"savetif {tif_stem}",
@@ -158,9 +167,20 @@ def star_removal(
         )
 
     # Step 2: StarNet2 inference
-    _run_starnet(tif_path, starless_tif, mask_tif, upscale)
+    starnet_stdout = _run_starnet(tif_path, starless_tif, mask_tif, upscale)
+    color_detected = "Color image" in starnet_stdout
+    if not color_detected:
+        raise RuntimeError(
+            "StarNet2 processed the image as monochrome (grayscale), not color. "
+            "This means the TIF passed to StarNet was not recognized as RGB. "
+            "Possible causes:\n"
+            "  1. The FITS input to T15 is already mono (1-channel) — check T14 stretch output.\n"
+            "  2. T03 calibrate was run without debayer=True for a color camera.\n"
+            "  3. T15 was intentionally called on a luminance-only image (unusual).\n"
+            f"StarNet stdout: {starnet_stdout.strip()!r}"
+        )
 
-    # Step 3: TIF → FITS (starless + mask in one Siril run)
+    # Step 3: TIF → FITS (starless + mask)
     siril_import: list[str] = [
         f"load {starless_stem}.tif",
         f"save {starless_stem}",
@@ -190,5 +210,6 @@ def star_removal(
     return {
         "starless_image_path": str(starless_fits),
         "star_mask_path": mask_fits_path,
+        "color_detected": color_detected,
         "tif_intermediate": str(tif_path),
     }

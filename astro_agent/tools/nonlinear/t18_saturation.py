@@ -23,7 +23,7 @@ from pathlib import Path
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from astro_agent.tools._siril import run_siril_script
+from astro_agent.tools._siril import fits_nlayers, run_siril_script
 
 
 # Hue range index reference (documented for agent and user)
@@ -90,22 +90,27 @@ class SaturationAdjustInput(BaseModel):
         )
     )
     method: str = Field(
-        default="global",
         description=(
-            "global: uniform saturation adjustment across all hues. "
-            "hue_targeted: boost or reduce a specific hue range (set hue_target). "
-            "ght_saturation: GHT applied to HSL saturation channel — targets "
-            "mid-saturation pixels, protects already-saturated stars."
+            "Choose based on target type — there is no universal default:\n"
+            "  global: uniform saturation across all hues. Correct for broadband "
+            "galaxy and star cluster images where all channels should be boosted equally.\n"
+            "  hue_targeted: boost a specific hue range only (set hue_target). "
+            "Required for emission nebulae — use hue_target=0 for Hα, hue_target=3 "
+            "for OIII. Global boost on emission nebulae amplifies background color noise.\n"
+            "  ght_saturation: GHT on the HSL saturation channel — targets "
+            "mid-saturation pixels, protects already-saturated stars. Good when the "
+            "background is marginally saturated and global would over-amplify it."
         ),
     )
     amount: float = Field(
-        default=0.5,
         description=(
-            "Saturation adjustment multiplier. "
-            "> 0: increase saturation (0.3–1.0 typical). "
-            "< 0: decrease saturation. "
-            "0: no change. "
-            "Apply in steps of 0.3–0.5 and iterate rather than one large boost."
+            "Saturation adjustment multiplier. Must be chosen from the current "
+            "image's saturation state — there is no universally safe value.\n"
+            "> 0: increase saturation. < 0: decrease. 0: no change.\n"
+            "Typical range: 0.3–1.0. Apply in steps of 0.3–0.5 and iterate. "
+            "Check analyze_image saturation statistics before choosing. "
+            "For a first pass on a well-calibrated stack: 0.3–0.5. "
+            "For a noisy or high-ISO image: 0.2–0.3 maximum."
         ),
     )
     background_factor: float = Field(
@@ -138,8 +143,8 @@ class SaturationAdjustInput(BaseModel):
 def saturation_adjust(
     working_dir: str,
     image_path: str,
-    method: str = "global",
-    amount: float = 0.5,
+    method: str,
+    amount: float,
     background_factor: float = 1.5,
     hue_target: int | None = None,
     ght_sat_options: GHTSatOptions | None = None,
@@ -166,6 +171,16 @@ def saturation_adjust(
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
+
+    if fits_nlayers(img_path) < 3:
+        raise ValueError(
+            f"saturation_adjust requires a color (3-channel RGB) image, but "
+            f"{img_path.name} is monochrome. "
+            "Saturation adjustment has no effect on mono images. "
+            "Trace back to T15 star_removal — if the starless image is mono, "
+            "StarNet received a mono or 8-bit input. Ensure T14 stretch output "
+            "is RGB and that T15 uses savetif16 for the TIF conversion."
+        )
 
     if method == "ght_saturation" and ght_sat_options is None:
         raise ValueError(

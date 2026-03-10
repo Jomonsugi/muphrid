@@ -44,7 +44,7 @@ from astro_agent.tools.nonlinear.t19_star_restoration import star_restoration
 from astro_agent.tools.preprocess.t01_ingest import ingest_dataset
 from astro_agent.tools.preprocess.t02_masters import build_masters
 from astro_agent.tools.preprocess.t02b_convert_sequence import convert_sequence
-from astro_agent.tools.preprocess.t03_calibrate import siril_calibrate
+from astro_agent.tools.preprocess.t03_calibrate import calibrate
 from astro_agent.tools.preprocess.t04_register import siril_register
 from astro_agent.tools.preprocess.t05_analyze_frames import analyze_frames
 from astro_agent.tools.preprocess.t06_select_frames import select_frames
@@ -130,18 +130,6 @@ def main() -> int:
         print(f"       Resolved: RA={r29['ra']:.4f}°, DEC={r29['dec']:.4f}°")
 
     # -------------------------------------------------------------------------
-    # T02b — Convert lights to sequence (needed before T03)
-    # -------------------------------------------------------------------------
-    r02b = _step(
-        "T02b convert_lights",
-        convert_sequence,
-        working_dir=str(working_dir),
-        input_files=files["lights"],
-        sequence_name="lights_seq",
-        debayer=False,
-    )
-
-    # -------------------------------------------------------------------------
     # T02 — Build masters (bias, dark, flat)
     # -------------------------------------------------------------------------
     r02_bias = _step(
@@ -179,11 +167,27 @@ def main() -> int:
         print(f"  [T02 flat] HITL: {r02_flat['diagnostics']['hitl_context']}")
 
     # -------------------------------------------------------------------------
+    # T02b — Convert raw lights to FITS sequence (required before T03)
+    # Siril calibrate operates on a FITS sequence, not raw files directly.
+    # No debayer here — calibration happens in raw CFA space (T03).
+    # -------------------------------------------------------------------------
+    r02b = _step(
+        "T02b convert_lights",
+        convert_sequence,
+        working_dir=str(working_dir),
+        input_files=files["lights"],
+        sequence_name="lights_seq",
+        debayer=False,
+    )
+
+    # -------------------------------------------------------------------------
     # T03 — Calibrate
+    # Fujifilm X-T30 II is X-Trans: is_cfa=True, fix_xtrans=True, equalize_cfa=True.
+    # An agent would derive these flags from T01 camera_model.
     # -------------------------------------------------------------------------
     r03 = _step(
         "T03 calibrate",
-        siril_calibrate,
+        calibrate,
         working_dir=str(working_dir),
         lights_sequence="lights_seq",
         master_bias=master_bias,
@@ -191,6 +195,7 @@ def main() -> int:
         master_flat=master_flat,
         is_cfa=True,
         debayer=True,
+        fix_xtrans=True,
         equalize_cfa=True,
     )
 
@@ -232,12 +237,15 @@ def main() -> int:
 
     # -------------------------------------------------------------------------
     # T06 — Select frames
+    # min_star_count is required — derived from T05 median_star_count.
+    # An agent would read summary.median_star_count and set ~50% of median.
     # -------------------------------------------------------------------------
+    median_stars = summary.get("median_star_count") or 60
     r06 = _step(
         "T06 select_frames",
         select_frames,
         frame_metrics=r05["frame_metrics"],
-        criteria={},
+        criteria={"min_star_count": max(10, int(median_stars * 0.5))},
     )
     accepted = r06["accepted_frames"]
     print(f"       Accepted: {len(accepted)}/{summary.get('frame_count', '?')} "
@@ -250,6 +258,13 @@ def main() -> int:
 
     # -------------------------------------------------------------------------
     # T07 — Stack
+    # rejection_method is required — no universal default.
+    # An agent would reason: 18 accepted frames with seeing_stability=0.16
+    # (tight FWHM distribution) → sigma_clipping is appropriate.
+    # For < 15 frames, winsorized is statistically safer (replaces rather than
+    # removes outliers). For > 50 frames, linear_fit is more accurate.
+    # These are starting points, not hard rules — calibration quality and
+    # per-frame homogeneity also factor in.
     # -------------------------------------------------------------------------
     r07 = _step(
         "T07 stack",
@@ -257,6 +272,7 @@ def main() -> int:
         working_dir=str(working_dir),
         registered_sequence=r04["registered_sequence"],
         accepted_frames=accepted,
+        rejection_method="sigma_clipping",
         total_frames_hint=summary.get("frame_count"),
     )
     current_image = r07["master_light_path"]
@@ -282,7 +298,6 @@ def main() -> int:
         remove_gradient,
         working_dir=str(working_dir),
         image_path=current_image,
-        backend="graxpert",
     )
     current_image = r09["processed_image_path"]
 
@@ -300,14 +315,11 @@ def main() -> int:
         image_path=current_image,
         camera_model=camera_model,
         target_coords=target_coords,
+        # GraXpert-processed linear stacks can fool findstar's default sigma threshold.
+        # An agent would add these after seeing "not enough stars picked" in error_msg.
+        platesolve_options={"findstar": {"sigma": 0.5, "relax": True}},
     )
-    if not r10.get("plate_solve_success"):
-        print("  [T10] WARNING: plate solve failed, continuing without color calibration")
-        print(f"  [T10] error_msg: {r10.get('error_msg')}")
-        if r10.get("calibrated_image_path"):
-            current_image = r10["calibrated_image_path"]
-    else:
-        current_image = r10["calibrated_image_path"]
+    current_image = r10["calibrated_image_path"]
 
     # -------------------------------------------------------------------------
     # T11 — Green noise (error classifier fixed — no more spurious SirilError)
@@ -334,11 +346,17 @@ def main() -> int:
     # -------------------------------------------------------------------------
     # T13 — Deconvolution
     # -------------------------------------------------------------------------
+    # Use FWHM from T05 registration to construct a manual PSF.
+    # An agent would do this after seeing "No suitable stars detectable"
+    # from makepsf stars — noise reduction softens stars past the detection threshold.
+    median_fwhm = summary.get("median_fwhm") or 3.2
     r13 = _step(
         "T13 deconvolution",
         deconvolution,
         working_dir=str(working_dir),
         image_path=current_image,
+        psf_source="manual",
+        manual_psf_options={"fwhm_px": round(median_fwhm, 1), "profile": "moffat"},
     )
     current_image = r13["processed_image_path"]
 
@@ -360,12 +378,15 @@ def main() -> int:
 
     # -------------------------------------------------------------------------
     # T15 — Star removal
+    # upscale is required — derived from T05 median_fwhm.
+    # median_fwhm=3.2px >> 2px threshold → upscale=False.
     # -------------------------------------------------------------------------
     r15 = _step(
         "T15 star_removal",
         star_removal,
         working_dir=str(working_dir),
         image_path=current_image,
+        upscale=(median_fwhm < 2.0),
         generate_star_mask=True,
     )
     starless_image = r15["starless_image_path"]
@@ -440,14 +461,18 @@ def main() -> int:
     current_image = r17["enhanced_image_path"]
 
     # -------------------------------------------------------------------------
-    # T18 — Saturation (amount now has a default; uses processed_image_path)
+    # T18 — Saturation
+    # method and amount are required (no defaults — target/data dependent).
+    # This test data is broadband OSC so global is correct; 0.3 is conservative
+    # for a first pass on short-exposure stacks with limited SNR.
     # -------------------------------------------------------------------------
     r18 = _step(
         "T18 saturation",
         saturation_adjust,
         working_dir=str(working_dir),
         image_path=current_image,
-        amount=0.5,
+        method="global",
+        amount=0.3,
     )
     current_image = r18["processed_image_path"]
 

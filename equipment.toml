@@ -16,7 +16,7 @@ sensor_type = "xtrans"          # "bayer" | "xtrans" | "mono"
 
 [optics]
 # Primary imaging setup. Comment out entries you don't use.
-focal_length_mm = 135.0         # Physical focal length of the lens (not EFL). Samyang 135mm f/2.
+focal_length_mm = 129.5         # Plate-solve-measured focal length (Siril, 2026-03-08). Samyang 135mm f/2 nominal.
 # aperture_mm = 50.0            # Primary aperture diameter (for Airy PSF)
 # obstruction_pct = 0.0         # Central obstruction as % of aperture area
 

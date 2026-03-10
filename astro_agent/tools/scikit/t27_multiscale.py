@@ -426,10 +426,14 @@ def multiscale_process(
         output = output * mask_3d + original * (1.0 - mask_3d)
         output = np.clip(output, 0.0, 1.0)
 
-    # Save result
+    # Save result.
+    # Squeeze (1, H, W) → (H, W) for mono outputs so downstream tools (Siril
+    # pm, T23) see NAXIS=2 — consistent with how Siril and T25 save mono images.
+    # Siril misreads (1, H, W) NAXIS=3/NAXIS3=1 and tries to load 3× the data.
     out_stem = output_stem or f"{img_path.stem}_mlt"
     out_path = Path(working_dir) / f"{out_stem}.fits"
-    hdu = astropy_fits.PrimaryHDU(data=output)
+    save_data = output.squeeze() if output.shape[0] == 1 else output
+    hdu = astropy_fits.PrimaryHDU(data=save_data)
     astropy_fits.HDUList([hdu]).writeto(out_path, overwrite=True)
 
     return {

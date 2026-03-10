@@ -26,7 +26,30 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from astropy.io import fits as astropy_fits
+
 from astro_agent.config import load_settings
+
+
+def fits_nlayers(fits_path: Path | str) -> int:
+    """Return the number of color channels in a FITS image.
+
+    Returns 1 for monochrome (NAXIS<3 or NAXIS3=1), 3 for RGB (NAXIS3=3).
+    """
+    with astropy_fits.open(str(fits_path)) as hdul:
+        hdr = hdul[0].header
+        naxis = int(hdr.get("NAXIS", 0))
+        if naxis < 3:
+            return 1
+        return int(hdr.get("NAXIS3", 1))
+
+
+def fits_has_nan(fits_path: Path | str) -> bool:
+    """Return True if the FITS image data contains any NaN or Inf values."""
+    import numpy as np
+    with astropy_fits.open(str(fits_path)) as hdul:
+        data = hdul[0].data
+        return bool(np.any(~np.isfinite(data)))
 
 
 # ── Result and error types ─────────────────────────────────────────────────────

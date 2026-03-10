@@ -2,8 +2,9 @@
 T10 — color_calibrate
 
 Correct white balance by matching star colors to photometric catalogs.
-Includes background neutralization (sets background to neutral grey) and
-optionally spectrophotometric calibration for more accurate color.
+Siril's PCC/SPCC always include background neutralization as part of the
+operation — it cannot be disabled. Use PCC for general OSC/DSLR images,
+SPCC for more accurate calibration when sensor/filter spectral data is available.
 
 This tool requires a plate-solved image. Plate solving is attempted internally
 if WCS is not already present in the FITS header.
@@ -303,14 +304,6 @@ class ColorCalibrateInput(BaseModel):
     )
     spcc_options: SpccOptions = Field(default_factory=SpccOptions)
     platesolve_options: PlateSolveOptions = Field(default_factory=PlateSolveOptions)
-    background_neutralization: bool = Field(
-        default=True,
-        description=(
-            "Advisory flag: Siril PCC/SPCC always include background neutralization. "
-            "No CLI flag to disable. If bg neutralization without PCC/SPCC is needed "
-            "(e.g. plate solve fails), use T20 + T23 pixel_math to equalize channels."
-        ),
-    )
 
 
 # ── Command builders ──────────────────────────────────────────────────────────
@@ -437,9 +430,9 @@ def _build_spcc_cmd(
 
 
 def _parse_plate_solve_result(result: SirilResult) -> dict:
-    """Extract WCS coords and pixel scale from Siril platesolve stdout."""
+    """Extract WCS coords, pixel scale, and measured focal length from Siril platesolve stdout."""
     import re
-    ra, dec, pixel_scale = None, None, None
+    ra, dec, pixel_scale, focal_length_mm = None, None, None, None
 
     m = re.search(r"RA\s*[=:]\s*([\d.]+)", result.stdout, re.IGNORECASE)
     if m:
@@ -450,8 +443,19 @@ def _parse_plate_solve_result(result: SirilResult) -> dict:
     m = re.search(r"pixel\s+scale[^=]*[=:]\s*([\d.]+)", result.stdout, re.IGNORECASE)
     if m:
         pixel_scale = float(m.group(1))
+    # Siril reports the plate-solve-derived focal length, which is more accurate
+    # than the manufacturer nominal (e.g. "Focal length: 129.50 mm").
+    # Computed from measured plate scale × known pixel size ÷ 206.265.
+    m = re.search(r"focal\s+length[^:]*:\s*([\d.]+)\s*mm", result.stdout, re.IGNORECASE)
+    if m:
+        focal_length_mm = float(m.group(1))
 
-    return {"ra": ra, "dec": dec, "pixel_scale_arcsec": pixel_scale}
+    return {
+        "ra": ra,
+        "dec": dec,
+        "pixel_scale_arcsec": pixel_scale,
+        "measured_focal_length_mm": focal_length_mm,
+    }
 
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
@@ -472,7 +476,6 @@ def color_calibrate(
     bgtol_upper: float | None = None,
     spcc_options: SpccOptions | None = None,
     platesolve_options: PlateSolveOptions | None = None,
-    background_neutralization: bool = True,
 ) -> dict:
     """
     Correct white balance by matching star colors to photometric catalogs.
@@ -498,9 +501,9 @@ def color_calibrate(
       downscale, sip_order, search_radius, catalog, limitmag, no_crop,
       local astrometry.net with blind_pos / blind_res.
 
-    If plate solving fails, returns plate_solve_success=False with diagnostic
-    error_msg. The agent should try providing target_coords, adjusting
-    platesolve_options, or fall back to pixel_math for manual neutralization.
+    Raises RuntimeError if pixel size cannot be resolved or plate solving fails.
+    On plate solve failure, retry with adjusted platesolve_options (lower sigma,
+    relax=True, explicit target_coords) or correct pixel_size_um / focal_length_mm.
 
     Run analyze_image after to verify color_coefficients are physically
     plausible (r, g, b all near 1.0 +/- 30%).
@@ -517,14 +520,10 @@ def color_calibrate(
     try:
         px_size = resolve_pixel_size(pixel_size_um, camera_model)
     except ValueError as e:
-        return {
-            "calibrated_image_path": None,
-            "plate_solve_success": False,
-            "wcs_coords": None,
-            "pixel_scale_arcsec": None,
-            "color_coefficients": None,
-            "error_msg": str(e),
-        }
+        raise RuntimeError(
+            f"Cannot color calibrate: pixel size unknown. {e}\n"
+            "Set pixel_size_um explicitly or add [camera] pixel_size_um to equipment.toml."
+        ) from e
 
     # Resolve focal length: explicit arg → equipment.toml → None (Siril uses header/prefs)
     resolved_fl = _resolve_fl(focal_length_mm if focal_length_mm and focal_length_mm > 0 else None)
@@ -549,9 +548,7 @@ def color_calibrate(
 
     commands = [f"load {stem}", *platesolve_cmds, cal_cmd, f"save {output_stem}"]
 
-    plate_solve_success = True
     wcs_info: dict = {}
-    error_msg: str | None = None
 
     try:
         result = run_siril_script(commands, working_dir=working_dir, timeout=180)
@@ -559,24 +556,15 @@ def color_calibrate(
     except SirilError as exc:
         stdout_lower = exc.result.stdout.lower() + exc.result.stderr.lower()
         if "plate" in stdout_lower or "wcs" in stdout_lower or "astrometry" in stdout_lower:
-            plate_solve_success = False
-            error_msg = (
-                f"Plate solving failed. platesolve_cmds={platesolve_cmds!r} "
-                f"stdout={exc.result.stdout[-600:]!r} "
-                f"stderr={exc.result.stderr[-400:]!r}"
-            )
-        else:
-            raise
-
-    if not plate_solve_success:
-        return {
-            "calibrated_image_path": None,
-            "plate_solve_success": False,
-            "wcs_coords": None,
-            "pixel_scale_arcsec": None,
-            "color_coefficients": None,
-            "error_msg": error_msg,
-        }
+            raise RuntimeError(
+                f"Plate solving failed — cannot color calibrate.\n"
+                f"platesolve_cmd={platesolve_cmd!r}\n"
+                f"stdout={exc.result.stdout[-600:]!r}\n"
+                f"stderr={exc.result.stderr[-400:]!r}\n"
+                "Retry with adjusted platesolve_options (lower sigma, relax=True), "
+                "explicit target_coords, or corrected pixel_size_um / focal_length_mm."
+            ) from exc
+        raise
 
     output_path = Path(working_dir) / f"{output_stem}.fit"
     if not output_path.exists():
@@ -588,13 +576,12 @@ def color_calibrate(
 
     return {
         "calibrated_image_path": str(output_path),
-        "plate_solve_success": True,
         "wcs_coords": {
             "ra": wcs_info.get("ra"),
             "dec": wcs_info.get("dec"),
         },
         "pixel_scale_arcsec": wcs_info.get("pixel_scale_arcsec"),
+        "measured_focal_length_mm": wcs_info.get("measured_focal_length_mm"),
         "pixel_size_um_used": px_size,
         "color_coefficients": None,
-        "error_msg": None,
     }

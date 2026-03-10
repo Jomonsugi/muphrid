@@ -29,7 +29,7 @@ from pathlib import Path
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from astro_agent.tools._siril import run_siril_script
+from astro_agent.tools._siril import fits_has_nan, run_siril_script
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -293,6 +293,15 @@ def stretch_image(
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
+
+    if fits_has_nan(img_path):
+        raise ValueError(
+            f"Input image {img_path.name} contains NaN or Inf values. "
+            "Stretching NaN data will produce an all-white or corrupted image. "
+            "Trace back to the previous tool that produced this file — most likely "
+            "T13 deconvolution diverged. Re-run T13 with lower iterations or higher "
+            "regularization, or skip deconvolution if SNR is insufficient."
+        )
 
     if method == "ghs" and ghs_options is None:
         raise ValueError(

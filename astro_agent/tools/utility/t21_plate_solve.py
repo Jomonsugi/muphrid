@@ -271,6 +271,14 @@ def plate_solve(
     directly when WCS data is needed without color calibration — most commonly
     for pixel_scale_arcsec for deconvolution PSF sizing in T13.
 
+    Returned measured_focal_length_mm is derived from the measured plate scale and
+    the known pixel size (focal_mm = pixel_um × 206.265 / plate_scale_arcsec). This
+    is more accurate than the manufacturer's nominal focal length. When present,
+    update metadata.focal_length_mm in state with this value — all downstream tools
+    that depend on focal length (T13 deconvolution PSF sizing, T10 SPCC) should use
+    the measured value, not the nominal. Note it in the processing_report if the
+    discrepancy from the nominal is > 2% (indicates a meaningful optical difference).
+
     Troubleshooting failed solves:
       - Provide approximate_coords (even rough RA/DEC helps enormously)
       - Verify focal_length_mm and pixel_size_um (wrong scale = #1 failure cause)
@@ -330,6 +338,7 @@ def plate_solve(
         fov = _parse_field_of_view(result.stdout)
         rotation = _parse_rotation(result.stdout)
 
+        measured_fl = wcs_info.get("measured_focal_length_mm")
         return {
             "success": True,
             "wcs_coords": {
@@ -337,6 +346,7 @@ def plate_solve(
                 "dec": wcs_info.get("dec"),
             },
             "pixel_scale_arcsec": wcs_info.get("pixel_scale_arcsec"),
+            "measured_focal_length_mm": measured_fl,
             "field_of_view": fov,
             "rotation_deg": rotation,
             "error_msg": None,

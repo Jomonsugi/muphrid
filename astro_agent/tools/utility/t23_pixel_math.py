@@ -17,6 +17,9 @@ Siril pm notes:
 - Result is left in memory; must be saved explicitly with `save`
 - Maximum 10 image variables per expression
 - -rescale normalizes output to [low, high] range (default 0–1 if no values given)
+- -nosum prevents Siril from accumulating LIVETIME/STACKCNT in the output header.
+  Always use for blending operations — pixel math here is not a stack, and writing
+  those header values would corrupt downstream metadata.
 """
 
 from __future__ import annotations
@@ -69,6 +72,15 @@ class PixelMathInput(BaseModel):
         default=1.0,
         description="Upper bound for output rescaling (used only if rescale=True).",
     )
+    nosum: bool = Field(
+        default=True,
+        description=(
+            "Prevent Siril from accumulating LIVETIME and STACKCNT in the output "
+            "FITS header (-nosum). Default True — pixel math in this pipeline is "
+            "used for blending, not stacking. Set False only if you are performing "
+            "a genuine image sum and want the header updated accordingly."
+        ),
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -82,10 +94,22 @@ def _find_fits(wd: Path, stem: str) -> Path | None:
     return None
 
 
-def _get_naxes(fits_path: Path) -> int:
-    """Return the number of axes (NAXIS) from a FITS primary header."""
+def _get_nlayers(fits_path: Path) -> int:
+    """
+    Return the number of image channels: 1 for mono, 3 for RGB.
+
+    FITS stores axes in Fortran order, so a numpy array of shape (C, H, W)
+    is written as NAXIS1=W, NAXIS2=H, NAXIS3=C. A mono image may be stored
+    as (H, W) → NAXIS=2, or as (1, H, W) → NAXIS=3 with NAXIS3=1.
+    Both are 1-channel; NAXIS alone does not distinguish them from RGB (NAXIS3=3).
+    """
     with fits.open(str(fits_path)) as hdul:
-        return int(hdul[0].header.get("NAXIS", 0))
+        hdr = hdul[0].header
+        naxis = int(hdr.get("NAXIS", 0))
+        if naxis < 3:
+            return 1
+        # NAXIS3 is the channel count for (C, H, W) arrays written by astropy/Siril.
+        return int(hdr.get("NAXIS3", 1))
 
 
 def _validate_and_broadcast(expression: str, working_dir: str) -> tuple[list[str], str, bool]:
@@ -96,9 +120,8 @@ def _validate_and_broadcast(expression: str, working_dir: str) -> tuple[list[str
     auto_broadcast flag).
 
     Siril pm requires all input images to have the same number of layers.
-    When a 1-layer mask is mixed with a 3-layer RGB image, we expand the
-    mono image via Siril rgbcomp and rewrite the expression to use the
-    expanded stem.
+    Mono images may be stored as (H, W) NAXIS=2 OR as (1, H, W) NAXIS=3 —
+    both are 1-channel and both trigger broadcast when mixed with 3-channel RGB.
     """
     stems = re.findall(r"\$([^$]+)\$", expression)
     if not stems:
@@ -113,13 +136,13 @@ def _validate_and_broadcast(expression: str, working_dir: str) -> tuple[list[str
 
     wd = Path(working_dir)
     missing = []
-    stem_naxes: dict[str, int] = {}
+    stem_layers: dict[str, int] = {}
     for stem in set(stems):
         fpath = _find_fits(wd, stem)
         if fpath is None:
             missing.append(stem)
         else:
-            stem_naxes[stem] = _get_naxes(fpath)
+            stem_layers[stem] = _get_nlayers(fpath)
 
     if missing:
         raise FileNotFoundError(
@@ -127,12 +150,13 @@ def _validate_and_broadcast(expression: str, working_dir: str) -> tuple[list[str
             f"Working dir: {working_dir}"
         )
 
-    nax_values = set(stem_naxes.values())
+    layer_values = set(stem_layers.values())
     auto_broadcast = False
 
-    if nax_values == {2, 3}:
+    if len(layer_values) > 1:
+        # Mix of channel counts — broadcast all 1-layer images to 3-layer RGB.
         auto_broadcast = True
-        mono_stems = [s for s, n in stem_naxes.items() if n == 2]
+        mono_stems = [s for s, n in stem_layers.items() if n == 1]
         for mono_stem in mono_stems:
             rgb_stem = f"{mono_stem}_rgb3"
             if _find_fits(wd, rgb_stem) is None:
@@ -160,6 +184,7 @@ def pixel_math(
     rescale: bool = False,
     rescale_low: float = 0.0,
     rescale_high: float = 1.0,
+    nosum: bool = True,
 ) -> dict:
     """
     General-purpose pixel math using Siril's PixelMath engine.
@@ -187,6 +212,8 @@ def pixel_math(
     pm_cmd = f'pm "{expression}"'
     if rescale:
         pm_cmd += f" -rescale {rescale_low} {rescale_high}"
+    if nosum:
+        pm_cmd += " -nosum"
 
     commands = [pm_cmd, f"save {out_stem}"]
     run_siril_script(commands, working_dir=working_dir, timeout=120)

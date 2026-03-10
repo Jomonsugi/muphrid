@@ -1,32 +1,36 @@
 """
 T12 — noise_reduction
 
-Reduce noise while preserving signal structure. Applied in linear space where
-noise statistics are approximately Gaussian after stacking — this is the
-mathematically correct moment to denoise. Noise reduced here will not be
-amplified by the stretch transformation.
+AI-based noise reduction on linear FITS data using GraXpert.
 
-Primary backend: Siril NL-Bayes (`denoise`) — fast, excellent detail
-preservation, optionally boosted with DA3D or SOS algorithms.
+Why GraXpert AI denoising:
+  Applied in linear space where noise statistics are approximately Gaussian
+  after stacking — this is the mathematically correct moment to denoise.
+  Noise reduced here is not amplified by the stretch transformation, enabling
+  more aggressive stretching without noise amplification and producing a
+  cleaner base for all downstream processing.
 
-Alternative backend: GraXpert AI denoising — deep-learning approach, very
-effective but slower. Uses denoise-ai-models/2.0.0 (cached locally).
-GraXpert denoising strength is controlled via a temporary preferences file
-(strength is not a direct CLI flag in GraXpert 3.0.2).
+  GraXpert's deep-learning denoiser is trained specifically on astrophotography
+  data. It preserves faint nebulosity, star halos, and fine structure better
+  than classical algorithms (NL-Bayes, wavelets) because the model has learned
+  what signal vs. noise looks like in this domain.
 
-A mild second pass post-stretch on the starless image may be warranted for
-very noisy captures, but linear-space denoising is always the primary pass.
+GraXpert command used:
+    GraXpert <input> -cli -cmd denoising -output <output>
+        -ai_version <n.n.n> -strength <0.0-1.0>
+        -batch_size <int> [-gpu {true,false}]
 """
 
 from __future__ import annotations
 
-import json
 import subprocess
-import tempfile
 from pathlib import Path
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
+
+import numpy as np
+from astropy.io import fits as astropy_fits
 
 from astro_agent.config import load_settings
 from astro_agent.tools._siril import run_siril_script
@@ -34,90 +38,44 @@ from astro_agent.tools._siril import run_siril_script
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
-class SirilDenoiseOptions(BaseModel):
-    modulation: float = Field(
-        default=0.9,
-        description=(
-            "Blend factor between the denoised output and the original (0.0–1.0). "
-            "1.0: full denoising (maximum noise reduction). "
-            "0.7–0.9: blends in 10–30% of the original — preserves faint detail "
-            "and avoids over-smoothing. Recommended range: 0.7–0.95."
-        ),
-    )
-    method: str = Field(
-        default="standard",
-        description=(
-            "standard: NL-Bayes — fast, high quality. Good default for most images. "
-            "da3d: NL-Bayes + DA3D boosting — best detail preservation at the cost "
-            "of 2–3× processing time. Preferred for images with fine structure "
-            "(galaxy spirals, planetary nebulae). "
-            "sos: SOS (Sum of Squares) boosting — iterative, use when standard "
-            "and da3d leave visible noise in low-SNR regions."
-        ),
-    )
-    sos_iterations: int = Field(
-        default=3,
-        description=(
-            "Number of SOS boosting iterations. Only used when method=sos. "
-            "More iterations = stronger denoising but slower. 3–5 is typical."
-        ),
-    )
-    sos_rho: float | None = Field(
-        default=None,
-        description=(
-            "SOS rho parameter (0 < rho < 1). Controls the amount of noisy image "
-            "mixed in between iterations. Only used with method=sos. "
-            "Lower values = more aggressive denoising per iteration. "
-            "Null = Siril default."
-        ),
-    )
-    independent_channels: bool = Field(
-        default=False,
-        description=(
-            "Process each color channel independently (-indep). "
-            "Default (False) processes all channels jointly, which is better for "
-            "OSC/DSLR color images. Set True only for unusual per-channel noise."
-        ),
-    )
-    use_vst: bool = Field(
-        default=False,
-        description=(
-            "Apply the generalised Anscombe variance stabilising transform (VST) "
-            "prior to NL-Bayes (-vst). Useful for photon-starved images such as "
-            "single subs, where noise follows a Poisson distribution rather than "
-            "Gaussian. For stacked images, VST is usually not beneficial. "
-            "Cannot be combined with method=da3d or method=sos."
-        ),
-    )
-    apply_cosmetic: bool = Field(
-        default=True,
-        description=(
-            "Apply automatic cosmetic correction (find_cosme) before denoising. "
-            "Removes residual hot and cold pixels that would otherwise be "
-            "propagated and amplified by the denoising algorithm. "
-            "Disable (-nocosmetic) only if cosmetic correction was already applied "
-            "explicitly earlier in the pipeline."
-        ),
-    )
-
-
-class GraXpertDenoiseOptions(BaseModel):
+class DenoiseOptions(BaseModel):
     strength: float = Field(
         default=0.5,
         description=(
             "Denoising strength 0.0–1.0. "
             "Higher values remove more noise but risk smoothing fine detail. "
             "0.5 is a reliable starting point for most stacks. "
-            "0.3–0.4 for high-SNR images with fine structure (galaxy spirals). "
-            "0.6–0.8 for high-noise images (short exposures, high ISO)."
+            "0.3–0.4 for high-SNR images with fine structure (galaxy spirals, "
+            "tight planetary nebulae). "
+            "0.6–0.8 for high-noise images (short exposures, high ISO, < 2h integration)."
         ),
     )
     ai_version: str = Field(
         default="2.0.0",
         description=(
-            "Denoise AI model version. 2.0.0 is the current best available "
-            "(linear data, superior structure preservation over 1.0.0). "
-            "Model cached at ~/Library/Application Support/GraXpert/denoise-ai-models/."
+            "Denoise AI model version in n.n.n format. "
+            "GraXpert will use a locally cached model or download from remote if needed. "
+            "Prefer locally cached versions to avoid network latency. "
+            "If a run fails reporting the version unavailable, retry with a version "
+            "from the list GraXpert provides in its error output. "
+            "Upgrade to a newer remote version (e.g. '3.0.2') only when the user "
+            "explicitly requests it — newer models may produce different noise/detail "
+            "trade-offs and affect reproducibility."
+        ),
+    )
+    batch_size: int = Field(
+        default=4,
+        description=(
+            "AI inference batch size. Larger values speed up processing but use more "
+            "GPU/CPU memory. Reduce to 1 or 2 if you encounter out-of-memory errors."
+        ),
+    )
+    gpu: bool = Field(
+        default=True,
+        description=(
+            "Enable GPU acceleration for AI inference. "
+            "Set False to force CPU (slower but useful for debugging or when "
+            "GPU memory is insufficient)."
         ),
     )
 
@@ -129,33 +87,24 @@ class NoiseReductionInput(BaseModel):
     image_path: str = Field(
         description=(
             "Absolute path to the linear FITS image to denoise. "
-            "Should be post gradient-removal and color calibration (T09, T10, T11)."
+            "Must be post gradient-removal and color calibration (T09, T10, T11)."
         )
     )
-    backend: str = Field(
-        default="siril",
-        description=(
-            "siril: NL-Bayes denoising via Siril (primary, fast, proven). "
-            "graxpert: AI denoising via GraXpert subprocess (alternative, slower, "
-            "deep-learning approach — may outperform Siril on very noisy images)."
-        ),
-    )
-    siril_options: SirilDenoiseOptions = Field(default_factory=SirilDenoiseOptions)
-    graxpert_options: GraXpertDenoiseOptions = Field(default_factory=GraXpertDenoiseOptions)
+    options: DenoiseOptions = Field(default_factory=DenoiseOptions)
 
 
-# ── Siril backend ──────────────────────────────────────────────────────────────
+# ── Noise measurement ──────────────────────────────────────────────────────────
 
 def _measure_bgnoise(stem: str, working_dir: str) -> float | None:
     """Run Siril bgnoise on the loaded image and parse the result."""
     from astro_agent.tools._siril import SirilError
+    import re
     try:
         result = run_siril_script(
             [f"load {stem}", "bgnoise"],
             working_dir=working_dir,
             timeout=30,
         )
-        import re
         m = re.search(r"Background\s+noise[^\d]*([\d.e+-]+)", result.stdout, re.IGNORECASE)
         if m:
             return float(m.group(1))
@@ -164,100 +113,99 @@ def _measure_bgnoise(stem: str, working_dir: str) -> float | None:
     return None
 
 
-def _run_siril_denoise(
-    image_path: Path,
-    working_dir: str,
-    options: SirilDenoiseOptions,
-) -> Path:
-    stem = image_path.stem
-    output_stem = f"{stem}_denoise"
+# ── GraXpert denoising ─────────────────────────────────────────────────────────
 
-    denoise_cmd = f"denoise -mod={options.modulation}"
-    if options.method == "da3d":
-        denoise_cmd += " -da3d"
-    elif options.method == "sos":
-        denoise_cmd += f" -sos={options.sos_iterations}"
-        if options.sos_rho is not None:
-            denoise_cmd += f" -rho={options.sos_rho}"
-    if options.use_vst and options.method == "standard":
-        denoise_cmd += " -vst"
-    if options.independent_channels:
-        denoise_cmd += " -indep"
-    if not options.apply_cosmetic:
-        denoise_cmd += " -nocosmetic"
-
-    commands = [
-        f"load {stem}",
-        denoise_cmd,
-        f"save {output_stem}",
-    ]
-    run_siril_script(commands, working_dir=working_dir, timeout=180)
-
-    output_path = Path(working_dir) / f"{output_stem}.fit"
-    if not output_path.exists():
-        output_path = Path(working_dir) / f"{output_stem}.fits"
-    if not output_path.exists():
-        raise FileNotFoundError(f"Siril denoise did not produce: {output_path}")
-
-    return output_path
+# GraXpert / ONNX zero-pixel bug:
+# GraXpert's neural network normalizes tiles by channel mean/std internally.
+# When a tile or image region contains exact-zero pixels (common in X-Trans
+# debayering and after Siril stacking with `framing=min`), the normalization
+# divides by zero → NaN propagates through the inference graph. This is a
+# known ONNX/GraXpert issue affecting X-Trans sensors and mosaiced images.
+# Fix: apply a tiny pedestal (1e-4) to zero-valued pixels before inference.
+# At 32-bit float precision this is ~0.01% of the full-scale range and is
+# completely invisible in the final image.
+_GRAXPERT_ZERO_PEDESTAL = 1e-4
 
 
-# ── GraXpert backend ───────────────────────────────────────────────────────────
+def _apply_zero_pedestal(fits_path: Path) -> int:
+    """Lift sub-pedestal and NaN pixels to _GRAXPERT_ZERO_PEDESTAL in-place.
+
+    GraXpert's ONNX inference normalizes tiles by local mean/std.
+    Pixels near zero (< ~1e-6 in X-Trans stacks) are mathematically
+    zero to the network but cause 0/0 in normalization → NaN output.
+    NaN pixels (Siril rejection/framing borders) also propagate as NaN
+    through the inference graph and corrupt entire tiles.
+    The fix: clamp both to pedestal — lifts the black point by
+    ~0.01% of full scale, completely invisible in the final image.
+
+    Returns the number of pixels modified.
+    """
+    with astropy_fits.open(str(fits_path), mode="update") as hdul:
+        data = hdul[0].data
+        mask = (data < _GRAXPERT_ZERO_PEDESTAL) | np.isnan(data)
+        count = int(np.sum(mask))
+        if count > 0:
+            data[mask] = _GRAXPERT_ZERO_PEDESTAL
+            hdul.flush()
+    return count
+
 
 def _run_graxpert_denoise(
     image_path: Path,
-    options: GraXpertDenoiseOptions,
-) -> Path:
-    """
-    Run GraXpert denoising via subprocess.
-    Strength is not a direct CLI flag in GraXpert 3.0.2 — it is written to a
-    temporary preferences JSON and passed via -preferences_file.
-    """
+    options: DenoiseOptions,
+) -> tuple[Path, int]:
+    """Run GraXpert denoising. Returns (output_path, zero_pixels_pedestaled)."""
     settings = load_settings()
-    graxpert_bin = settings.graxpert_bin
 
     output_path = image_path.parent / f"{image_path.stem}_denoise.fits"
 
-    # Build minimal preferences dict with the desired strength
-    prefs = {
-        "denoise_strength": options.strength,
-        "ai_gpu_acceleration": True,
-        "ai_batch_size": 4,
-    }
+    # GraXpert always appends .fits to the -output argument, so pass the
+    # stem without extension to land at the correct final path.
+    output_stem = str(output_path.with_suffix(""))
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False
-    ) as tmp:
-        json.dump(prefs, tmp)
-        prefs_path = tmp.name
+    # Apply pedestal to a working copy so the original input is not modified.
+    import shutil
+    graxpert_input = image_path.parent / f"{image_path.stem}_graxpert_input.fits"
+    shutil.copy2(str(image_path), str(graxpert_input))
+    zero_count = _apply_zero_pedestal(graxpert_input)
 
-    try:
-        cmd = [
-            graxpert_bin,
-            str(image_path),
-            "-cli",
-            "-cmd", "denoising",
-            "-output", str(output_path),
-            "-ai_version", options.ai_version,
-            "-preferences_file", prefs_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    finally:
-        Path(prefs_path).unlink(missing_ok=True)
+    # GraXpert CLI positional: filename must come last (after all flags).
+    # Use the pedestaled working copy as input; rename output to expected path.
+    working_output = image_path.parent / f"{graxpert_input.stem}_denoise.fits"
+    working_stem = str(working_output.with_suffix(""))
+
+    cmd = [
+        settings.graxpert_bin,
+        "-cli",
+        "-cmd", "denoising",
+        "-output", working_stem,
+        "-ai_version", options.ai_version,
+        "-strength", str(options.strength),
+        "-batch_size", str(options.batch_size),
+        "-gpu", "true" if options.gpu else "false",
+        str(graxpert_input),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+    # Clean up working copy regardless of outcome
+    graxpert_input.unlink(missing_ok=True)
+
+    combined = (result.stderr + result.stdout).strip()
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"GraXpert denoising failed (exit {result.returncode}):\n"
-            f"{result.stderr or result.stdout}"
+            f"GraXpert denoising failed (exit {result.returncode}):\n{combined}"
         )
 
-    if not output_path.exists():
+    if not working_output.exists():
         raise FileNotFoundError(
-            f"GraXpert did not produce expected output: {output_path}\n"
-            f"stdout: {result.stdout}"
+            f"GraXpert did not produce expected output: {working_output}\n{combined}"
         )
 
-    return output_path
+    # Move to the expected output path (named after original stem, not working copy)
+    working_output.rename(output_path)
+
+    return output_path, zero_count
 
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
@@ -266,33 +214,24 @@ def _run_graxpert_denoise(
 def noise_reduction(
     working_dir: str,
     image_path: str,
-    backend: str = "siril",
-    siril_options: SirilDenoiseOptions | None = None,
-    graxpert_options: GraXpertDenoiseOptions | None = None,
+    options: DenoiseOptions | None = None,
 ) -> dict:
     """
-    Reduce noise in the linear FITS image before stretching.
+    AI-based noise reduction on the linear FITS image using GraXpert.
 
-    Denoising in linear space is the gold standard — noise statistics are
-    Gaussian here and the algorithm has the most information to work with.
-    Applying denoising after stretch amplifies noise in shadow regions
+    Applied before stretching (T14) — denoising in linear space is the gold
+    standard. Noise statistics are Gaussian here and the ML model has the most
+    information to work with. Denoising after stretch amplifies shadow noise
     first and makes structure recovery harder.
 
-    Backend guidance:
-    - siril (default): NL-Bayes, fast, reliable. Use da3d method for best
-      detail preservation on images with fine structure.
-    - graxpert: Deep-learning denoiser, may outperform NL-Bayes on very noisy
-      captures or images with structured noise patterns.
-
-    Use modulation < 1.0 (Siril) or strength < 1.0 (GraXpert) to blend in
-    original signal and avoid over-smoothing. Run analyze_image before and
-    after to compare noise_before vs noise_after and confirm SNR improvement
-    without signal loss.
+    Tune strength based on SNR: start at 0.5, lower for high-SNR images with
+    fine structure, raise for short-exposure or high-ISO captures. The
+    noise_before / noise_after / noise_reduction_pct in the return dict give
+    the agent quantitative feedback to assess whether to re-run with different
+    strength.
     """
-    if siril_options is None:
-        siril_options = SirilDenoiseOptions()
-    if graxpert_options is None:
-        graxpert_options = GraXpertDenoiseOptions()
+    if options is None:
+        options = DenoiseOptions()
 
     img_path = Path(image_path)
     if not img_path.exists():
@@ -300,10 +239,7 @@ def noise_reduction(
 
     noise_before = _measure_bgnoise(img_path.stem, working_dir)
 
-    if backend == "graxpert":
-        output_path = _run_graxpert_denoise(img_path, graxpert_options)
-    else:
-        output_path = _run_siril_denoise(img_path, working_dir, siril_options)
+    output_path, zero_pixels_pedestaled = _run_graxpert_denoise(img_path, options)
 
     noise_after = _measure_bgnoise(output_path.stem, working_dir)
 
@@ -312,9 +248,9 @@ def noise_reduction(
         reduction_pct = round((1.0 - noise_after / noise_before) * 100, 1)
 
     return {
-        "denoised_image_path": str(output_path),
-        "backend_used": backend,
-        "noise_before": noise_before,
-        "noise_after": noise_after,
-        "noise_reduction_pct": reduction_pct,
+        "denoised_image_path":    str(output_path),
+        "noise_before":           noise_before,
+        "noise_after":            noise_after,
+        "noise_reduction_pct":    reduction_pct,
+        "zero_pixels_pedestaled": zero_pixels_pedestaled,
     }

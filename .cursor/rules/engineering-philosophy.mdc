@@ -10,7 +10,9 @@ Build an agentic astrophotography pipeline that matches PixInsight-quality outpu
 using open source software. Every decision — package choice, algorithm, architecture —
 should be made with that bar in mind.
 
-When a human post-process raw image files to final stacked image, the process is not linear, it is iterative. The human uses many tools and each tool has many options. Which tools are used and which options are selected is never deterministic, it is situational. To be successful, the LLM agent will need access to all the same tools and options. The output of tools will be data that the LLM can reason over to decide on the next step to take, just as a human would do.
+## Motivation
+
+When a human post-process raw image files to a final stacked image, the process is not linear, it is iterative. The human uses many tools available via a diversity of software and APIs and each tool has many options to leverage. Which tools are used and which parameters are selected is not deterministic, it is situational. Even though there are certain tasks that must be executed, and in a particular order, even those task themselves require a data driven selection of parameters to yield optimal results. Humans also have tools available to them that allow them to make data driven decisions. The process is highly iterative. Try a particular set of parameters -> observe results through data -> iterate until deemed satisfactory -> move on to the next task and repeat the cycle. At times a backtrack is needed and an entire sequence of task must be repeated to yield the expected results. This paradigm can transfer to an agentic framework. If all the same tools are avaiable, with all the same parameters exposed, with a data driven input and output that the LLM agent can reason to decide on next steps. The iterative task of astrophotography processing can be taken on by the agent. Critically, although data is the primary factor to be used in decision making, subjectivity is a part of the process. A human will observe the effects of different parameters on tools and decide on a path forward based on the effect on the image. In these cases HITL will be employed. Tools that provide a chance for subjective reasoning will trigger HITL, so a human in the loop can compare options and discuss with the agent via chat which set of parameters that a tool exposes provides the best results based on opinion. HITL will be a forced default of tools where subjectivity has it's place, and through this moments, tools can be improved, and HITL removed where appropriate. The tension between automation, LLM data driven reasoning, and HITL subjectivity has the opportunity to not only make the astrophotography image processing workflow more efficient, but to produce stunning results.
 
 ## Gold Standard Over Convenient
 
@@ -23,7 +25,7 @@ the most complete, accurate data possible. Richer data = better agent.
 ## When Evaluating New Packages
 
 1. Check GitHub for recent commit activity (within last 6 months)
-2. Check if it's what professional tools use (Lightroom, PixInsight, etc.)
+2. Although this agentic framework will only use open source, decisions made should be motivated by professional software soluations (Lightroom, PixInsight, etc.)
 3. Prefer battle-tested C/C++ libraries wrapped in Python over pure-Python alternatives
 4. Check PyPI download count as a proxy for community trust
 5. License matters for open-source intent — note GPL vs MIT for future publication

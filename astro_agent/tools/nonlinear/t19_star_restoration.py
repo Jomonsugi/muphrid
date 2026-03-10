@@ -30,7 +30,7 @@ from pathlib import Path
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from astro_agent.tools._siril import run_siril_script
+from astro_agent.tools._siril import fits_nlayers, run_siril_script
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -126,6 +126,17 @@ def star_restoration(
     starless_path = Path(starless_image_path)
     if not starless_path.exists():
         raise FileNotFoundError(f"Starless image not found: {starless_image_path}")
+
+    if fits_nlayers(starless_path) < 3:
+        raise ValueError(
+            f"star_restoration requires a color (3-channel RGB) starless image, but "
+            f"{starless_path.name} is monochrome. "
+            "Recombining a mono starless with a color star mask produces a mono result "
+            "with no color information. "
+            "Trace back to T15 star_removal — StarNet must output color. "
+            "If T15 raised no error, check whether T16–T18 inadvertently converted "
+            "the image to mono."
+        )
 
     if mode == "blend" and blend_options is None:
         raise ValueError("blend_options (including star_mask_path) is required for mode=blend.")

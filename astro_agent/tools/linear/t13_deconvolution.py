@@ -38,18 +38,20 @@ from pathlib import Path
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from astro_agent.tools._siril import run_siril_script
+from astro_agent.tools._siril import fits_has_nan, run_siril_script
 
 
 # ── Pydantic input schemas ────────────────────────────────────────────────────
 
 class RLOptions(BaseModel):
     iterations: int = Field(
-        default=10,
+        default=5,
         description=(
             "Number of Richardson-Lucy iterations. "
-            "Start conservative: 5–10 for first pass. 10–20 for modest sharpening. "
-            "Never exceed 30 — diminishing returns and ringing risk."
+            "Default 5 is the conservative first pass for any SNR level. "
+            "Increase to 10–20 only after running analyze_image and confirming "
+            "SNR > 50 and noise_after is acceptable. "
+            "Never exceed 30 — diminishing returns and ringing risk amplify noise."
         ),
     )
     regularization: str = Field(
@@ -454,6 +456,20 @@ def deconvolution(
         output_path = Path(working_dir) / f"{output_stem}.fits"
     if not output_path.exists():
         raise FileNotFoundError(f"Deconvolution did not produce: {output_path}")
+
+    if fits_has_nan(output_path):
+        raise RuntimeError(
+            f"Deconvolution produced NaN/Inf values in {output_path.name}. "
+            "The Richardson-Lucy algorithm diverged — the image is corrupted and "
+            "must not be used downstream (stretch will convert NaN → 1.0, "
+            "producing an all-white image). "
+            "To fix:\n"
+            "  1. Reduce iterations (e.g., iterations=3-5 instead of current value).\n"
+            "  2. Lower alpha to increase regularization strength (e.g., alpha=500-1000).\n"
+            "  3. Switch method='wiener' — more numerically stable on noisy images.\n"
+            "  4. Try psf_source='blind' if the manual PSF does not match the actual blur.\n"
+            "  5. Skip deconvolution entirely if SNR is low (snr_estimate < 50)."
+        )
 
     psf_fwhm_used = _parse_psf_fwhm(result.stdout)
 
