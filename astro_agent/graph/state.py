@@ -58,12 +58,13 @@ class MasterPaths(TypedDict):
 
 
 class PathState(TypedDict):
-    current_image:  str | None   # FITS path of the working image — always current
-    latest_preview: str | None   # JPG path of the most recent preview — HITL only
-    starless_image: str | None   # set after star_removal (T15)
-    star_mask:      str | None   # set after star_removal (T15)
-    masters:        MasterPaths
-    variants:       dict[str, str]  # A/B stretch variants: {"gentle": path, ...}
+    current_image:      str | None   # FITS path of the working image — always current
+    latest_preview:     str | None   # JPG path of the most recent preview — HITL only
+    starless_image:     str | None   # set after star_removal (T15)
+    star_mask:          str | None   # set after star_removal (T15)
+    masters:            MasterPaths
+    pre_gradient_image: str | None   # snapshot before T09 — HITL before/after comparison
+    pre_decon_image:    str | None   # snapshot before T13 — HITL before/after comparison
 
 
 class Metadata(TypedDict):
@@ -250,20 +251,16 @@ class SessionContext(TypedDict):
 
 class HITLPayload(TypedDict):
     """
-    Stable contract between the graph (hitl_node) and any presenter
-    (cli_presenter, future Streamlit presenter, etc.).
+    Stable contract between hitl_check and any presenter (CLI, Streamlit, etc.).
 
-    hitl_node calls interrupt(payload: HITLPayload) and never does I/O.
+    hitl_check calls interrupt(HITLPayload) and never does I/O.
     The caller reads this payload and handles all presentation.
     """
-    trigger:        str           # e.g. "stretch_selection", "auto_deconvolution"
-    checkpoint:     str           # which tool or phase triggered this interrupt
-    question:       str           # question to present to the user
-    options:        list[str] | None  # None → free-text response only
-    allow_free_text: bool         # True allows typed response alongside options
-    preview_paths:  list[str]     # absolute JPG paths (one per image to display)
-    preview_labels: list[str]     # label for each preview (same length as paths)
-    context:        str           # metric summary or other text context
+    type:           str           # "data_review" or "image_review" (from hitl_config.toml)
+    title:          str           # human-readable title (from hitl_config.toml)
+    tool_name:      str           # the tool that triggered this checkpoint
+    images:         list[str]     # image paths produced by the tool (for image_review)
+    context:        list          # recent messages for continuity (last N)
 
 
 # ── Top-level graph state ──────────────────────────────────────────────────────
@@ -289,6 +286,12 @@ class AstroState(TypedDict):
     # Accumulated HITL preferences — written by hitl_node, read by planner
     user_feedback: dict
 
+    # Active HITL conversation flag — set by hitl_check when interrupt fires,
+    # cleared on approval. While True, the agent routes back to hitl_check
+    # (not phase_advance) even when it responds without tool calls, so the
+    # human can chat freely before approving or requesting revision.
+    active_hitl: bool
+
 
 # ── Factory ────────────────────────────────────────────────────────────────────
 
@@ -313,7 +316,8 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             starless_image=None,
             star_mask=None,
             masters=MasterPaths(bias=None, dark=None, flat=None),
-            variants={},
+            pre_gradient_image=None,
+            pre_decon_image=None,
         ),
         metadata=Metadata(
             is_linear=True,

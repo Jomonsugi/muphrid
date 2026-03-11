@@ -189,12 +189,11 @@ class SirilStackInput(BaseModel):
         ),
     )
 
-    # ── HITL ──────────────────────────────────────────────────────────────
     total_frames_hint: int | None = Field(
         default=None,
         description=(
             "Total registered frames from T05 summary.frame_count. "
-            "Used to compute acceptance rate for HITL."
+            "Used to compute acceptance rate."
         ),
     )
 
@@ -336,10 +335,6 @@ def siril_stack(
       - 10-30 frames: rejection='sigma_clipping', sigma=[3.0, 3.0]
       - > 30 frames:  rejection='sigma_clipping', sigma=[2.5, 2.5] (can be tighter)
       - > 100 frames: consider fast_norm=True for speed
-
-    HITL triggers when:
-      - Fewer than 2 frames accepted
-      - Less than 15% acceptance rate with ≥ 5 total frames
     """
     if rejection_sigma is None:
         rejection_sigma = [3.0, 3.0]
@@ -429,32 +424,7 @@ def siril_stack(
         "background_noise":    result.parsed.get("background_noise"),
     }
 
-    # ── HITL ──────────────────────────────────────────────────────────────
-    hitl_reasons: list[str] = []
-
-    if n_accepted < 2:
-        hitl_reasons.append(
-            f"Only {n_accepted} light frame(s) accepted for stacking. "
-            f"A minimum of 2 is needed for meaningful integration."
-        )
-    elif total_frames >= 5 and acceptance_rate < 0.15:
-        hitl_reasons.append(
-            f"Only {n_accepted}/{total_frames} frames accepted ({acceptance_rate:.0%}). "
-            f"More than 85% of light frames were rejected."
-        )
-
-    hitl_required = len(hitl_reasons) > 0
-    hitl_context = ""
-    if hitl_required:
-        hitl_context = (
-            "Light frame stacking quality check failed.\n"
-            + "\n".join(f"  - {r}" for r in hitl_reasons)
-            + f"\nStack metrics: {stack_metrics}"
-        )
-
     return {
         "master_light_path": str(master_path),
         "stack_metrics":     stack_metrics,
-        "hitl_required":     hitl_required,
-        "hitl_context":      hitl_context,
     }

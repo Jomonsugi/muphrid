@@ -8,11 +8,10 @@ visible by applying a non-linear transfer function.
 Backend: Siril CLI — GHS (Generalized Hyperbolic Stretch), arcsinh, or
 autostretch. GHS offers the most control and is preferred.
 
-This tool is a hard HITL checkpoint. The agent should call it 2–3 times with
-different stretch intensities to produce variants (e.g., gentle/moderate/
-aggressive), present them to the user, and proceed with the selected version.
-After stretch, metadata.is_linear MUST be set to False in state — subsequent
-tools must not assume linear data.
+Produce multiple variants using distinct output_suffix values (e.g. 'gentle',
+'moderate', 'aggressive') so the best result can be selected. After stretch,
+the image is non-linear — subsequent linear tools (T09–T13) must not be
+applied.
 
 Key metrics to monitor (from analyze_image after stretch):
   - clipped_shadows_pct < 0.5% — preserve faint nebulosity
@@ -269,8 +268,8 @@ def stretch_image(
     ALL subsequent tools (T15–T19, T25–T27) must only be called post-stretch.
     ALL linear tools (T09–T13) must NOT be called after stretch.
 
-    To produce stretch variants for HITL comparison, call this tool multiple
-    times with different parameters, using distinct output_suffix values:
+    Call this tool multiple times with different parameters to produce variants
+    for comparison, using distinct output_suffix values:
       - 'gentle': ghs_options.stretch_amount=1.5, highlight_protection=0.98
       - 'moderate': ghs_options.stretch_amount=2.5 (default)
       - 'aggressive': ghs_options.stretch_amount=4.0, highlight_protection=0.92

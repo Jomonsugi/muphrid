@@ -9,9 +9,6 @@ Backend: GraXpert AI (direct subprocess). Handles complex, irregular gradients
 without manual sample placement. Confirmed working: v3.0.2, CoreML acceleration,
 model bge-ai-models/1.0.1.
 
-HITL: requires_visual_review=True by default. Gradient removal can introduce
-subtle artefacts near extended emission nebulae or at image edges. Visual
-inspection is mandatory in V1 before releasing this checkpoint to automation.
 """
 
 from __future__ import annotations
@@ -183,9 +180,7 @@ def remove_gradient(
     Always run analyze_image before and after to measure the change in
     background_flatness_score and confirm the gradient was removed without
     over-correcting signal near bright nebulae or at image edges.
-
-    HITL visual review is triggered automatically after this tool (V1).
-    """
+"""
     if graxpert_options is None:
         graxpert_options = GraXpertBGEOptions()
 

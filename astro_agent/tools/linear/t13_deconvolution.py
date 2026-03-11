@@ -27,7 +27,6 @@ CRITICAL CONSTRAINTS:
   - Total Variation regularization (-tv) is the default and safest choice.
   - Always run analyze_image after to verify improvement.
 
-HITL: requires_visual_review=True by default.
 """
 
 from __future__ import annotations
@@ -401,9 +400,7 @@ def deconvolution(
 
     PSF can be saved (-savepsf via psf_config.save_psf) for reuse across
     multiple deconvolution attempts with different rl/wiener parameters.
-
-    HITL visual review is triggered automatically (V1).
-    """
+"""
     if blind_psf_options is None:
         blind_psf_options = BlindPsfOptions()
     if stars_psf_options is None:

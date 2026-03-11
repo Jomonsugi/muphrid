@@ -17,10 +17,6 @@ Format pipeline:
     2. StarNet2: TIF in → starless TIF + mask TIF (both color if input is color)
     3. Siril: load TIF → save FITS (×2, for starless + mask)
 
-HITL: requires_visual_review=True by default.
-Star removal quality is a known subjective checkpoint — the threshold between
-"stars cleanly removed" and "nebula structure damaged" requires visual judgment.
-
 Input requirements:
   - Must be a stretched (non-linear) image (post T14).
   - Image should be color (RGB). Mono support is available but unusual.
@@ -135,7 +131,6 @@ def star_removal(
     False otherwise. Never leave this to chance — wrong choice either wastes
     time (False on tight stars → incomplete removal) or doubles runtime needlessly.
 
-    HITL visual review is triggered automatically after this tool (V1).
     Check: nebula structure intact, no dark halos around removed stars.
     """
     img_path = Path(image_path)

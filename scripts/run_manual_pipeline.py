@@ -140,8 +140,6 @@ def main() -> int:
         input_files=files.get("biases", []),
     )
     master_bias = r02_bias["master_path"]
-    if r02_bias["diagnostics"]["hitl_required"]:
-        print(f"  [T02 bias] HITL: {r02_bias['diagnostics']['hitl_context']}")
 
     r02_dark = _step(
         "T02 dark",
@@ -151,8 +149,6 @@ def main() -> int:
         input_files=files.get("darks", []),
     )
     master_dark = r02_dark["master_path"]
-    if r02_dark["diagnostics"]["hitl_required"]:
-        print(f"  [T02 dark] HITL: {r02_dark['diagnostics']['hitl_context']}")
 
     r02_flat = _step(
         "T02 flat",
@@ -163,8 +159,6 @@ def main() -> int:
         master_bias_path=master_bias,
     )
     master_flat = r02_flat["master_path"]
-    if r02_flat["diagnostics"]["hitl_required"]:
-        print(f"  [T02 flat] HITL: {r02_flat['diagnostics']['hitl_context']}")
 
     # -------------------------------------------------------------------------
     # T02b — Convert raw lights to FITS sequence (required before T03)
@@ -250,8 +244,6 @@ def main() -> int:
     accepted = r06["accepted_frames"]
     print(f"       Accepted: {len(accepted)}/{summary.get('frame_count', '?')} "
           f"({r06.get('acceptance_rate', 0):.0%})")
-    if r06.get("hitl_required"):
-        print(f"       HITL: {r06['hitl_context']}")
     if r06.get("rejection_reasons"):
         for frame_key, reason in r06["rejection_reasons"].items():
             print(f"       Rejected frame {frame_key}: {reason}")
@@ -276,8 +268,6 @@ def main() -> int:
         total_frames_hint=summary.get("frame_count"),
     )
     current_image = r07["master_light_path"]
-    if r07.get("hitl_required"):
-        print(f"       HITL: {r07['hitl_context']}")
 
     # -------------------------------------------------------------------------
     # T08 — Crop

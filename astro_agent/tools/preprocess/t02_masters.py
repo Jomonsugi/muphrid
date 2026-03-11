@@ -16,8 +16,8 @@ Rejection type codes for 'rej' (mean) stacking:
     s = sigma clipping, w = winsorized, n = none, p = percentile,
     m = median, l = linear-fit, g = generalized ESD, a = k-MAD
 
-Sensor-relative HITL thresholds:
-    HITL thresholds for flat and bias quality checks are computed from sensor
+Sensor-relative diagnostic thresholds:
+    Thresholds for flat and bias quality checks are computed from sensor
     black_level and white_level (passed via acquisition_meta from T01). This
     makes the checks correct for any camera — 14-bit mirrorless, 12-bit DSLR,
     16-bit dedicated astro cam — rather than assuming 16-bit full range.
@@ -90,7 +90,7 @@ class BuildMastersInput(BaseModel):
         default=None,
         description=(
             "AcquisitionMeta dict from T01 ingest_dataset. When provided, the tool "
-            "reads black_level and white_level to compute sensor-relative HITL "
+            "reads black_level and white_level to compute sensor-relative diagnostic "
             "thresholds for flat quality. If omitted, EXIF is read from the first "
             "input file. Pass dataset['acquisition_meta'] from T01's output."
         ),
@@ -155,7 +155,7 @@ def _resolve_sensor_levels(
     Priority:
       1. acquisition_meta (from T01 — already paid for, most reliable)
       2. EXIF from first input file (fallback if T01 wasn't run / not passed)
-      3. Conservative 16-bit defaults (last resort — never triggers false HITL)
+      3. Conservative 16-bit defaults (last resort)
     """
     if acquisition_meta:
         black = acquisition_meta.get("black_level")
@@ -212,25 +212,25 @@ def _compute_diagnostics(
     seq_path: Path | None = None,
 ) -> dict:
     """
-    Compute quality flags, warnings, and HITL trigger from the master FITS.
+    Compute quality flags and warnings from the master FITS.
 
-    HITL fires only for clearly broken situations — wrong frame type, impossible
-    signal levels, or batches too small to stack. Suboptimal-but-usable situations
-    are reported as warnings for the agent to reason about.
+    Diagnostic checks fire only for clearly broken situations — wrong frame type,
+    impossible signal levels, or batches too small to stack. Suboptimal-but-usable
+    situations are reported as warnings for the agent to reason about.
 
-    HITL thresholds are sensor-relative so they are correct for any camera.
+    Thresholds are sensor-relative so they are correct for any camera.
     """
     quality_flags: dict = {"frame_count": frame_count}
     warnings: list[str] = []
-    hitl_reasons: list[str] = []
+    quality_issues: list[str] = []
 
     black, white = _resolve_sensor_levels(acquisition_meta, input_files or [])
     quality_flags["sensor_black"] = black
     quality_flags["sensor_white"] = white
 
-    # ── Frame count: fire HITL only if clearly insufficient ───────────────
+    # ── Frame count: warn if clearly insufficient ─────────────────────────
     if frame_count < 2:
-        hitl_reasons.append(
+        quality_issues.append(
             f"Only {frame_count} {file_type} frame(s) provided. A minimum of 2 is "
             f"required for any meaningful stacking or noise averaging. "
             f"Capture more {file_type} frames before proceeding."
@@ -280,7 +280,7 @@ def _compute_diagnostics(
     rejection_rate = quality_flags.get("frames_rejected", 0) / max(frame_count, 1)
     quality_flags["rejection_rate"] = rejection_rate
 
-    # ── Type-specific HITL checks ─────────────────────────────────────────
+    # ── Type-specific quality checks ──────────────────────────────────────
 
     if file_type == "flat":
         flat_med = quality_flags.get("flat_median_normalized", 0.0)
@@ -291,7 +291,7 @@ def _compute_diagnostics(
 
         if flat_med < norm_min or flat_med > norm_max:
             fill_pct_approx = (flat_med * 65535) / max(white - black, 1) * 100
-            hitl_reasons.append(
+            quality_issues.append(
                 f"Flat median ({flat_med:.3f} Siril-norm, ~{fill_pct_approx:.0f}% fill) "
                 f"outside sensor-relative safe range [{norm_min:.3f}, {norm_max:.3f}] "
                 f"(= 30–55% of usable ADU range: black={black}, white={white}). "
@@ -303,7 +303,7 @@ def _compute_diagnostics(
                 with fits.open(master_bias_path) as bhdul:
                     bias_med = float(np.median(bhdul[0].data.astype(np.float64)))
                     if flat_med > 0 and flat_med < 2 * bias_med:
-                        hitl_reasons.append(
+                        quality_issues.append(
                             f"Flat median ({flat_med:.3f}) < 2× bias median ({bias_med:.3f}) "
                             f"— flat signal too weak for reliable calibration."
                         )
@@ -317,7 +317,7 @@ def _compute_diagnostics(
         sensor_bias_threshold = (black + 0.05 * (white - black)) / 65535.0
         quality_flags["bias_threshold"] = round(sensor_bias_threshold, 5)
         if bias_mean > sensor_bias_threshold:
-            hitl_reasons.append(
+            quality_issues.append(
                 f"Bias mean ({bias_mean:.5f}) exceeds sensor-relative threshold "
                 f"({sensor_bias_threshold:.5f} = black_level + 5% of usable range). "
                 f"Possible dark or flat mislabeled as bias."
@@ -332,7 +332,7 @@ def _compute_diagnostics(
                 sat_threshold_adu = 0.85 * white
                 saturated_count = sum(1 for m in per_frame if m > sat_threshold_adu)
                 if saturated_count == len(per_frame):
-                    hitl_reasons.append(
+                    quality_issues.append(
                         f"All {len(per_frame)} bias frames have median ADU > 85% of sensor "
                         f"white level ({white}). These are not bias frames — they are "
                         f"saturated. Check that the bias folder contains minimum-exposure "
@@ -353,7 +353,7 @@ def _compute_diagnostics(
         dark_max_threshold = (black + 0.70 * (white - black)) / 65535.0
         quality_flags["dark_max_threshold"] = round(dark_max_threshold, 5)
         if dark_mean > dark_max_threshold:
-            hitl_reasons.append(
+            quality_issues.append(
                 f"Dark master mean ({dark_mean:.5f}) exceeds expected maximum "
                 f"({dark_max_threshold:.5f} = black_level + 70% of usable range). "
                 f"Dark frames appear too bright — possible flat or light mislabeled as dark."
@@ -367,7 +367,7 @@ def _compute_diagnostics(
                     quality_flags["bias_mean_for_dark_check"] = bias_mean_norm
                     # Dark master (non-bias-subtracted) must have mean ≥ bias mean
                     if dark_mean < bias_mean_norm * 0.95:
-                        hitl_reasons.append(
+                        quality_issues.append(
                             f"Dark master mean ({dark_mean:.5f}) is lower than bias mean "
                             f"({bias_mean_norm:.5f}). Dark frames cannot have less signal "
                             f"than bias — possible accidental calibration or wrong folder."
@@ -377,27 +377,16 @@ def _compute_diagnostics(
 
     # ── Universal: high rejection rate ────────────────────────────────────
     if rejection_rate > 0.40:
-        hitl_reasons.append(
+        quality_issues.append(
             f"Rejection rate ({rejection_rate:.0%}) exceeds 40% — "
             f"majority of frames are outliers; possible capture issue."
         )
 
-    warnings.extend(hitl_reasons)
-    hitl_required = len(hitl_reasons) > 0
-
-    hitl_context = ""
-    if hitl_required:
-        hitl_context = (
-            f"Calibration master ({file_type}) quality check failed.\n"
-            + "\n".join(f"  - {r}" for r in hitl_reasons)
-            + f"\nQuality flags: {quality_flags}"
-        )
+    warnings.extend(quality_issues)
 
     return {
         "quality_flags": quality_flags,
         "warnings": warnings,
-        "hitl_required": hitl_required,
-        "hitl_context": hitl_context,
     }
 
 
@@ -419,11 +408,11 @@ def build_masters(
 
     Call in order: bias first, then dark (optionally with master_bias),
     then flat (with master_bias). Returns master_path, frame statistics,
-    and diagnostics including HITL trigger flags for critical quality issues.
+    and diagnostics including quality flags and warnings.
 
     Pass acquisition_meta=dataset['acquisition_meta'] from T01's output to
-    enable sensor-relative HITL thresholds. Without it, T02 reads EXIF from
-    the first input file as a fallback.
+    enable sensor-relative diagnostic thresholds. Without it, T02 reads EXIF
+    from the first input file as a fallback.
     """
     if rejection_sigma is None:
         rejection_sigma = [3.0, 3.0]

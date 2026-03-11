@@ -9,9 +9,8 @@ Two modes:
       had poor frame overlap — note in the processing report.
 
   manual: crops to explicit (x, y, w, h) pixel coordinates provided by the user.
-      Use for compositional reframing or removing a known noisy edge. This mode
-      is a HITL operation — the agent must present the image to the user and
-      obtain coordinates before calling. Coordinates follow Siril convention:
+      Use for compositional reframing or removing a known noisy edge. Coordinates
+      follow Siril convention:
       x/y = top-left corner in pixels, w/h = width/height in pixels.
 
 Siril command: crop <x> <y> <w> <h>
@@ -48,9 +47,7 @@ class AutoCropInput(BaseModel):
             "auto: detect and remove black registration borders automatically. "
             "Run after siril_stack; no user input needed.\n"
             "manual: crop to explicit coordinates provided by the user. "
-            "HITL required — present the image to the user and obtain (x, y, w, h) "
-            "before calling. Never call manual mode without prior user confirmation "
-            "of the crop region."
+            "Obtain (x, y, w, h) before calling."
         ),
     )
     threshold: float = Field(
@@ -157,10 +154,9 @@ def auto_crop(
     If pixels_removed_pct > 15, check registration quality — poor overlap
     indicates frames may need to be re-registered with looser framing settings.
 
-    Manual mode: executes a crop the user has already decided on. HITL is
-    required before calling this mode — present the image, get coordinates
-    from the user, then call with mode='manual' and the confirmed x/y/w/h.
-    Do not infer or guess crop coordinates autonomously.
+    Manual mode: executes a crop to the specified coordinates. Call with
+    mode='manual' and the confirmed x/y/w/h. Do not infer or guess crop
+    coordinates autonomously.
     """
     img_path = Path(image_path)
     if not img_path.exists():

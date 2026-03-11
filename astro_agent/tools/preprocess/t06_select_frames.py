@@ -19,8 +19,6 @@ to cut.  The agent has the same levers:
   - min_quality: Siril's composite quality metric (0-1), higher is better
 
 Safety: never returns an empty accepted_frames list.
-HITL: triggers when >50% of frames are rejected — a human would want to
-review the data and thresholds before proceeding.
 """
 
 from __future__ import annotations
@@ -198,7 +196,6 @@ def select_frames(
          - Variable seeing (seeing_stability > 0.3): max_fwhm_sigma=1.5 (be selective)
          - Tracking issues (tracking_quality < 0.7): raise min_roundness to 0.6
          - Dense field: lower min_star_count based on median_star_count
-      4. If >50% rejected, review data before proceeding (HITL triggered)
 
     Never returns an empty accepted_frames list — if all frames fail every
     criterion, all are returned with a warning.
@@ -222,20 +219,11 @@ def select_frames(
     acceptance_rate = len(accepted) / n_total if n_total > 0 else 1.0
 
     warnings: list[str] = []
-    hitl_required = False
-    hitl_context = ""
 
     if acceptance_rate < 0.5:
-        hitl_required = True
-        hitl_context = (
-            f"Frame selection rejected {len(rejected_list)}/{n_total} frames "
-            f"({1 - acceptance_rate:.0%}).  More than half the data is being discarded. "
-            f"Review the rejection reasons and consider loosening thresholds, or "
-            f"inspect the worst frames for systematic issues (tracking, clouds, focus)."
-        )
         warnings.append(
             f"Acceptance rate is {acceptance_rate:.0%} ({len(accepted)}/{n_total} frames). "
-            "More than 50% rejected — HITL triggered."
+            "More than 50% rejected — review rejection reasons and consider loosening thresholds."
         )
 
     if len(accepted) < 3 and n_total >= 3:
@@ -249,7 +237,5 @@ def select_frames(
         "rejected_frames":   rejected_list,
         "rejection_reasons": rejection_reasons,
         "acceptance_rate":   round(acceptance_rate, 4),
-        "hitl_required":     hitl_required,
-        "hitl_context":      hitl_context,
         "warnings":          warnings,
     }

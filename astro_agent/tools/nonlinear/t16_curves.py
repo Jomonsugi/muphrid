@@ -21,7 +21,6 @@ from pydantic import BaseModel, Field
 
 from astro_agent.tools._siril import run_siril_script
 
-
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class MTFOptions(BaseModel):

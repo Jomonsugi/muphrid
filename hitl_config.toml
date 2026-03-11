@@ -1,0 +1,92 @@
+# HITL (Human-in-the-Loop) Configuration
+#
+# Defines which pipeline steps pause for human review.
+#
+# autonomous = true    skip all HITL interrupts for unattended runs
+# enabled = false      skip HITL for a specific tool only
+#
+# type = "data_review"    show metrics/stats, no image display required
+# type = "image_review"   show current image(s), chat-based feedback
+#
+# The agent decides what to try and what parameters to use based on the
+# current image state, conversation history, and long-term memory.
+# If the human asks for comparison options ("show me two more"), the agent
+# produces them and the UI displays them — this is not enforced here.
+
+autonomous = false
+vlm_enabled = false   # when true, inject preview image into agent context during HITL feedback
+
+# ── Preprocessing ──────────────────────────────────────────────────────────────
+
+[hitl.T02_masters]
+enabled = true
+type    = "data_review"
+title   = "T02 Master Frame Diagnostics"
+
+[hitl.T06_T07_stack]
+enabled = true
+type    = "data_review"
+title   = "T06/T07 Frame Selection and Stack Results"
+
+# ── Linear processing ──────────────────────────────────────────────────────────
+
+[hitl.T09_gradient]
+enabled = true
+type    = "image_review"
+title   = "T09 Gradient Removal"
+
+[hitl.T10_color]
+enabled = true
+type    = "data_review"
+title   = "T10 Color Calibration Results"
+
+[hitl.T12_denoise]
+enabled = true
+type    = "data_review"
+title   = "T12 Noise Reduction Results"
+
+[hitl.T13_decon]
+enabled = true
+type    = "image_review"
+title   = "T13 Deconvolution"
+
+# ── Stretch ────────────────────────────────────────────────────────────────────
+
+[hitl.T14_stretch]
+enabled = true
+type    = "image_review"
+title   = "T14 Stretch"
+
+# ── Non-linear processing ──────────────────────────────────────────────────────
+
+[hitl.T15_star_removal]
+enabled = true
+type    = "image_review"
+title   = "T15 Star Removal"
+
+[hitl.T16_curves]
+enabled = true
+type    = "image_review"
+title   = "T16 Curves"
+
+[hitl.T17_local_contrast]
+enabled = true
+type    = "image_review"
+title   = "T17 Local Contrast"
+
+[hitl.T18_saturation]
+enabled = true
+type    = "image_review"
+title   = "T18 Saturation"
+
+[hitl.T19_star_restoration]
+enabled = true
+type    = "image_review"
+title   = "T19 Star Restoration"
+
+# ── Multiscale sharpening ──────────────────────────────────────────────────────
+
+[hitl.T27_multiscale]
+enabled = true
+type    = "image_review"
+title   = "T27 Multiscale Sharpening"
