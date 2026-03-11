@@ -84,9 +84,10 @@ def remove_green_noise(
     """
     Remove systematic green cast from OSC/DSLR images using Siril SCNR.
 
-    Only apply to OSC/DSLR data (metadata.is_osc=True). Check green_excess
-    from analyze_image first — if it is near zero, skip this tool to avoid
-    introducing a magenta cast.
+    The Bayer/X-Trans CFA has 2× more green pixels than red or blue, which
+    causes a systematic green cast in the stacked image after demosaicing.
+    Only applicable to OSC/DSLR color data. If green_excess is near zero,
+    applying this tool may introduce a magenta cast.
 
     Protection type guide:
     - average_neutral: standard, reliable. Full green neutralization with no
@@ -98,9 +99,6 @@ def remove_green_noise(
       green [OIII] emission).
     - additive_mask: gentlest, accepts amount (0–1). Best for narrowband
       or targets where preserving subtle green tones matters.
-
-    Must be called in linear space, typically after color_calibrate (T10).
-    Run analyze_image after to confirm green_excess is reduced.
     """
     img_path = Path(image_path)
     if not img_path.exists():

@@ -227,7 +227,7 @@ def calibrate(
     bias, and flat vignetting are sensor-space properties that must be
     corrected before color interpolation.
 
-    Camera-specific settings (derive from T01 camera_model):
+    Camera-specific settings (derived from the camera model):
 
       Fujifilm X-Trans (X-T30, X-T4, X-S10, X-H2, etc.):
         is_cfa=True, debayer=True, fix_xtrans=True, equalize_cfa=True

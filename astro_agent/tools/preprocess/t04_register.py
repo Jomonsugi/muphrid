@@ -455,12 +455,8 @@ def siril_register(
     Register calibrated light frames using Siril star matching.
 
     Full registration pipeline: setfindstar (optional) → register → seqapplyreg.
-    Returns the registered sequence name, the calibrated sequence name (for T05
-    to parse registration data from), and registration summary metrics.
-
-    The most important output for frame selection is the per-frame data written
-    by Siril to the calibrated sequence's .seq file (R-lines). Use T05 with
-    calibrated_sequence to extract it.
+    Returns the registered sequence name, the calibrated sequence name, and
+    registration summary metrics.
 
     Key tuning levers when registration struggles:
       - findstar.sigma: lower to detect fainter stars

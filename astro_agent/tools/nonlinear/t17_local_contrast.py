@@ -209,21 +209,15 @@ def local_contrast_enhance(
     """
     Enhance local contrast and fine detail in nebulosity/galaxy structure.
 
-    Apply to the starless image only — doing this with stars present creates
-    halos around bright stars from CLAHE and ringing from wavelet sharpening.
-
     Method guidance:
     - wavelet: surgical control per spatial scale. Default layer_weights are all
       1.0 (passthrough — no effect). Set weights > 1.0 on fine layers to sharpen.
       Do NOT use on star fields or globular clusters — wavelet sharpening enhances
       star halos. Use unsharp or clahe for those targets instead.
-    - clahe: effective for revealing faint nebula structure but noisy. Always
-      apply after noise reduction (T12). Use clip_limit 1.5–2.0.
+    - clahe: effective for revealing faint nebula structure but amplifies noise.
+      Use clip_limit 1.5–2.0.
     - unsharp: simplest and gentlest. Good for star fields, mild enhancement,
       or as a first pass before more aggressive wavelet processing.
-
-    Run analyze_image before and after to confirm the detail improvement
-    without significant noise amplification.
     """
     if clahe_options is None:
         clahe_options = ClaheOptions()

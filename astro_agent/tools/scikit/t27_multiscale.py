@@ -354,17 +354,12 @@ def multiscale_process(
     wavelet+wrecons: sharpen scale 2 while suppressing scale 1 noise, leave
     large-scale structure untouched, and confine everything to a masked region.
 
-    Standard sharpening recipe (starless image, with nebula mask from T25):
-      scale 1: suppress        (remove noise before sharpening)
-      scale 2: sharpen 1.3     (fine filaments, PSF wings)
-      scale 3: sharpen 1.15    (shells, dust lane edges)
-      scale 4: passthrough
-      scale 5: passthrough
-
-    Standard noise reduction recipe (linear or post-stretch, no mask needed):
-      scale 1: denoise sigma=0.5
-      scale 2: denoise sigma=0.2
-      scale 3–5: passthrough
+    Per-scale operation reference:
+      scale 1: finest detail (2–4px, noise/grain)
+      scale 2: fine structure (4–8px, filaments, PSF wings)
+      scale 3: medium structure (8–16px, shells, dust lanes)
+      scale 4: coarse structure (16–32px, galaxy arms)
+      scale 5+: residual (large-scale background)
 
     Implementation note: PyWavelets has no 'b3' wavelet. The B3-spline à trous
     transform is implemented directly using scipy.ndimage.convolve1d with kernel

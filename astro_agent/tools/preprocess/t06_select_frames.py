@@ -183,19 +183,16 @@ def select_frames(
     criteria: dict | None = None,
 ) -> dict:
     """
-    Accept or reject frames based on per-frame registration metrics from T05.
+    Accept or reject frames based on per-frame registration metrics.
 
     Sigma-clipping on FWHM, wFWHM, roundness, star count, background, and
     quality.  Each threshold is independently tunable.
 
-    Recommended workflow:
-      1. Run T05 to get summary statistics
-      2. Review summary — median_fwhm, tracking_quality, sky_consistency
-      3. Set criteria based on the data:
-         - Small dataset (< 15 subs): max_fwhm_sigma=3.0 (preserve integration)
-         - Variable seeing (seeing_stability > 0.3): max_fwhm_sigma=1.5 (be selective)
-         - Tracking issues (tracking_quality < 0.7): raise min_roundness to 0.6
-         - Dense field: lower min_star_count based on median_star_count
+    Threshold guidance:
+      - Small dataset (< 15 subs): max_fwhm_sigma=3.0 (preserve integration)
+      - Variable seeing (seeing_stability > 0.3): max_fwhm_sigma=1.5 (be selective)
+      - Tracking issues (tracking_quality < 0.7): raise min_roundness to 0.6
+      - Dense field: lower min_star_count based on median_star_count
 
     Never returns an empty accepted_frames list — if all frames fail every
     criterion, all are returned with a warning.

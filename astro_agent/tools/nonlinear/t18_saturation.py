@@ -150,16 +150,11 @@ def saturation_adjust(
     ght_sat_options: GHTSatOptions | None = None,
 ) -> dict:
     """
-    Adjust color saturation of the starless non-linear image.
-
-    Apply to the starless image only — saturation on a star-containing image
-    causes rainbow fringing and color bloat around bright stars.
+    Adjust color saturation of the non-linear image.
 
     Emission nebula targeting:
     - For Hα (reds): method=hue_targeted, hue_target=0
     - For OIII (blue-green): method=hue_targeted, hue_target=3
-    - Multiple targeted passes (one per emission line) give better control
-      than one global boost.
 
     GHT saturation (ght_saturation) is recommended over global for images
     where the sky background is already marginally saturated — it targets

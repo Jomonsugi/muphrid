@@ -41,17 +41,13 @@ def resolve_target(target_name: str) -> dict:
     """
     Resolve an astronomical target name to RA/DEC coordinates via SIMBAD.
 
-    MANDATORY: Call this immediately after T01 ingest with the user-provided target
-    name. Store ra/dec and pass to color_calibrate (T10) as target_coords and to
-    plate_solve (T21) as approximate_coords. Plate solving will fail or be
-    unreliable without a position hint.
-
-    Returns ra/dec in decimal degrees (J2000).
+    Returns ra/dec in decimal degrees (J2000). The returned coordinates can
+    be passed as a position hint to plate solving operations; a position hint
+    significantly improves plate solve reliability and speed.
 
     Example:
         result = resolve_target("M42")
         # result["ra"] = 83.82, result["dec"] = -5.39
-        color_calibrate(..., target_coords={"ra": result["ra"], "dec": result["dec"]})
 
     If SIMBAD cannot resolve the name, try an alternative spelling before
     falling back to manual coordinates.

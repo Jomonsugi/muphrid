@@ -482,9 +482,10 @@ def color_calibrate(
     Performs background neutralization and photometric or spectrophotometric
     color calibration.
 
-    Plate solving runs internally first — requires focal_length_mm and
-    pixel_size_um. pixel_size_um resolves automatically from the camera model
-    lookup table when not explicitly provided.
+    Requires a plate-solved image. Plate solving is attempted internally if
+    WCS is not already present in the FITS header. Requires focal_length_mm
+    and pixel_size_um (resolved from equipment.toml or environment if not
+    explicitly provided).
 
     Method guidance:
       pcc  — reliable for all OSC/DSLR images, uses Gaia catalog by default.
@@ -504,9 +505,6 @@ def color_calibrate(
     Raises RuntimeError if pixel size cannot be resolved or plate solving fails.
     On plate solve failure, retry with adjusted platesolve_options (lower sigma,
     relax=True, explicit target_coords) or correct pixel_size_um / focal_length_mm.
-
-    Run analyze_image after to verify color_coefficients are physically
-    plausible (r, g, b all near 1.0 +/- 30%).
     """
     if spcc_options is None:
         spcc_options = SpccOptions()

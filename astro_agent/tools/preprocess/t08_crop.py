@@ -150,9 +150,7 @@ def auto_crop(
     Crop a FITS image, either automatically (border removal) or manually
     (user-specified coordinates).
 
-    Auto mode: run after siril_stack to remove black registration borders.
-    If pixels_removed_pct > 15, check registration quality — poor overlap
-    indicates frames may need to be re-registered with looser framing settings.
+    Auto mode: detects and removes black registration borders automatically.
 
     Manual mode: executes a crop to the specified coordinates. Call with
     mode='manual' and the confirmed x/y/w/h. Do not infer or guess crop

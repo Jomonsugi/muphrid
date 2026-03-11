@@ -166,9 +166,6 @@ def curves_adjust(
     """
     Fine-tune brightness, contrast, and per-channel tonal balance.
 
-    Apply to the starless image after stretch. Calling this on the full image
-    (with stars) will cause star bloat during any brightening pass.
-
     Method guidance:
     - mtf: simple and reliable. Set midtone < 0.5 to brighten, > 0.5 to darken.
       Use channels=R/G/B to correct residual color casts.
@@ -176,9 +173,7 @@ def curves_adjust(
       symmetry_point to the median of the region you want to enhance.
       Effective for boosting faint outer nebula without saturating bright core.
 
-    Run analyze_image before and after to measure the change in median_brightness
-    and contrast_ratio. Multiple passes with small adjustments are better than
-    one large adjustment.
+    Multiple passes with small adjustments are better than one large adjustment.
     """
     if mtf_options is None:
         mtf_options = MTFOptions()

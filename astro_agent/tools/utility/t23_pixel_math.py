@@ -189,12 +189,8 @@ def pixel_math(
     """
     General-purpose pixel math using Siril's PixelMath engine.
 
-    The primary use case in this pipeline is the masked-application pattern —
-    combining a globally-processed image with the original using a mask to
-    confine the effect to a tonal region:
-        "$processed$ * $mask$ + $original$ * (1 - $mask$)"
-
-    Other common uses:
+    Common uses:
+    - Masked application: "$processed$ * $mask$ + $original$ * (1 - $mask$)"
     - Weighted star recombination: "$starless$ + $starmask$ * 0.8"
     - Channel extraction: "$image$[R]" (where Siril channels are indexed)
     - HDR blending: "$bright$ * 0.3 + "$mid$ * 0.7"
@@ -203,7 +199,7 @@ def pixel_math(
     The result image is saved to working_dir/{output_stem}.fit.
 
     Validate expression syntax before calling — the agent should check that
-    all $variable$ names correspond to known pipeline outputs.
+    all $variable$ names correspond to known image files.
     """
     _stems, expression, auto_broadcast = _validate_and_broadcast(expression, working_dir)
 

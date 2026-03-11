@@ -88,10 +88,13 @@ def process(
 
         # T01 ingest runs first to discover the dataset
         typer.echo(f"Ingesting dataset from: {directory}")
-        ingest_result = ingest_dataset.invoke({"directory": directory})
+        ingest_result = ingest_dataset.invoke({"root_directory": directory})
+
+        for warning in ingest_result.get("warnings", []):
+            typer.echo(f"Warning: {warning}", err=True)
 
         initial_state = make_empty_state(
-            dataset=ingest_result,
+            dataset=ingest_result["dataset"],
             session=session,
         )
 

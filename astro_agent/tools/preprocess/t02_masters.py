@@ -406,13 +406,8 @@ def build_masters(
     """
     Stack calibration frames (bias/dark/flat) into a master calibration frame.
 
-    Call in order: bias first, then dark (optionally with master_bias),
-    then flat (with master_bias). Returns master_path, frame statistics,
-    and diagnostics including quality flags and warnings.
-
-    Pass acquisition_meta=dataset['acquisition_meta'] from T01's output to
-    enable sensor-relative diagnostic thresholds. Without it, T02 reads EXIF
-    from the first input file as a fallback.
+    Returns master_path, frame statistics, and diagnostics including quality
+    flags and warnings.
     """
     if rejection_sigma is None:
         rejection_sigma = [3.0, 3.0]

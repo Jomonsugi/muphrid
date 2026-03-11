@@ -324,7 +324,7 @@ def siril_stack(
     total_frames_hint: int | None = None,
 ) -> dict:
     """
-    Stack accepted registered frames into a master light FITS.
+    Stack registered frames into a master light FITS.
 
     Uses Siril select/unselect to include only accepted_frames, then runs
     the stack command with full control over rejection, normalization,

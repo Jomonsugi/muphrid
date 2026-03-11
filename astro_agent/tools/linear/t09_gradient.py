@@ -176,10 +176,6 @@ def remove_gradient(
     Correction type guidance:
     - Subtraction (default): additive gradients from light pollution or sky glow.
     - Division: multiplicative gradients from residual vignetting after flats.
-
-    Always run analyze_image before and after to measure the change in
-    background_flatness_score and confirm the gradient was removed without
-    over-correcting signal near bright nebulae or at image edges.
 """
     if graxpert_options is None:
         graxpert_options = GraXpertBGEOptions()

@@ -219,16 +219,16 @@ def noise_reduction(
     """
     AI-based noise reduction on the linear FITS image using GraXpert.
 
-    Applied before stretching (T14) — denoising in linear space is the gold
-    standard. Noise statistics are Gaussian here and the ML model has the most
-    information to work with. Denoising after stretch amplifies shadow noise
-    first and makes structure recovery harder.
+    Denoising in linear space is the gold standard: noise statistics are
+    approximately Gaussian after stacking, and the ML model has the most
+    information to work with. Noise reduced here is not amplified by the
+    stretch transformation.
 
     Tune strength based on SNR: start at 0.5, lower for high-SNR images with
-    fine structure, raise for short-exposure or high-ISO captures. The
-    noise_before / noise_after / noise_reduction_pct in the return dict give
-    the agent quantitative feedback to assess whether to re-run with different
-    strength.
+    fine structure, raise for short-exposure or high-ISO captures.
+
+    Returns noise_before, noise_after, and noise_reduction_pct for quantitative
+    assessment of the denoising result.
     """
     if options is None:
         options = DenoiseOptions()

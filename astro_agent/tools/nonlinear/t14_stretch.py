@@ -264,25 +264,16 @@ def stretch_image(
     """
     Apply a non-linear stretch to the linear FITS image.
 
-    This is THE CROSSING — after this tool, the image is non-linear.
-    ALL subsequent tools (T15–T19, T25–T27) must only be called post-stretch.
-    ALL linear tools (T09–T13) must NOT be called after stretch.
-
-    Call this tool multiple times with different parameters to produce variants
-    for comparison, using distinct output_suffix values:
-      - 'gentle': ghs_options.stretch_amount=1.5, highlight_protection=0.98
-      - 'moderate': ghs_options.stretch_amount=2.5 (default)
-      - 'aggressive': ghs_options.stretch_amount=4.0, highlight_protection=0.92
+    Transforms linear (un-stretched) data into perceptual brightness space,
+    making faint signal visible. Use distinct output_suffix values (e.g.
+    'gentle', 'moderate', 'aggressive') to produce multiple variants for
+    comparison without overwriting each other.
 
     Method guidance:
     - ghs: best control, recommended. Use highlight_protection=0.92-0.98 to
       prevent star core saturation.
     - autostretch: reliable fallback, useful for a quick first look.
     - asinh: good for smooth shadow lifting without highlight crushing.
-
-    After stretching, always run analyze_image and check:
-    - clipped_shadows_pct < 0.5% (faint nebulosity preserved)
-    - clipped_highlights_pct < 0.1% (star cores not burned)
     """
     if asinh_options is None:
         asinh_options = AsinhOptions()

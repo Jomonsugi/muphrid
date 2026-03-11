@@ -267,17 +267,9 @@ def plate_solve(
     Astrometric plate solving — determines celestial coordinates and pixel
     scale (arcsec/pixel) of the image.
 
-    Called automatically by color_calibrate (T10) before PCC/SPCC. Call T21
-    directly when WCS data is needed without color calibration — most commonly
-    for pixel_scale_arcsec for deconvolution PSF sizing in T13.
-
     Returned measured_focal_length_mm is derived from the measured plate scale and
     the known pixel size (focal_mm = pixel_um × 206.265 / plate_scale_arcsec). This
-    is more accurate than the manufacturer's nominal focal length. When present,
-    update metadata.focal_length_mm in state with this value — all downstream tools
-    that depend on focal length (T13 deconvolution PSF sizing, T10 SPCC) should use
-    the measured value, not the nominal. Note it in the processing_report if the
-    discrepancy from the nominal is > 2% (indicates a meaningful optical difference).
+    is more accurate than the manufacturer's nominal focal length.
 
     Troubleshooting failed solves:
       - Provide approximate_coords (even rough RA/DEC helps enormously)

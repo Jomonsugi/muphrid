@@ -374,10 +374,8 @@ def deconvolution(
     """
     Sharpen the linear image by deconvolving atmospheric and optical blur.
 
-    Prerequisites (verify with analyze_image before calling):
-    - Image must be in linear space (is_linear=True).
-    - snr_estimate > 50. Low-SNR images produce ringing, not sharpening.
-    - Image should be noise-reduced (T12 completed).
+    Best results require the image to be in linear space with adequate SNR
+    (snr_estimate > 50). Low-SNR images produce ringing rather than sharpening.
 
     PSF source guidance:
       stars  — measures PSF from the image's own stars. Almost always the best

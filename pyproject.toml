@@ -20,6 +20,7 @@ dependencies = [
     "pywavelets>=1.9.0",
     "rich>=14.3.3",
     "scikit-image>=0.26.0",
+    "streamlit>=1.45.0",
     "typer>=0.24.1",
 ]
 

@@ -117,21 +117,16 @@ def star_removal(
     """
     Remove stars from the stretched image using StarNet v2 neural network.
 
-    Produces a color starless image and optionally a star mask. The starless
-    image becomes the working canvas for all non-linear processing
-    (T16–T18, T25–T27). The star mask is recombined with the processed
-    starless image in T19.
+    Produces a color starless image and optionally a star mask.
 
     Processing pipeline (internal):
       1. Convert FITS → 16-bit TIF (Siril savetif16)
       2. Run StarNet2 MPS on TIF → starless TIF + mask TIF
       3. Convert TIFs back → FITS (Siril save)
 
-    Set upscale from T05 median_fwhm: True if FWHM < 2px (under-sampled),
-    False otherwise. Never leave this to chance — wrong choice either wastes
-    time (False on tight stars → incomplete removal) or doubles runtime needlessly.
-
-    Check: nebula structure intact, no dark halos around removed stars.
+    Set upscale=True when median_fwhm < 2px (under-sampled). Under-sampled
+    images have tight stars that StarNet partially misses without upscaling.
+    Upscaling doubles processing time and adds no benefit when FWHM ≥ 2px.
     """
     img_path = Path(image_path)
     if not img_path.exists():

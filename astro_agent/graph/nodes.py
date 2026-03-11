@@ -28,36 +28,12 @@ from astro_agent.graph.hitl import (
     tool_cfg,
     vlm_enabled,
 )
+from astro_agent.graph.prompts import PHASE_PROMPTS as _PHASE_PROMPTS
+from astro_agent.graph.prompts import SYSTEM_BASE as _SYSTEM_BASE
 from astro_agent.graph.registry import all_tools, tools_for_phase
 from astro_agent.graph.state import AstroState, HITLPayload, ProcessingPhase
 
 logger = logging.getLogger(__name__)
-
-
-# ── Phase-specific system prompt fragments (placeholders) ─────────────────────
-# Full prompt design is out of scope — these are minimal placeholders.
-
-_PHASE_PROMPTS: dict[ProcessingPhase, str] = {
-    ProcessingPhase.INGEST: "You are preprocessing astronomical image data. Focus on ingestion, calibration, registration, frame analysis, stacking, and cropping.",
-    ProcessingPhase.CALIBRATION: "You are preprocessing astronomical image data. Focus on calibration with master frames.",
-    ProcessingPhase.REGISTRATION: "You are preprocessing astronomical image data. Focus on frame registration and alignment.",
-    ProcessingPhase.ANALYSIS: "You are preprocessing astronomical image data. Focus on frame quality analysis and selection.",
-    ProcessingPhase.STACKING: "You are preprocessing astronomical image data. Focus on frame stacking and cropping.",
-    ProcessingPhase.LINEAR: "You are processing linear astronomical data. Focus on gradient removal, color calibration, noise reduction, and deconvolution.",
-    ProcessingPhase.STRETCH: "You are stretching a linear astronomical image to non-linear. Choose stretch parameters based on image state and target type.",
-    ProcessingPhase.NONLINEAR: "You are enhancing a non-linear astronomical image. Focus on star processing, curves, contrast, saturation, and sharpening.",
-    ProcessingPhase.EXPORT: "You are exporting the final processed astronomical image.",
-    ProcessingPhase.REVIEW: "Processing is complete. Review the final result.",
-    ProcessingPhase.COMPLETE: "Processing is complete.",
-}
-
-_SYSTEM_BASE = (
-    "You are an astrophotography processing agent. You process astronomical "
-    "images through a multi-step pipeline using specialized tools. Call tools "
-    "to process the image, analyze results, and advance through the pipeline. "
-    "When you have completed all tasks for the current processing phase, "
-    "respond without tool calls to advance to the next phase."
-)
 
 
 # ── phase_router ──────────────────────────────────────────────────────────────

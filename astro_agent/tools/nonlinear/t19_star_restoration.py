@@ -106,7 +106,7 @@ def star_restoration(
     synthstar_options: SynthstarOptions | None = None,
 ) -> dict:
     """
-    Recombine the processed starless image with stars as the final composition step.
+    Blend a star mask back into a starless image.
 
     Blend mode (default):
       Uses Siril pixel math: $starless$ + $starmask$ * star_weight
@@ -119,9 +119,6 @@ def star_restoration(
       ellipticity, hue), and generates a synthetic Moffat profile replacement.
       Eliminates optical aberrations (coma, trailing, spikes) from the star layer.
       Best results: use source_image = the stretched pre-starnet image.
-
-    Both modes: call analyze_image after to confirm stars blended naturally and
-    the background/nebulosity is not clipped or washed out.
     """
     starless_path = Path(starless_image_path)
     if not starless_path.exists():

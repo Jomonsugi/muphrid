@@ -316,21 +316,16 @@ def analyze_frames(
     """
     Extract per-frame registration data from a Siril .seq file.
 
-    This is the agent's "Plot tab" — after registration (T04), this tool reads
-    the per-frame metrics that Siril computed (FWHM, wFWHM, roundness, quality,
-    background, star count) and returns them with summary statistics.
+    Reads per-frame metrics that Siril computed during registration (FWHM,
+    wFWHM, roundness, quality, background, star count) and returns them with
+    summary statistics.
 
-    IMPORTANT: Pass the calibrated_sequence name (input to register), NOT the
-    registered output (r_<seq>).  Siril writes R-lines to the input .seq file
-    during registration.  T04 returns both names — use calibrated_sequence.
-
-    The returned data enables the same frame selection decisions a human makes:
+    The returned data enables frame selection decisions:
       - median_fwhm + std_fwhm → set FWHM rejection thresholds
       - tracking_quality (median roundness) → detect mount/tracking issues
       - seeing_stability (FWHM CV) → assess atmospheric consistency
       - sky_consistency (background CV) → detect clouds / moon interference
       - outlier_frames → frames > 2σ above median FWHM
-      - per-frame metrics → feed into T06 for sigma-clipping selection
 
     If has_registration_data is False, registration did not produce star
     metrics.  Re-run T04 with tuned findstar parameters (lower sigma,

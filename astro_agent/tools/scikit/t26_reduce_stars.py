@@ -258,19 +258,15 @@ def reduce_stars(
     """
     Physically reduce the angular size of stars via morphological erosion.
 
-    This tool shrinks star disk diameters without dimming them. Use it on the
-    final combined image (after T19 star_restoration) to eliminate residual
-    bloom. The effect is confined to the star region mask — background
-    nebulosity is never touched.
+    This tool shrinks star disk diameters without dimming them. The effect is
+    confined to the star region mask — background nebulosity is never touched.
 
     Key settings:
     - kernel_radius=1, iterations=1: gentlest effect, almost always safe
     - kernel_radius=2: moderate bloom reduction (preview result)
-    - star_mask_path from T15: always preferred over auto-detection — prevents
-      bright nebula cores from being incorrectly identified as stars
+    - star_mask_path: preferred over auto-detection — prevents bright nebula
+      cores from being incorrectly identified as stars
     - blend_amount=0.5: half-strength, useful when stars are only mildly large
-
-    After running, call analyze_image to confirm stars.median_fwhm decreased.
     """
     img_path = Path(image_path)
     if not img_path.exists():

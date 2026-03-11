@@ -369,8 +369,7 @@ def analyze_image(
     Comprehensive image analysis tool — the agent's primary decision instrument.
 
     Returns per-channel statistics, background noise, star metrics, and derived
-    quality indicators. Call this before and after any image-modifying tool to
-    evaluate the result and decide on next actions.
+    quality indicators.
 
     Key metrics and their decision thresholds:
     - background.gradient_magnitude > 0.05: run remove_gradient

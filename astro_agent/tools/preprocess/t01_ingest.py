@@ -454,10 +454,6 @@ def ingest_dataset(
     extract acquisition metadata from EXIF (camera RAW) or FITS headers,
     and return a populated Dataset schema.
 
-    Always call this tool first. The returned dataset flows into all
-    subsequent tools. Check summary.input_format — if 'raw', pass
-    is_cfa=true to siril_calibrate (T03).
-
     The returned dataset.acquisition_meta now includes sensor characterization:
     black_level, white_level, bit_depth, raw_exposure_bias, sensor_type.
     These values enable T02 to apply sensor-relative HITL thresholds for flat

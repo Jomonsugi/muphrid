@@ -277,10 +277,6 @@ def create_mask(
     """
     Generate a float32 FITS mask (values 0.0–1.0) for targeted processing.
 
-    Masks are the foundation of the masked-application pattern — they confine
-    any subsequent tool's effect to specific tonal regions without a permanent
-    separate processing path.
-
     Mask type guide:
     - 'luminance': bright=1, dark=0. Protect stars during noise reduction;
       target bright nebula cores for subtle curves adjustment.
@@ -291,8 +287,9 @@ def create_mask(
     - 'channel_diff': channel_a > channel_b + threshold. Use R>B to isolate
       Hα emission; B>R for OIII; G>R for OIII in narrowband mapped images.
 
-    The mask is saved as a single-channel float32 FITS. Use it immediately in
-    T23 pixel_math: "$processed$ * $mask$ + $original$ * (1 - $mask$)"
+    The mask is saved as a single-channel float32 FITS. Use in pixel_math
+    to confine any processing to a specific tonal region:
+    "$processed$ * $mask$ + $original$ * (1 - $mask$)"
     """
     if luminance_options is None:
         luminance_options = LuminanceOptions()

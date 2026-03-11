@@ -106,26 +106,21 @@ def extract_narrowband(
     """
     Extract narrowband channels (Hα, O-III, Green) from a CFA (Bayer mosaic) image.
 
-    This is the entry point for the OSC dual-narrowband workflow. Use when:
-    - The image was captured through a duoband filter (L-eNhance, L-Ultimate,
-      STC Duo-Narrowband, etc.) on a color OSC/DSLR camera.
-    - You want to separate the Hα (red) and O-III (blue) signals for independent
-      processing and custom palette combination (HOO, SHO, etc.).
+    Use when the image was captured through a duoband filter (L-eNhance,
+    L-Ultimate, STC Duo-Narrowband, etc.) on a color OSC/DSLR camera to
+    separate Hα (red) and O-III (blue) signals for independent processing
+    and custom palette combination (HOO, SHO, etc.).
 
     Prerequisites:
-    - image_path must be a CFA FITS (not debayered). T03 must have been run
-      with debayer=False, or this must be a single calibrated CFA frame.
+    - image_path must be a CFA FITS (not debayered). Calibration must have
+      been run with debayer=False, or this must be a single calibrated CFA frame.
     - The FITS header must contain the BAYER_PATTERN keyword for Siril to
       perform correct extraction.
 
-    Workflow after extraction:
-    1. Register Hα frames (T04), stack Hα (T07) → Ha_stacked.fits
-    2. Register OIII frames (T04), stack OIII (T07) → OIII_stacked.fits
-    3. Process each independently (T12 noise reduction, T27 multiscale)
-    4. Combine with T23 pixel_math:
-       HOO palette: R=$Ha$ G=$OIII$ B=$OIII$
-       SHO palette: R=$Ha$ G=$Ha$*0.3+$OIII$*0.7 B=$OIII$
-       Custom: any linear combination the agent deems appropriate
+    Palette combination examples via pixel_math:
+      HOO palette: R=$Ha$ G=$OIII$ B=$OIII$
+      SHO palette: R=$Ha$ G=$Ha$*0.3+$OIII$*0.7 B=$OIII$
+      Custom: any linear combination appropriate to the target
 
     Returns paths to extracted channel FITS files.
     """
