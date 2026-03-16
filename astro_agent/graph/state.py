@@ -66,6 +66,16 @@ class PathState(TypedDict):
     pre_gradient_image: str | None   # snapshot before T09 — HITL before/after comparison
     pre_decon_image:    str | None   # snapshot before T13 — HITL before/after comparison
 
+    # Preprocessing sequence chain — each tool writes its output name here
+    # so the next tool can read it via InjectedState without the LLM tracking paths.
+    lights_sequence:      str | None        # sequence name after T02b → read by T03
+    calibrated_sequence:  str | None        # sequence name after T03  → read by T04, T05
+    registered_sequence:  str | None        # sequence name after T04  → read by T07
+    selected_frames:      list[str] | None  # accepted frame keys after T06 → read by T07
+
+    # Latest mask FITS path — written by T25, optionally read by T27
+    latest_mask:          str | None
+
 
 class Metadata(TypedDict):
     is_linear:          bool
@@ -92,6 +102,7 @@ class FrameMetrics(TypedDict, total=False):
 
 class Metrics(TypedDict):
     frame_stats:         dict[str, FrameMetrics]  # keyed by filename
+    frame_summary:       dict | None              # summary stats from T05 (median_fwhm, etc.)
 
     # Core image quality (from T20 analyze_image)
     current_fwhm:        float | None
@@ -288,7 +299,7 @@ class AstroState(TypedDict):
 
     # Active HITL conversation flag — set by hitl_check when interrupt fires,
     # cleared on approval. While True, the agent routes back to hitl_check
-    # (not phase_advance) even when it responds without tool calls, so the
+    # (not agent_chat) even when it responds without tool calls, so the
     # human can chat freely before approving or requesting revision.
     active_hitl: bool
 
@@ -318,6 +329,11 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             masters=MasterPaths(bias=None, dark=None, flat=None),
             pre_gradient_image=None,
             pre_decon_image=None,
+            lights_sequence=None,
+            calibrated_sequence=None,
+            registered_sequence=None,
+            selected_frames=None,
+            latest_mask=None,
         ),
         metadata=Metadata(
             is_linear=True,
@@ -330,6 +346,7 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
         ),
         metrics=Metrics(
             frame_stats={},
+            frame_summary=None,
             current_fwhm=None,
             current_background=None,
             current_noise=None,
@@ -358,4 +375,155 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
         processing_report=[],
         messages=[],
         user_feedback={},
+        active_hitl=False,
     )
+
+
+def build_initial_message(dataset: Dataset, session: SessionContext, ingest_summary: dict) -> str:
+    """
+    Build the initial HumanMessage content with full dataset context.
+
+    This is the agent's ONLY source of truth about the dataset it's working
+    with. Without this, the agent has no idea what frames are available,
+    what camera was used, or what parameters are appropriate.
+
+    Everything a human post-processor would know when sitting down to process
+    must be in this message: camera, sensor, optics, frame inventory, exposure,
+    sky conditions, sensor dynamic range, equipment profile, and calibration
+    strategy.
+    """
+    from astro_agent.equipment import load_equipment
+
+    meta = dataset.get("acquisition_meta", {})
+    files = dataset.get("files", {})
+    equipment = load_equipment()
+    equip_camera = equipment.get("camera", {})
+    equip_optics = equipment.get("optics", {})
+
+    lines = [
+        f"Process the astrophotography dataset for **{session['target_name']}**.",
+        "",
+        "## Dataset",
+        f"- Lights: {len(files.get('lights', []))} frames",
+        f"- Darks: {len(files.get('darks', []))} frames",
+        f"- Flats: {len(files.get('flats', []))} frames",
+        f"- Biases: {len(files.get('biases', []))} frames",
+    ]
+
+    exp = meta.get("exposure_time_s")
+    if exp:
+        total = exp * len(files.get("lights", []))
+        lines.append(f"- Exposure: {exp}s per frame, {total / 60:.1f} min total integration")
+
+    # Detected file extensions from ingest
+    detected_ext = ingest_summary.get("detected_extensions")
+    if detected_ext:
+        ext_str = ", ".join(sorted(detected_ext)) if isinstance(detected_ext, (list, set)) else str(detected_ext)
+        lines.append(f"- File extensions: {ext_str}")
+
+    lines.append("")
+    lines.append("## Acquisition")
+
+    if meta.get("camera_model"):
+        lines.append(f"- Camera: {meta['camera_model']}")
+    if meta.get("sensor_type"):
+        lines.append(f"- Sensor: {meta['sensor_type'].upper()}")
+    if meta.get("iso"):
+        lines.append(f"- ISO: {meta['iso']}")
+    if meta.get("gain") is not None:
+        lines.append(f"- Gain: {meta['gain']}")
+    if meta.get("focal_length_mm"):
+        lines.append(f"- Focal length: {meta['focal_length_mm']}mm")
+    if meta.get("pixel_size_um"):
+        lines.append(f"- Pixel size: {meta['pixel_size_um']}μm")
+    if meta.get("bit_depth"):
+        lines.append(f"- Bit depth: {meta['bit_depth']}-bit")
+    if meta.get("input_format"):
+        lines.append(f"- Input format: {meta['input_format'].upper()}")
+    if meta.get("filter"):
+        lines.append(f"- Filter: {meta['filter']}")
+
+    # Sensor characterization — dynamic range context for the agent
+    black = meta.get("black_level")
+    white = meta.get("white_level")
+    if black is not None and white is not None:
+        lines.append("")
+        lines.append("## Sensor Characterization")
+        lines.append(f"- Black level: {black} ADU (pedestal)")
+        lines.append(f"- White level: {white} ADU (full well)")
+        usable = white - black
+        lines.append(f"- Usable dynamic range: ~{usable} ADU levels")
+        if meta.get("raw_exposure_bias") is not None:
+            lines.append(f"- Raw exposure bias: {meta['raw_exposure_bias']} stops")
+
+    # Equipment profile — shows the agent what values came from equipment.toml
+    if equip_camera or equip_optics:
+        lines.append("")
+        lines.append("## Equipment Profile (equipment.toml)")
+        if equip_camera.get("model"):
+            lines.append(f"- Camera: {equip_camera['model']}")
+        if equip_camera.get("sensor_type"):
+            lines.append(f"- Sensor: {equip_camera['sensor_type']}")
+        if equip_camera.get("pixel_size_um"):
+            lines.append(f"- Pixel size: {equip_camera['pixel_size_um']} μm")
+        if equip_optics.get("focal_length_mm"):
+            lines.append(f"- Focal length: {equip_optics['focal_length_mm']} mm (plate-solve-measured)")
+
+    # Ingest sensor summary (from T01's EXIF analysis)
+    sensor_summary = ingest_summary.get("sensor")
+    if sensor_summary and isinstance(sensor_summary, dict):
+        # Only show if it adds info beyond what's already displayed
+        sensor_model = sensor_summary.get("model")
+        if sensor_model and sensor_model != meta.get("camera_model"):
+            lines.append(f"- Sensor model (EXIF): {sensor_model}")
+
+    lines.append("")
+    lines.append("## Session")
+    lines.append(f"- Bortle: {session.get('bortle', 'unknown')}")
+    if session.get("sqm_reading"):
+        lines.append(f"- SQM: {session['sqm_reading']} mag/arcsec²")
+    if session.get("remove_stars") is not None:
+        lines.append(f"- Star removal: {'yes' if session['remove_stars'] else 'no'}")
+    if session.get("notes"):
+        lines.append(f"- Notes: {session['notes']}")
+
+    # Warnings from ingest
+    warnings = ingest_summary.get("warnings") or []
+    cleaned = ingest_summary.get("cleaned_artifacts") or []
+    if warnings:
+        lines.append("")
+        lines.append("## Ingest warnings")
+        for w in warnings:
+            lines.append(f"- {w}")
+    if cleaned:
+        lines.append(f"- Cleaned stale artifacts: {', '.join(cleaned)}")
+
+    # Calibration frame availability drives the agent's strategy
+    lines.append("")
+    lines.append("## Calibration strategy")
+    has_darks = len(files.get("darks", [])) > 0
+    has_flats = len(files.get("flats", [])) > 0
+    has_biases = len(files.get("biases", [])) > 0
+
+    if has_biases and has_darks and has_flats:
+        lines.append(
+            "Full calibration: call build_masters(file_type='bias'), "
+            "then build_masters(file_type='dark'), "
+            "then build_masters(file_type='flat'), then calibrate lights."
+        )
+    elif has_darks and has_flats:
+        lines.append(
+            "No bias frames. Call build_masters(file_type='dark'), "
+            "then build_masters(file_type='flat'), calibrate without bias subtraction."
+        )
+    elif has_darks:
+        lines.append("Darks only. Call build_masters(file_type='dark'). No flats — vignetting/dust correction will be skipped.")
+    elif has_flats:
+        lines.append("Flats only. Call build_masters(file_type='flat'). No darks — thermal noise correction will be skipped.")
+    else:
+        lines.append("No calibration frames. Proceed directly to convert_sequence and registration.")
+
+    lines.append("")
+    lines.append("Begin preprocessing.")
+
+    return "\n".join(lines)

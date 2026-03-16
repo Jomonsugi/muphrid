@@ -44,6 +44,11 @@ def is_enabled(tool_id: str) -> bool:
     return tool_cfg(tool_id).get("enabled", False)
 
 
+def is_autonomous() -> bool:
+    """Check if the pipeline is running in autonomous mode (no human available)."""
+    return _CFG.get("autonomous", False)
+
+
 def vlm_enabled() -> bool:
     """Check if VLM image injection is enabled for HITL feedback loops."""
     return _CFG.get("vlm_enabled", False)

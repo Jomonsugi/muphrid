@@ -25,23 +25,24 @@ reside in working_dir and be referenced by their stem (no extension, no path).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import fits_nlayers, run_siril_script
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class BlendOptions(BaseModel):
-    star_mask_path: str = Field(
-        description=(
-            "Absolute path to the star mask FITS produced by T15. "
-            "Must be in the same working_dir as the starless image."
-        )
-    )
     star_weight: float = Field(
         default=1.0,
         description=(
@@ -67,15 +68,6 @@ class SynthstarOptions(BaseModel):
 
 
 class StarRestorationInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    starless_image_path: str = Field(
-        description=(
-            "Absolute path to the processed starless FITS image. "
-            "This is the fully processed nebulosity image from T16–T18."
-        )
-    )
     mode: str = Field(
         default="blend",
         description=(
@@ -99,12 +91,12 @@ class StarRestorationInput(BaseModel):
 
 @tool(args_schema=StarRestorationInput)
 def star_restoration(
-    working_dir: str,
-    starless_image_path: str,
     mode: str = "blend",
     blend_options: BlendOptions | None = None,
     synthstar_options: SynthstarOptions | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Blend a star mask back into a starless image.
 
@@ -120,6 +112,10 @@ def star_restoration(
       Eliminates optical aberrations (coma, trailing, spikes) from the star layer.
       Best results: use source_image = the stretched pre-starnet image.
     """
+    working_dir = state["dataset"]["working_dir"]
+    starless_image_path = state["paths"]["starless_image"]
+    star_mask_path_from_state = state["paths"]["star_mask"]
+
     starless_path = Path(starless_image_path)
     if not starless_path.exists():
         raise FileNotFoundError(f"Starless image not found: {starless_image_path}")
@@ -136,7 +132,7 @@ def star_restoration(
         )
 
     if mode == "blend" and blend_options is None:
-        raise ValueError("blend_options (including star_mask_path) is required for mode=blend.")
+        blend_options = BlendOptions()
     if mode == "synthstar" and synthstar_options is None:
         raise ValueError("synthstar_options (including source_image_path) is required for mode=synthstar.")
 
@@ -144,9 +140,10 @@ def star_restoration(
     output_stem = f"{starless_stem}_restored"
 
     if mode == "blend":
-        mask_path = Path(blend_options.star_mask_path)  # type: ignore[union-attr]
+        # Use star mask from state
+        mask_path = Path(star_mask_path_from_state)
         if not mask_path.exists():
-            raise FileNotFoundError(f"Star mask not found: {blend_options.star_mask_path}")  # type: ignore[union-attr]
+            raise FileNotFoundError(f"Star mask not found: {star_mask_path_from_state}")
 
         # Both FITS must be in working_dir for $stem$ pixel math to resolve
         if mask_path.parent.resolve() != Path(working_dir).resolve():
@@ -190,8 +187,18 @@ def star_restoration(
     if not output_path.exists():
         raise FileNotFoundError(f"star_restoration did not produce: {output_path}")
 
-    return {
-        "final_image_path": str(output_path),
+    summary: dict = {
+        "output_path": str(output_path),
         "mode": mode,
-        "star_weight": blend_options.star_weight if mode == "blend" else None,  # type: ignore[union-attr]
+        "starless_image": str(starless_image_path),
     }
+    if mode == "blend":
+        summary["star_mask"] = str(star_mask_path_from_state)
+        summary["star_weight"] = blend_options.star_weight  # type: ignore[union-attr]
+    elif mode == "synthstar":
+        summary["source_image"] = str(synthstar_options.source_image_path)  # type: ignore[union-attr]
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(output_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

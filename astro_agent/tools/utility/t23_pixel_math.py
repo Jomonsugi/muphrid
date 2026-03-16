@@ -26,21 +26,21 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 from astropy.io import fits
 from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class PixelMathInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
     expression: str = Field(
         description=(
             "PixelMath expression. Image variable stems are wrapped in $: "
@@ -178,13 +178,13 @@ def _validate_and_broadcast(expression: str, working_dir: str) -> tuple[list[str
 
 @tool(args_schema=PixelMathInput)
 def pixel_math(
-    working_dir: str,
     expression: str,
     output_stem: str | None = None,
     rescale: bool = False,
     rescale_low: float = 0.0,
     rescale_high: float = 1.0,
     nosum: bool = True,
+    state: Annotated[AstroState, InjectedState] = None,
 ) -> dict:
     """
     General-purpose pixel math using Siril's PixelMath engine.
@@ -201,6 +201,7 @@ def pixel_math(
     Validate expression syntax before calling — the agent should check that
     all $variable$ names correspond to known image files.
     """
+    working_dir = state["dataset"]["working_dir"]
     _stems, expression, auto_broadcast = _validate_and_broadcast(expression, working_dir)
 
     out_stem = output_stem or "pm_result"

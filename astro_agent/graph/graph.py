@@ -15,10 +15,10 @@ from langgraph.graph import END, StateGraph
 
 from astro_agent.config import make_llm
 from astro_agent.graph.nodes import (
+    agent_chat,
     hitl_check,
     make_action_node,
     make_agent_node,
-    phase_advance,
     phase_router,
     route_after_agent,
     route_after_phase_router,
@@ -85,21 +85,22 @@ def build_graph(
     builder.add_node("agent", agent_node)
     builder.add_node("action", action_node)
     builder.add_node("hitl_check", hitl_check)
-    builder.add_node("phase_advance", phase_advance)
+    builder.add_node("agent_chat", agent_chat)
 
     # ── Entry point ───────────────────────────────────────────────────────
     builder.set_entry_point("phase_router")
 
     # ── Edges ─────────────────────────────────────────────────────────────
 
-    # agent → action (tool_calls) | hitl_check (active HITL chat) | phase_advance
+    # agent → action (tool_calls) | hitl_check (active HITL) | agent_chat (text) | END
     builder.add_conditional_edges(
         "agent",
         route_after_agent,
         {
             "action": "action",
             "hitl_check": "hitl_check",
-            "phase_advance": "phase_advance",
+            "agent_chat": "agent_chat",
+            "__end__": END,
         },
     )
 
@@ -109,10 +110,10 @@ def build_graph(
     # hitl_check → agent (passes through or returns with human feedback)
     builder.add_edge("hitl_check", "agent")
 
-    # phase_advance → phase_router (advance phase, then re-enter)
-    builder.add_edge("phase_advance", "phase_router")
+    # agent_chat → agent (human responded or autonomous nudge injected)
+    builder.add_edge("agent_chat", "agent")
 
-    # phase_router → agent | END (based on current phase)
+    # phase_router → agent | END (entry point routing)
     builder.add_conditional_edges(
         "phase_router",
         route_after_phase_router,

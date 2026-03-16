@@ -33,14 +33,21 @@ Standard recipes (from spec §5 T27):
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import numpy as np
 from astropy.io import fits as astropy_fits
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 from scipy.ndimage import convolve1d
+
+from astro_agent.graph.state import AstroState
 
 
 # ── B3-spline à trous transform ────────────────────────────────────────────────
@@ -154,12 +161,6 @@ class ScaleOperation(BaseModel):
 
 
 class MultiscaleProcessInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the working directory."
-    )
-    image_path: str = Field(
-        description="Absolute path to the FITS image to process."
-    )
     num_scales: int = Field(
         default=5,
         description=(
@@ -176,11 +177,11 @@ class MultiscaleProcessInput(BaseModel):
             "See spec §5 T27 for standard sharpening and denoising recipes."
         )
     )
-    mask_path: str | None = Field(
-        default=None,
+    use_latest_mask: bool = Field(
+        default=False,
         description=(
-            "Optional path to a float32 FITS mask from T25. If provided, the "
-            "processed result is blended with the original via the mask: "
+            "If True, use the latest mask from state (paths.latest_mask) to confine "
+            "processing. The processed result is blended with the original via the mask: "
             "'result * mask + original * (1 - mask)'. "
             "Use an inverted_luminance mask for noise reduction to avoid "
             "over-smoothing nebula structure."
@@ -335,16 +336,16 @@ def _process_plane(
 
 @tool(args_schema=MultiscaleProcessInput)
 def multiscale_process(
-    working_dir: str,
-    image_path: str,
     num_scales: int = 5,
     scale_operations: list[ScaleOperation] | None = None,
-    mask_path: str | None = None,
+    use_latest_mask: bool = False,
     boundary_mode: str = "reflect",
     per_channel: bool = False,
     color_reconstruction: str = "ratio",
     output_stem: str | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Decompose the image into spatial frequency scales via the B3-spline à trous
     wavelet transform, apply independent operations per scale, then reconstruct.
@@ -361,10 +362,16 @@ def multiscale_process(
       scale 4: coarse structure (16–32px, galaxy arms)
       scale 5+: residual (large-scale background)
 
+    Set use_latest_mask=True to apply the most recent mask from T25 create_mask.
+
     Implementation note: PyWavelets has no 'b3' wavelet. The B3-spline à trous
     transform is implemented directly using scipy.ndimage.convolve1d with kernel
     [1/16, 4/16, 6/16, 4/16, 1/16] and inter-scale holes (stride=2^i).
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+    latest_mask = state["paths"].get("latest_mask") if use_latest_mask else None
+
     if scale_operations is None:
         scale_operations = []
 
@@ -413,9 +420,9 @@ def multiscale_process(
                 per_scale_stats = stats
         output = np.stack(output_channels, axis=0)
 
-    # Optional mask blending
-    if mask_path and Path(mask_path).exists():
-        mask = _load_mask(Path(mask_path), data.shape[1:])
+    # Optional mask blending from state
+    if latest_mask and Path(latest_mask).exists():
+        mask = _load_mask(Path(latest_mask), data.shape[1:])
         # Broadcast mask to (3, H, W)
         mask_3d = mask[np.newaxis, :, :]
         output = output * mask_3d + original * (1.0 - mask_3d)
@@ -431,7 +438,22 @@ def multiscale_process(
     hdu = astropy_fits.PrimaryHDU(data=save_data)
     astropy_fits.HDUList([hdu]).writeto(out_path, overwrite=True)
 
-    return {
-        "processed_image_path": str(out_path),
+    summary = {
+        "output_path": str(out_path),
+        "num_scales": num_scales,
+        "per_channel": per_channel,
+        "color_reconstruction": color_reconstruction,
+        "boundary_mode": boundary_mode,
+        "mask_applied": bool(latest_mask and Path(latest_mask).exists()),
+        "mask_path": latest_mask if latest_mask and Path(latest_mask).exists() else None,
         "per_scale_stats": per_scale_stats,
+        "scale_operations": [
+            {"scale": op.scale, "operation": op.operation, "weight": op.weight, "denoise_sigma": op.denoise_sigma}
+            for op in scale_operations
+        ],
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(out_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

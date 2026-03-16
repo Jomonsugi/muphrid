@@ -31,34 +31,25 @@ Siril docs:
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class SirilStackInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    registered_sequence: str = Field(
-        description=(
-            "Name of the registered sequence (without .seq). "
-            "Typically 'r_pp_lights_seq' from T04."
-        )
-    )
-    accepted_frames: list[str] = Field(
-        description=(
-            "List of accepted frame keys from select_frames (T06). "
-            "Must match frame keys in the .seq file."
-        )
-    )
-
     # ── Stack method ──────────────────────────────────────────────────────
     stack_method: str = Field(
         default="mean",
@@ -301,11 +292,8 @@ _WEIGHTING_MAP = {
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool(args_schema=SirilStackInput)
+@tool
 def siril_stack(
-    working_dir: str,
-    registered_sequence: str,
-    accepted_frames: list[str],
     rejection_method: str,
     stack_method: str = "mean",
     rejection_sigma: list[float] | None = None,
@@ -321,23 +309,37 @@ def siril_stack(
     upscale: bool = False,
     feather: int | None = None,
     rejection_maps: str | None = None,
-    total_frames_hint: int | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Stack registered frames into a master light FITS.
 
-    Uses Siril select/unselect to include only accepted_frames, then runs
-    the stack command with full control over rejection, normalization,
-    weighting, and output options.
+    Working directory, registered sequence, and accepted frame list are read
+    from state. Uses Siril select/unselect to include only the accepted frames
+    from select_frames (T06), then stacks with the specified method.
 
-    Recommended settings by dataset size:
-      - < 10 frames:  rejection='winsorized', sigma=[2.5, 2.5]
-      - 10-30 frames: rejection='sigma_clipping', sigma=[3.0, 3.0]
-      - > 30 frames:  rejection='sigma_clipping', sigma=[2.5, 2.5] (can be tighter)
-      - > 100 frames: consider fast_norm=True for speed
+    Args:
+        rejection_method: Pixel rejection algorithm (for stack_method='mean').
+            Choose based on accepted frame count from T06:
+            'winsorized' (< 15 frames), 'sigma_clipping' (15-50 frames),
+            'linear_fit' (> 50 frames), 'none' (< 5 frames).
+        stack_method: 'mean' (best SNR, default), 'median', 'sum', 'min', 'max'.
+        rejection_sigma: [low_sigma, high_sigma]. Default [3.0, 3.0].
+        normalization: 'addscale' (default), 'mulscale', 'add', 'mul', 'none'.
+        weighting: 'wfwhm' (default), 'noise', 'nbstars', 'nbstack', 'none'.
+        output_32bit: Write 32-bit float output. Required for linear processing.
+        output_name: Output filename stem (no extension). Default 'master_light'.
     """
     if rejection_sigma is None:
         rejection_sigma = [3.0, 3.0]
+
+    working_dir = state["dataset"]["working_dir"]
+    registered_sequence = state["paths"]["registered_sequence"]
+    accepted_frames = state["paths"].get("selected_frames") or []
+
+    if not registered_sequence:
+        raise ValueError("registered_sequence not found in state. Run siril_register (T04) first.")
 
     wdir = Path(working_dir)
     seq_path = wdir / f"{registered_sequence}.seq"
@@ -345,8 +347,6 @@ def siril_stack(
     name_to_index, n_frames = _parse_seq_file(seq_path)
     if n_frames == 0:
         n_frames = max(name_to_index.values()) + 1 if name_to_index else len(accepted_frames)
-
-    total_frames = total_frames_hint if total_frames_hint is not None else n_frames
 
     selection_cmds = _build_selection_commands(
         registered_sequence, n_frames, accepted_frames, name_to_index
@@ -412,19 +412,23 @@ def siril_stack(
             f"Siril stdout:\n{result.stdout[-1000:]}"
         )
 
-    n_accepted = len(accepted_frames)
-    acceptance_rate = n_accepted / max(total_frames, 1)
-
-    stack_metrics = {
-        "stacked_count":       n_accepted,
-        "total_frames":        total_frames,
-        "acceptance_rate":     round(acceptance_rate, 3),
-        "total_integration_s": None,
-        "estimated_snr_gain":  round(n_accepted ** 0.5, 3),
-        "background_noise":    result.parsed.get("background_noise"),
+    summary = {
+        "output_path": str(master_path),
+        "registered_sequence": registered_sequence,
+        "accepted_frames_count": len(accepted_frames),
+        "total_frames_in_seq": n_frames,
+        "settings": {
+            "stack_method": stack_method,
+            "rejection_method": rejection_method,
+            "rejection_sigma": rejection_sigma,
+            "normalization": normalization,
+            "weighting": weighting,
+            "output_32bit": output_32bit,
+            "output_name": output_name,
+        },
     }
 
-    return {
-        "master_light_path": str(master_path),
-        "stack_metrics":     stack_metrics,
-    }
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(master_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

@@ -34,12 +34,19 @@ Siril docs:
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
@@ -245,16 +252,6 @@ def _build_filter_flags(filters: SeqApplyRegFilters) -> list[str]:
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class SirilRegisterInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    calibrated_sequence: str = Field(
-        description=(
-            "Name of the calibrated sequence (without .seq extension). "
-            "Typically 'pp_lights_seq' from T03."
-        )
-    )
-
     # ── register command options ──────────────────────────────────────────
     two_pass: bool = Field(
         default=True,
@@ -427,10 +424,8 @@ def _parse_register_output(stdout: str) -> dict:
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool(args_schema=SirilRegisterInput)
+@tool
 def siril_register(
-    working_dir: str,
-    calibrated_sequence: str,
     two_pass: bool = True,
     transformation: str = "homography",
     max_stars: int = 500,
@@ -450,13 +445,14 @@ def siril_register(
     prefix: str | None = None,
     filters: dict | None = None,
     findstar: dict | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Register calibrated light frames using Siril star matching.
 
+    Working directory and calibrated sequence name are read from state.
     Full registration pipeline: setfindstar (optional) → register → seqapplyreg.
-    Returns the registered sequence name, the calibrated sequence name, and
-    registration summary metrics.
 
     Key tuning levers when registration struggles:
       - findstar.sigma: lower to detect fainter stars
@@ -467,6 +463,11 @@ def siril_register(
       - min_pairs: decrease for sparse fields with few stars
       - transformation: try 'shift' for well-tracked data, 'affine' for simpler geometry
     """
+    working_dir = state["dataset"]["working_dir"]
+    calibrated_sequence = state["paths"]["calibrated_sequence"]
+    if not calibrated_sequence:
+        raise ValueError("calibrated_sequence not found in state. Run calibrate (T03) first.")
+
     commands: list[str] = []
 
     # ── 1. setfindstar preamble ───────────────────────────────────────────
@@ -570,13 +571,22 @@ def siril_register(
     output_prefix = prefix if prefix else "r_"
     registered_seq = f"{output_prefix}{calibrated_sequence}"
 
-    return {
+    summary = {
         "registered_sequence": registered_seq,
         "calibrated_sequence": calibrated_sequence,
-        "registered_sequence_path": str(Path(working_dir) / f"{registered_seq}.seq"),
-        "calibrated_sequence_path": str(Path(working_dir) / f"{calibrated_sequence}.seq"),
-        "registered_count": metrics.get("registered_count", 0),
-        "failed_count": metrics.get("failed_count", 0),
-        "reference_image_index": metrics.get("reference_image_index"),
-        "total_stars_detected": metrics.get("total_stars_detected"),
+        **metrics,
+        "settings": {
+            "two_pass": two_pass,
+            "transformation": transformation,
+            "max_stars": max_stars,
+            "min_pairs": min_pairs,
+            "interpolation": interpolation,
+            "framing": framing,
+            "drizzle": drizzle,
+        },
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "registered_sequence": registered_seq},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

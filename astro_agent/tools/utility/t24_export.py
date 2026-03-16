@@ -21,10 +21,16 @@ Siril commands (verified against Siril 1.4 CLI docs):
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
@@ -128,12 +134,6 @@ class FormatSpec(BaseModel):
 
 
 class ExportFinalInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description="Absolute path to the final FITS image to export."
-    )
     formats: list[FormatSpec] = Field(
         default_factory=lambda: [FormatSpec(**f) for f in DEFAULT_FORMATS],
         description=(
@@ -231,12 +231,12 @@ def _export_one(
 
 @tool(args_schema=ExportFinalInput)
 def export_final(
-    working_dir: str,
-    image_path: str,
     formats: list[FormatSpec] | None = None,
     output_dir: str | None = None,
     source_profile: str = "sRGBlinear",
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Export the finished image in distribution-ready formats with ICC profiles.
 
@@ -258,6 +258,9 @@ def export_final(
 
     For mono images, use gray profiles: graysrgb, grayrec2020, graylinear.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     if formats is None:
         formats = [FormatSpec(**f) for f in DEFAULT_FORMATS]
 
@@ -296,4 +299,14 @@ def export_final(
             "file_size_mb": file_size_mb,
         })
 
-    return {"exported_files": exported_files}
+    return Command(update={
+        "metadata": {
+            **state["metadata"],
+            "export_done": True,
+            "exported_files": exported_files,
+        },
+        "messages": [ToolMessage(
+            content=str({"exported_files": exported_files}),
+            tool_call_id=tool_call_id,
+        )],
+    })

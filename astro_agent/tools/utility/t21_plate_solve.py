@@ -16,13 +16,20 @@ Siril commands (verified against Siril 1.4 CLI docs):
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from astro_agent.equipment import resolve_pixel_size, resolve_target_coords
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import SirilError, run_siril_script
 from astro_agent.tools.linear.t10_color_calibrate import _parse_plate_solve_result
 
@@ -30,12 +37,6 @@ from astro_agent.tools.linear.t10_color_calibrate import _parse_plate_solve_resu
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class PlateSolveInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description="Absolute path to the FITS image to plate solve."
-    )
     target_name: str | None = Field(
         default=None,
         description=(
@@ -181,14 +182,18 @@ def build_platesolve_cmd(
     """Build the Siril platesolve command string with all available options."""
     parts = ["platesolve"]
 
-    if force_resolve:
-        parts.append("-force")
-
+    # Siril's parser checks for coordinates FIRST (word[1] not starting with '-'
+    # or negative number), then processes flags. -force must come AFTER coords.
+    # Source: src/core/command.c — coords parsed before the flags while-loop.
+    # The official docs show -force first, but that contradicts the source.
     if approximate_coords:
         ra = approximate_coords.get("ra")
         dec = approximate_coords.get("dec")
         if ra is not None and dec is not None:
             parts.append(f"{ra} {dec}")
+
+    if force_resolve:
+        parts.append("-force")
 
     if focal_length_mm is not None and focal_length_mm > 0:
         parts.append(f"-focal={focal_length_mm}")
@@ -242,8 +247,6 @@ def _parse_rotation(stdout: str) -> float | None:
 
 @tool(args_schema=PlateSolveInput)
 def plate_solve(
-    working_dir: str,
-    image_path: str,
     target_name: str | None = None,
     approximate_coords: dict | None = None,
     focal_length_mm: float | None = None,
@@ -262,7 +265,9 @@ def plate_solve(
     blind_pos: bool = False,
     blind_res: bool = False,
     findstar: dict | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Astrometric plate solving — determines celestial coordinates and pixel
     scale (arcsec/pixel) of the image.
@@ -280,6 +285,9 @@ def plate_solve(
       - Try use_local_astrometry_net=True with blind_pos/blind_res for unknown fields
       - Set search_radius to widen the cone search
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -331,34 +339,48 @@ def plate_solve(
         rotation = _parse_rotation(result.stdout)
 
         measured_fl = wcs_info.get("measured_focal_length_mm")
-        return {
-            "success": True,
-            "wcs_coords": {
-                "ra": wcs_info.get("ra"),
-                "dec": wcs_info.get("dec"),
-            },
-            "pixel_scale_arcsec": wcs_info.get("pixel_scale_arcsec"),
+        coords = {"ra": wcs_info.get("ra"), "dec": wcs_info.get("dec")}
+        pixel_scale = wcs_info.get("pixel_scale_arcsec")
+
+        summary = {
+            "status": "solved",
+            "ra": coords.get("ra"),
+            "dec": coords.get("dec"),
+            "pixel_scale_arcsec": pixel_scale,
             "measured_focal_length_mm": measured_fl,
             "field_of_view": fov,
             "rotation_deg": rotation,
-            "error_msg": None,
+            "input_focal_length_mm": focal_length_mm,
+            "input_pixel_size_um": resolved_px_um,
+            "resolved_coords_hint": resolved_coords,
         }
+
+        return Command(update={
+            "metadata": {
+                **state["metadata"],
+                "plate_solve_coords": coords,
+                "pixel_scale": pixel_scale,
+            },
+            "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+        })
 
     except SirilError as exc:
         stdout_lower = exc.result.stdout.lower() + exc.result.stderr.lower()
         if any(kw in stdout_lower for kw in ("plate", "wcs", "astrometry", "solve", "match")):
-            return {
-                "success": False,
-                "wcs_coords": None,
-                "pixel_scale_arcsec": None,
-                "field_of_view": None,
-                "rotation_deg": None,
-                "error_msg": (
-                    f"Plate solving failed. Suggestions: provide approximate_coords, "
-                    f"verify focal_length_mm and pixel_size_um, try downscale=True, "
-                    f"try a different catalog, increase limitmag, or try "
-                    f"use_local_astrometry_net=True with blind_pos/blind_res. "
-                    f"Siril: {exc.result.stderr[:300]}"
-                ),
+            failure_summary = {
+                "status": "failed",
+                "error": "plate solving failed — WCS not found",
+                "input_focal_length_mm": focal_length_mm,
+                "input_pixel_size_um": resolved_px_um,
+                "resolved_coords_hint": resolved_coords,
+                "siril_stdout_tail": exc.result.stdout[-500:] if exc.result.stdout else None,
             }
+            return Command(update={
+                "metadata": {
+                    **state["metadata"],
+                    "plate_solve_coords": None,
+                    "pixel_scale": None,
+                },
+                "messages": [ToolMessage(content=json.dumps(failure_summary, indent=2, default=str), tool_call_id=tool_call_id)],
+            })
         raise

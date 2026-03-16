@@ -10,11 +10,12 @@ See graph_design.md §Phase Gates & Tool Groupings for the rationale.
 
 from __future__ import annotations
 
+from typing import get_type_hints
+
 from astro_agent.graph.state import ProcessingPhase
 
 # ── Imports: Preprocessing ────────────────────────────────────────────────────
 
-from astro_agent.tools.preprocess.t01_ingest import ingest_dataset
 from astro_agent.tools.preprocess.t02_masters import build_masters
 from astro_agent.tools.preprocess.t02b_convert_sequence import convert_sequence
 from astro_agent.tools.preprocess.t03_calibrate import calibrate
@@ -58,6 +59,7 @@ from astro_agent.tools.utility.t21_plate_solve import plate_solve
 from astro_agent.tools.utility.t23_pixel_math import pixel_math
 from astro_agent.tools.utility.t28_extract_narrowband import extract_narrowband
 from astro_agent.tools.utility.t29_resolve_target import resolve_target
+from astro_agent.tools.utility.t30_advance_phase import advance_phase
 
 
 # ── Tool groups ───────────────────────────────────────────────────────────────
@@ -68,10 +70,12 @@ UTILITY_TOOLS = [
     pixel_math,
     extract_narrowband,
     resolve_target,
+    advance_phase,
 ]
 
 PREPROCESS_TOOLS = [
-    ingest_dataset,
+    # ingest_dataset intentionally excluded — runs once during session init
+    # (CLI/app) before the graph starts. Dataset is already in state.
     build_masters,
     convert_sequence,
     calibrate,
@@ -137,6 +141,47 @@ def tools_for_phase(phase: ProcessingPhase) -> list:
     """Return the full tool list for a given phase: gate tools + utility tools."""
     gate_tools = _PHASE_TO_GATE.get(phase, [])
     return gate_tools + UTILITY_TOOLS
+
+
+def _fix_injected_annotations() -> None:
+    """
+    Fix InjectedState/InjectedToolCallId detection for tools defined in files
+    that use 'from __future__ import annotations'.
+
+    With PEP 563 (future annotations), all annotations are stored as strings
+    rather than evaluated types. LangChain's _injected_args_keys is a
+    cached_property that uses inspect.signature() — which returns the raw string
+    annotations — then checks _is_injected_arg_type(), which fails on strings.
+    The result: _injected_args_keys = frozenset() and state defaults to None.
+
+    LangGraph's _get_all_injected_args uses get_type_hints() which resolves
+    strings correctly, so ToolNode *does* inject state into tool_call["args"].
+    But _parse_input() strips extra args (via Pydantic validation against
+    args_schema) then tries to add them back via _injected_args_keys — and
+    since that's empty, state is lost before the function is called.
+
+    Fix: overwrite func.__annotations__ with the fully-evaluated types from
+    get_type_hints() before _injected_args_keys is ever accessed (it's a
+    cached_property — first access wins).
+    """
+    all_groups = [PREPROCESS_TOOLS, LINEAR_TOOLS, STRETCH_TOOLS,
+                  NONLINEAR_TOOLS, EXPORT_TOOLS, UTILITY_TOOLS]
+    seen: set[str] = set()
+    for group in all_groups:
+        for t in group:
+            if t.name in seen:
+                continue
+            seen.add(t.name)
+            func = getattr(t, "func", None) or getattr(t, "coroutine", None)
+            if func is None:
+                continue
+            try:
+                t.func.__annotations__ = get_type_hints(func, include_extras=True)
+            except Exception:
+                pass
+
+
+_fix_injected_annotations()
 
 
 def all_tools() -> list:

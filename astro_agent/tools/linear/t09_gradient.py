@@ -13,14 +13,21 @@ model bge-ai-models/1.0.1.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from astro_agent.config import load_settings
+from astro_agent.graph.state import AstroState
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -63,15 +70,6 @@ class GraXpertBGEOptions(BaseModel):
 
 
 class RemoveGradientInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the linear FITS image to process. "
-            "Must be a stacked, cropped FITS from T08."
-        )
-    )
     graxpert_options: GraXpertBGEOptions = Field(default_factory=GraXpertBGEOptions)
 
 
@@ -161,10 +159,10 @@ def _run_graxpert_bge(
 
 @tool(args_schema=RemoveGradientInput)
 def remove_gradient(
-    working_dir: str,
-    image_path: str,
     graxpert_options: GraXpertBGEOptions | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Remove large-scale background gradients from a linear FITS image using
     GraXpert AI background extraction.
@@ -177,18 +175,32 @@ def remove_gradient(
     - Subtraction (default): additive gradients from light pollution or sky glow.
     - Division: multiplicative gradients from residual vignetting after flats.
 """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     if graxpert_options is None:
         graxpert_options = GraXpertBGEOptions()
 
+    original_image_path = image_path
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
     processed_path, bg_model_path = _run_graxpert_bge(img_path, graxpert_options)
 
-    return {
-        "processed_image_path":  str(processed_path),
+    summary = {
+        "output_path": str(processed_path),
+        "pre_gradient_image": str(original_image_path),
         "background_model_path": str(bg_model_path) if bg_model_path else None,
-        "correction_type":       graxpert_options.correction_type,
-        "smoothing":             graxpert_options.smoothing,
+        "settings": {
+            "correction_type": graxpert_options.correction_type,
+            "smoothing": graxpert_options.smoothing,
+            "ai_version": graxpert_options.ai_version,
+            "save_background_model": graxpert_options.save_background_model,
+        },
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(processed_path), "pre_gradient_image": str(original_image_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

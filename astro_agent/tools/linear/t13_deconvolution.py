@@ -31,12 +31,19 @@ CRITICAL CONSTRAINTS:
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import fits_has_nan, run_siril_script
 
 
@@ -224,12 +231,6 @@ class PsfConfig(BaseModel):
 
 
 class DeconvolutionInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description="Absolute path to the linear FITS image to sharpen."
-    )
     method: str = Field(
         default="richardson_lucy",
         description=(
@@ -359,8 +360,6 @@ def _parse_psf_fwhm(stdout: str) -> float | None:
 
 @tool(args_schema=DeconvolutionInput)
 def deconvolution(
-    working_dir: str,
-    image_path: str,
     method: str = "richardson_lucy",
     psf_source: str = "stars",
     psf_file: str | None = None,
@@ -370,7 +369,9 @@ def deconvolution(
     psf_config: PsfConfig | None = None,
     rl_options: RLOptions | None = None,
     wiener_options: WienerOptions | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Sharpen the linear image by deconvolving atmospheric and optical blur.
 
@@ -399,6 +400,9 @@ def deconvolution(
     PSF can be saved (-savepsf via psf_config.save_psf) for reuse across
     multiple deconvolution attempts with different rl/wiener parameters.
 """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     if blind_psf_options is None:
         blind_psf_options = BlindPsfOptions()
     if stars_psf_options is None:
@@ -412,6 +416,7 @@ def deconvolution(
     if wiener_options is None:
         wiener_options = WienerOptions()
 
+    original_image_path = image_path
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -466,17 +471,31 @@ def deconvolution(
             "  5. Skip deconvolution entirely if SNR is low (snr_estimate < 50)."
         )
 
-    psf_fwhm_used = _parse_psf_fwhm(result.stdout)
+    psf_fwhm = _parse_psf_fwhm(result.stdout)
 
-    return {
-        "processed_image_path": str(output_path),
-        "sharpened_image_path": str(output_path),
+    summary = {
+        "output_path": str(output_path),
+        "pre_decon_image": str(original_image_path),
         "method": method,
         "psf_source": psf_source,
-        "psf_profile": manual_psf_options.profile if psf_source == "manual" else None,
-        "psf_fwhm_used": psf_fwhm_used,
-        "psf_saved_to": psf_config.save_psf,
-        "iterations_used": rl_options.iterations if method == "richardson_lucy" else None,
-        "regularization": rl_options.regularization if method == "richardson_lucy" else None,
-        "stop_criterion": rl_options.stop if method == "richardson_lucy" else None,
+        "psf_fwhm_px": psf_fwhm,
+        "settings": {},
     }
+    if method == "richardson_lucy":
+        summary["settings"] = {
+            "iterations": rl_options.iterations,
+            "regularization": rl_options.regularization,
+            "alpha": rl_options.alpha,
+            "stop": rl_options.stop,
+            "gdstep": rl_options.gdstep,
+            "use_multiplicative": rl_options.use_multiplicative,
+        }
+    elif method == "wiener":
+        summary["settings"] = {
+            "alpha": wiener_options.alpha,
+        }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(output_path), "pre_decon_image": str(original_image_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

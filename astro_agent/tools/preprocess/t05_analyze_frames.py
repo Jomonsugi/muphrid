@@ -30,24 +30,15 @@ from __future__ import annotations
 import re
 import statistics
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
-from pydantic import BaseModel, Field
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 
-
-# ── Pydantic input schema ──────────────────────────────────────────────────────
-
-class AnalyzeFramesInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    calibrated_sequence: str = Field(
-        description=(
-            "Name of the calibrated sequence (without .seq extension). "
-            "This is the INPUT to registration — where Siril writes R-lines. "
-            "Typically 'pp_lights_seq' from T03.  NOT the r_<seq> output."
-        )
-    )
+from astro_agent.graph.state import AstroState
 
 
 # ── .seq parser ────────────────────────────────────────────────────────────────
@@ -308,17 +299,17 @@ def _compute_summary(frame_metrics: dict[str, dict], seq_data: dict) -> dict:
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool(args_schema=AnalyzeFramesInput)
+@tool
 def analyze_frames(
-    working_dir: str,
-    calibrated_sequence: str,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    state: Annotated[AstroState, InjectedState],
+) -> Command:
     """
     Extract per-frame registration data from a Siril .seq file.
 
-    Reads per-frame metrics that Siril computed during registration (FWHM,
-    wFWHM, roundness, quality, background, star count) and returns them with
-    summary statistics.
+    Reads the calibrated sequence from state. Parses per-frame metrics that
+    Siril computed during registration (FWHM, wFWHM, roundness, quality,
+    background, star count) and writes them to state.
 
     The returned data enables frame selection decisions:
       - median_fwhm + std_fwhm → set FWHM rejection thresholds
@@ -327,24 +318,28 @@ def analyze_frames(
       - sky_consistency (background CV) → detect clouds / moon interference
       - outlier_frames → frames > 2σ above median FWHM
 
-    If has_registration_data is False, registration did not produce star
-    metrics.  Re-run T04 with tuned findstar parameters (lower sigma,
-    increased radius, relax=True) before concluding the data is unusable.
+    If has_registration_data is False, re-run T04 with tuned findstar
+    parameters (lower sigma, increased radius, relax=True).
     """
+    working_dir = state["dataset"]["working_dir"]
+    calibrated_sequence = state["paths"]["calibrated_sequence"]
+    if not calibrated_sequence:
+        raise ValueError("calibrated_sequence not found in state. Run calibrate (T03) and register (T04) first.")
+
     wdir = Path(working_dir)
     seq_path = wdir / f"{calibrated_sequence}.seq"
     if not seq_path.exists():
         raise FileNotFoundError(
             f"Sequence file not found: {seq_path}. "
-            f"Ensure calibration (T03) and registration (T04) completed. "
-            f"Pass the calibrated sequence name, NOT the registered output."
+            f"Ensure calibration (T03) and registration (T04) completed."
         )
 
     seq_data = _parse_seq_file(seq_path)
     frame_metrics = _build_frame_metrics(seq_data)
     summary = _compute_summary(frame_metrics, seq_data)
 
-    return {
-        "frame_metrics": frame_metrics,
-        "summary":       summary,
-    }
+    import json
+    return Command(update={
+        "metrics": {**state["metrics"], "frame_stats": frame_metrics, "frame_summary": summary},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2), tool_call_id=tool_call_id)],
+    })

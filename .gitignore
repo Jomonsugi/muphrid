@@ -48,3 +48,7 @@ Thumbs.db
 # Test data (RAF/FITS — not for version control)
 test_images/
 manual_pipeline_output/
+
+# Runtime artifacts
+checkpoints.db
+.claude/

@@ -18,26 +18,24 @@ Important constraints:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class RemoveGreenNoiseInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the linear OSC/DSLR FITS to process. "
-            "Must be color (is_osc=True) and in linear space."
-        )
-    )
     protection_type: str = Field(
         default="average_neutral",
         description=(
@@ -75,12 +73,12 @@ class RemoveGreenNoiseInput(BaseModel):
 
 @tool(args_schema=RemoveGreenNoiseInput)
 def remove_green_noise(
-    working_dir: str,
-    image_path: str,
     protection_type: str = "average_neutral",
     amount: float = 1.0,
     preserve_lightness: bool = True,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Remove systematic green cast from OSC/DSLR images using Siril SCNR.
 
@@ -100,6 +98,9 @@ def remove_green_noise(
     - additive_mask: gentlest, accepts amount (0–1). Best for narrowband
       or targets where preserving subtle green tones matters.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -135,9 +136,18 @@ def remove_green_noise(
     if not output_path.exists():
         raise FileNotFoundError(f"rmgreen did not produce: {output_path}")
 
-    return {
-        "cleaned_image_path": str(output_path),
-        "protection_type": protection_type,
-        "amount": amount,
-        "preserve_lightness": preserve_lightness,
+    summary = {
+        "output_path": str(output_path),
+        "settings": {
+            "protection_type": protection_type,
+            "siril_type_int": type_int,
+            "amount": amount if type_int >= 2 else None,
+            "preserve_lightness": preserve_lightness,
+        },
+        "siril_command": rmgreen_cmd,
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(output_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

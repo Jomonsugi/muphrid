@@ -24,28 +24,26 @@ Input requirements:
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from astro_agent.config import load_settings
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class StarRemovalInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the stretched (non-linear) FITS image. "
-            "Must be post-stretch (T14). StarNet processes non-linear images."
-        )
-    )
     upscale: bool = Field(
         description=(
             "Apply 2× intermediate upsampling before star removal (-u flag). "
@@ -109,11 +107,11 @@ def _run_starnet(
 
 @tool(args_schema=StarRemovalInput)
 def star_removal(
-    working_dir: str,
-    image_path: str,
     upscale: bool,
     generate_star_mask: bool = True,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Remove stars from the stretched image using StarNet v2 neural network.
 
@@ -128,6 +126,9 @@ def star_removal(
     images have tight stars that StarNet partially misses without upscaling.
     Upscaling doubles processing time and adds no benefit when FWHM ≥ 2px.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -197,9 +198,16 @@ def star_removal(
         if mf.exists():
             mask_fits_path = str(mf)
 
-    return {
+    summary = {
         "starless_image_path": str(starless_fits),
         "star_mask_path": mask_fits_path,
+        "upscale": upscale,
+        "generate_star_mask": generate_star_mask,
         "color_detected": color_detected,
-        "tif_intermediate": str(tif_path),
+        "starnet_stdout": starnet_stdout.strip(),
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "starless_image": str(starless_fits), "star_mask": mask_fits_path},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

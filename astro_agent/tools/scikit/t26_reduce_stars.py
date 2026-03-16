@@ -24,16 +24,24 @@ Backend: Pure Python — scikit-image + Astropy. No Siril invocation.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 from astropy.io import fits as astropy_fits
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 from skimage.filters import gaussian
 from skimage.measure import label, regionprops
 from skimage.morphology import binary_dilation, dilation, diamond, disk, erosion, square
 from skimage.feature import peak_local_max
+
+from astro_agent.graph.state import AstroState
 
 _FOOTPRINT_BUILDERS = {
     "disk": disk,
@@ -45,23 +53,6 @@ _FOOTPRINT_BUILDERS = {
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class ReduceStarsInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the final combined FITS image (stars + starless). "
-            "Call after T19 star_restoration, not on the starless image alone."
-        )
-    )
-    star_mask_path: str | None = Field(
-        default=None,
-        description=(
-            "Absolute path to the star mask FITS from T15 star_removal. "
-            "Preferred over auto-detection — more precise and prevents erosion "
-            "from affecting bright nebula knots misidentified as stars."
-        ),
-    )
     detection_threshold: float = Field(
         default=0.6,
         description=(
@@ -238,9 +229,6 @@ def _count_stars_affected(star_binary: np.ndarray, connectivity: int = 2) -> int
 
 @tool(args_schema=ReduceStarsInput)
 def reduce_stars(
-    working_dir: str,
-    image_path: str,
-    star_mask_path: str | None = None,
     detection_threshold: float = 0.6,
     kernel_radius: int = 1,
     structuring_element: str = "disk",
@@ -254,7 +242,9 @@ def reduce_stars(
     label_connectivity: int = 2,
     feather_px: int = 3,
     output_stem: str | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Physically reduce the angular size of stars via morphological erosion.
 
@@ -268,6 +258,9 @@ def reduce_stars(
       cores from being incorrectly identified as stars
     - blend_amount=0.5: half-strength, useful when stars are only mildly large
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -277,8 +270,11 @@ def reduce_stars(
     data, is_color = _load_fits(img_path)
     lum = _compute_luminance(data)
 
-    if star_mask_path and Path(star_mask_path).exists():
-        star_binary = _load_mask_channel(Path(star_mask_path))
+    # Use explicit star_mask_path if given, else fall back to state
+    effective_mask_path = star_mask_path or state["paths"].get("star_mask")
+
+    if effective_mask_path and Path(effective_mask_path).exists():
+        star_binary = _load_mask_channel(Path(effective_mask_path))
         if star_binary.shape != lum.shape:
             from skimage.transform import resize
             star_binary = resize(
@@ -331,12 +327,8 @@ def reduce_stars(
         )
 
     # Measure size reduction as shrinkage of bright star area.
-    # Threshold the output luminance at the same level used for detection
-    # and compare how many pixels are still "star-bright" vs before erosion.
     output_lum = _compute_luminance(output_data)
     lum_threshold = float(np.mean(lum[star_binary])) if np.any(star_binary) else detection_threshold
-    # Constrain post-counting to the original star region to avoid bright nebulosity
-    # elsewhere in the frame contaminating the star-size metric.
     star_pixels_after = int(np.sum((output_lum > lum_threshold) & star_binary))
     mean_size_reduction_pct = (
         float((star_pixels_before - star_pixels_after) / (star_pixels_before + 1e-9) * 100)
@@ -351,8 +343,25 @@ def reduce_stars(
     hdu = astropy_fits.PrimaryHDU(data=output_data)
     astropy_fits.HDUList([hdu]).writeto(out_path, overwrite=True)
 
-    return {
-        "reduced_image_path": str(out_path),
+    summary = {
+        "output_path": str(out_path),
         "stars_affected_count": stars_affected_count,
+        "star_pixels_before": star_pixels_before,
+        "star_pixels_after": star_pixels_after,
         "mean_size_reduction_pct": round(mean_size_reduction_pct, 2),
+        "settings": {
+            "detection_threshold": detection_threshold,
+            "kernel_radius": kernel_radius,
+            "structuring_element": structuring_element,
+            "erosion_mode": erosion_mode,
+            "iterations": iterations,
+            "blend_amount": blend_amount,
+            "protect_core_radius": protect_core_radius,
+            "feather_px": feather_px,
+        },
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(out_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

@@ -37,27 +37,19 @@ green channel in broadband captures mostly continuum light.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
 from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class ExtractNarrowbandInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the CFA (non-debayered) FITS image. "
-            "Must contain a Bayer mosaic pattern (BAYER_PATTERN FITS keyword). "
-            "Input must be a calibrated but not debayered FITS from T03 (debayer=False). "
-            "Common pattern: stacked CFA lights, or a single calibrated CFA frame."
-        )
-    )
     extraction_type: str = Field(
         default="ha_oiii",
         description=(
@@ -97,11 +89,10 @@ class ExtractNarrowbandInput(BaseModel):
 
 @tool(args_schema=ExtractNarrowbandInput)
 def extract_narrowband(
-    working_dir: str,
-    image_path: str,
     extraction_type: str = "ha_oiii",
     upscale_ha: bool = False,
     resample: str | None = None,
+    state: Annotated[AstroState, InjectedState] = None,
 ) -> dict:
     """
     Extract narrowband channels (Hα, O-III, Green) from a CFA (Bayer mosaic) image.
@@ -124,6 +115,9 @@ def extract_narrowband(
 
     Returns paths to extracted channel FITS files.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")

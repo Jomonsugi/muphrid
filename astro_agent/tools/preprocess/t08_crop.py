@@ -18,29 +18,26 @@ Siril command: crop <x> <y> <w> <h>
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 from astropy.io import fits
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class AutoCropInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the stacked FITS to crop. "
-            "Typically master_light.fit from siril_stack (T07), or any intermediate "
-            "FITS at any pipeline stage."
-        )
-    )
     mode: str = Field(
         default="auto",
         description=(
@@ -135,27 +132,33 @@ def _find_crop_bounds(image_path: Path, threshold: float) -> tuple[int, int, int
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool(args_schema=AutoCropInput)
+@tool
 def auto_crop(
-    working_dir: str,
-    image_path: str,
     mode: str = "auto",
     threshold: float = 0.01,
     x: int | None = None,
     y: int | None = None,
     w: int | None = None,
     h: int | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
-    Crop a FITS image, either automatically (border removal) or manually
-    (user-specified coordinates).
+    Crop a FITS image to remove registration borders or reframe to user coordinates.
 
-    Auto mode: detects and removes black registration borders automatically.
+    Working directory and current image path are read from state.
 
-    Manual mode: executes a crop to the specified coordinates. Call with
-    mode='manual' and the confirmed x/y/w/h. Do not infer or guess crop
-    coordinates autonomously.
+    Args:
+        mode: 'auto' (detect and remove black borders) or 'manual'
+            (crop to explicit x/y/w/h coordinates — obtain from user first).
+        threshold: Auto mode border detection threshold (default 0.01).
+        x, y, w, h: Manual mode crop coordinates (top-left + size in pixels).
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+    if not image_path:
+        raise ValueError("current_image not found in state. Run siril_stack (T07) first.")
+
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -199,9 +202,24 @@ def auto_crop(
             f"Siril crop geometry was: x={crop_x} y={crop_y} w={crop_w} h={crop_h}"
         )
 
-    return {
-        "cropped_image_path": str(cropped_path),
+    summary = {
+        "output_path": str(cropped_path),
         "mode": mode,
-        "crop_geometry": {"x": crop_x, "y": crop_y, "w": crop_w, "h": crop_h},
+        "crop_geometry": {
+            "x": crop_x,
+            "y": crop_y,
+            "width": crop_w,
+            "height": crop_h,
+        },
+        "original_dimensions": {
+            "width": full_w,
+            "height": full_h,
+        },
         "pixels_removed_pct": removed_pct,
+        "threshold": threshold if mode == "auto" else None,
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(cropped_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

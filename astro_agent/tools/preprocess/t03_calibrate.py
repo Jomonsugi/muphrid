@@ -46,12 +46,19 @@ Siril commands (Siril 1.4):
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
@@ -87,104 +94,6 @@ class CosmeticCorrectionOptions(BaseModel):
     )
 
 
-# ── Pydantic input schema ──────────────────────────────────────────────────────
-
-class CalibrateInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    lights_sequence: str = Field(
-        description=(
-            "Name of the lights sequence to calibrate (without .seq extension). "
-            "Must already exist in working_dir — produced by T02b convert_sequence. "
-            "T04 register expects the output to be 'pp_lights_seq' (default prefix)."
-        )
-    )
-    master_bias: str | None = Field(
-        default=None,
-        description=(
-            "Absolute path to master bias FITS. "
-            "OR a uniform level expression (e.g. '=256' or '=64*$OFFSET'). "
-            "Null to skip bias subtraction."
-        ),
-    )
-    master_dark: str | None = Field(
-        default=None,
-        description="Absolute path to master dark FITS. Null to skip dark subtraction.",
-    )
-    master_flat: str | None = Field(
-        default=None,
-        description="Absolute path to master flat FITS. Null to skip flat correction.",
-    )
-    is_cfa: bool = Field(
-        description=(
-            "True for OSC/DSLR/mirrorless cameras (Bayer or X-Trans CFA). "
-            "Always True for camera RAW input. False for monochrome sensors."
-        )
-    )
-    debayer: bool = Field(
-        default=True,
-        description=(
-            "Demosaic (debayer) CFA data after calibration. "
-            "True for all color cameras. False only for mono sensors."
-        ),
-    )
-    equalize_cfa: bool = Field(
-        default=False,
-        description=(
-            "Equalize CFA channel mean intensities from the master flat to prevent "
-            "color tinting (-equalize_cfa). "
-            "Set True for Fujifilm X-Trans cameras — critical for correct color after "
-            "flat calibration of the irregular X-Trans CFA pattern. "
-            "Not needed for standard Bayer sensors."
-        ),
-    )
-    fix_xtrans: bool = Field(
-        default=False,
-        description=(
-            "Correct the rectangle artifact in darks and biases caused by Fujifilm's "
-            "phase-detection autofocus pixels (-fix_xtrans). "
-            "Set True for all Fujifilm X-Trans cameras (X-T30, X-T4, X-S10, X-H2, etc.). "
-            "Has no effect on Bayer or mono sensors."
-        ),
-    )
-    cosmetic_correction: CosmeticCorrectionOptions = Field(
-        default_factory=CosmeticCorrectionOptions,
-    )
-    optimize_dark: str | None = Field(
-        default=None,
-        description=(
-            "Dark frame scaling optimization. "
-            "'auto': Siril computes dark scaling coefficient automatically (-opt). "
-            "Requires both bias and dark masters. Use when dark exposure differs "
-            "from light exposure. "
-            "'exp': Compute coefficient from the EXPTIME FITS keyword (-opt=exp). "
-            "Null: No scaling — use when dark and light exposures match exactly."
-        ),
-    )
-    process_all: bool = Field(
-        default=False,
-        description=(
-            "Process all frames including those marked as excluded (-all). "
-            "Normally excluded frames are skipped."
-        ),
-    )
-    prefix: str | None = Field(
-        default=None,
-        description=(
-            "Output filename prefix for calibrated frames. "
-            "Default 'pp_' produces 'pp_lights_seq.seq'. "
-            "Change only if downstream tools expect a different name."
-        ),
-    )
-    output_fitseq: bool = Field(
-        default=False,
-        description=(
-            "Write output as a single multi-image FITS sequence file (-fitseq) "
-            "instead of individual per-frame FITS files. "
-            "Individual files (default) are more compatible with external tools."
-        ),
-    )
 
 
 # ── Output parsing ─────────────────────────────────────────────────────────────
@@ -204,35 +113,26 @@ def _parse_calibrate_output(stdout: str) -> tuple[int, int]:
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool(args_schema=CalibrateInput)
+@tool
 def calibrate(
-    working_dir: str,
-    lights_sequence: str,
     is_cfa: bool,
-    master_bias: str | None = None,
-    master_dark: str | None = None,
-    master_flat: str | None = None,
-    debayer: bool = True,
-    equalize_cfa: bool = False,
-    fix_xtrans: bool = False,
-    cosmetic_correction: CosmeticCorrectionOptions | None = None,
-    optimize_dark: str | None = None,
-    process_all: bool = False,
-    prefix: str | None = None,
-    output_fitseq: bool = False,
-) -> dict:
+    debayer: bool,
+    equalize_cfa: bool,
+    fix_xtrans: bool,
+    cosmetic_correction: CosmeticCorrectionOptions | None,
+    optimize_dark: str | None,
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    state: Annotated[AstroState, InjectedState],
+) -> Command:
     """
     Apply master calibration frames to raw light subs in CFA (raw) space,
-    then debayer. This is the correct mathematical order: dark current,
-    bias, and flat vignetting are sensor-space properties that must be
-    corrected before color interpolation.
+    then debayer. Working directory, lights sequence, and master paths are
+    read from state automatically.
 
-    Camera-specific settings (derived from the camera model):
+    Camera-specific settings (derived from sensor_type in dataset.acquisition_meta):
 
       Fujifilm X-Trans (X-T30, X-T4, X-S10, X-H2, etc.):
         is_cfa=True, debayer=True, fix_xtrans=True, equalize_cfa=True
-        Siril 1.4 auto-applies Markesteijn for X-Trans. Set quality=3 in
-        Siril Preferences once for best detail preservation.
 
       Bayer OSC/DSLR/mirrorless (Canon, Nikon, Sony, ZWO OSC):
         is_cfa=True, debayer=True, fix_xtrans=False, equalize_cfa=False
@@ -240,12 +140,31 @@ def calibrate(
       Monochrome (ZWO mono, Atik, QHY mono):
         is_cfa=False, debayer=False
 
-    Bias can be a file path or a uniform level expression (e.g. '=256').
-    Cosmetic correction requires master_dark for method='dark'.
-    Dark optimization requires both bias and dark for mode='auto'.
+    Args:
+        is_cfa: True for any OSC/DSLR/mirrorless camera (Bayer or X-Trans).
+            False only for monochrome sensors.
+        debayer: Demosaic CFA data after calibration. True for all color cameras.
+        equalize_cfa: Equalize CFA channel means to prevent color tinting.
+            Required for Fujifilm X-Trans; not needed for Bayer.
+        fix_xtrans: Correct rectangle artifacts from Fuji phase-detection AF pixels.
+            Required for all Fujifilm X-Trans cameras.
+        cosmetic_correction: Hot/cold pixel correction options. Null uses defaults.
+        optimize_dark: Dark scaling: 'auto' (Siril computes coefficient),
+            'exp' (from EXPTIME keyword), or null (no scaling — use when
+            dark and light exposures match exactly).
     """
     if cosmetic_correction is None:
         cosmetic_correction = CosmeticCorrectionOptions()
+
+    working_dir = state["dataset"]["working_dir"]
+    lights_sequence = state["paths"]["lights_sequence"]
+    masters = state["paths"]["masters"]
+    master_bias = masters.get("bias")
+    master_dark = masters.get("dark")
+    master_flat = masters.get("flat")
+
+    if not lights_sequence:
+        raise ValueError("lights_sequence not found in state. Run convert_sequence first.")
 
     parts: list[str] = ["calibrate", lights_sequence]
 
@@ -281,25 +200,35 @@ def calibrate(
     elif optimize_dark == "auto":
         parts.append("-opt")
 
-    if process_all:
-        parts.append("-all")
-    if prefix is not None:
-        parts.append(f"-prefix={prefix}")
-    if output_fitseq:
-        parts.append("-fitseq")
-
     calibrate_cmd = " ".join(parts)
     result = run_siril_script([calibrate_cmd], working_dir=working_dir, timeout=600)
 
     calibrated, bad_pixels = _parse_calibrate_output(result.stdout)
 
-    output_prefix = prefix if prefix is not None else "pp_"
-    calibrated_seq = f"{output_prefix}{lights_sequence}"
-    calibrated_seq_path = Path(working_dir) / f"{calibrated_seq}.seq"
+    calibrated_seq = f"pp_{lights_sequence}"
 
-    return {
-        "calibrated_sequence":      calibrated_seq,
-        "calibrated_sequence_path": str(calibrated_seq_path),
-        "calibrated_count":         calibrated,
-        "bad_pixel_count":          bad_pixels,
+    summary = {
+        "calibrated_sequence": calibrated_seq,
+        "lights_sequence": lights_sequence,
+        "calibrated_count": calibrated,
+        "bad_pixels_corrected": bad_pixels,
+        "masters_applied": {
+            "bias": master_bias,
+            "dark": master_dark,
+            "flat": master_flat,
+        },
+        "settings": {
+            "is_cfa": is_cfa,
+            "debayer": debayer,
+            "equalize_cfa": equalize_cfa,
+            "fix_xtrans": fix_xtrans,
+            "cosmetic_correction_method": cc.method,
+            "optimize_dark": optimize_dark,
+        },
+        "siril_command": calibrate_cmd,
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "calibrated_sequence": calibrated_seq},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

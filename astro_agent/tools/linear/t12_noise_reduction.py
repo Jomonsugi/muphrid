@@ -23,16 +23,23 @@ GraXpert command used:
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 import numpy as np
 from astropy.io import fits as astropy_fits
 
 from astro_agent.config import load_settings
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
@@ -81,22 +88,18 @@ class DenoiseOptions(BaseModel):
 
 
 class NoiseReductionInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the linear FITS image to denoise. "
-            "Must be post gradient-removal and color calibration (T09, T10, T11)."
-        )
-    )
     options: DenoiseOptions = Field(default_factory=DenoiseOptions)
 
 
 # ── Noise measurement ──────────────────────────────────────────────────────────
 
-def _measure_bgnoise(stem: str, working_dir: str) -> float | None:
-    """Run Siril bgnoise on the loaded image and parse the result."""
+def _measure_bgnoise(stem: str, working_dir: str) -> tuple[float | None, str | None]:
+    """
+    Run Siril bgnoise on the loaded image and parse the result.
+
+    Returns (noise_value, error_msg). If measurement succeeds, error_msg is None.
+    If it fails, noise_value is None and error_msg explains why.
+    """
     from astro_agent.tools._siril import SirilError
     import re
     try:
@@ -107,10 +110,12 @@ def _measure_bgnoise(stem: str, working_dir: str) -> float | None:
         )
         m = re.search(r"Background\s+noise[^\d]*([\d.e+-]+)", result.stdout, re.IGNORECASE)
         if m:
-            return float(m.group(1))
-    except (SirilError, ValueError):
-        pass
-    return None
+            return float(m.group(1)), None
+        return None, f"bgnoise ran but could not parse noise value from output: {result.stdout[-200:]}"
+    except SirilError as e:
+        return None, f"bgnoise Siril error: {e}"
+    except ValueError as e:
+        return None, f"bgnoise parse error: {e}"
 
 
 # ── GraXpert denoising ─────────────────────────────────────────────────────────
@@ -212,10 +217,10 @@ def _run_graxpert_denoise(
 
 @tool(args_schema=NoiseReductionInput)
 def noise_reduction(
-    working_dir: str,
-    image_path: str,
     options: DenoiseOptions | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     AI-based noise reduction on the linear FITS image using GraXpert.
 
@@ -230,6 +235,9 @@ def noise_reduction(
     Returns noise_before, noise_after, and noise_reduction_pct for quantitative
     assessment of the denoising result.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     if options is None:
         options = DenoiseOptions()
 
@@ -237,20 +245,37 @@ def noise_reduction(
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    noise_before = _measure_bgnoise(img_path.stem, working_dir)
-
     output_path, zero_pixels_pedestaled = _run_graxpert_denoise(img_path, options)
 
-    noise_after = _measure_bgnoise(output_path.stem, working_dir)
-
-    reduction_pct: float | None = None
+    # Measure noise before/after if possible
+    noise_before, before_err = _measure_bgnoise(img_path.stem, working_dir)
+    noise_after, after_err = _measure_bgnoise(output_path.stem, working_dir)
+    noise_reduction_pct = None
     if noise_before and noise_after and noise_before > 0:
-        reduction_pct = round((1.0 - noise_after / noise_before) * 100, 1)
+        noise_reduction_pct = round((1.0 - noise_after / noise_before) * 100, 2)
 
-    return {
-        "denoised_image_path":    str(output_path),
-        "noise_before":           noise_before,
-        "noise_after":            noise_after,
-        "noise_reduction_pct":    reduction_pct,
+    noise_warnings = []
+    if before_err:
+        noise_warnings.append(f"Could not measure noise before denoising: {before_err}")
+    if after_err:
+        noise_warnings.append(f"Could not measure noise after denoising: {after_err}")
+
+    summary = {
+        "output_path": str(output_path),
+        "noise_before": noise_before,
+        "noise_after": noise_after,
+        "noise_reduction_pct": noise_reduction_pct,
+        "noise_measurement_warnings": noise_warnings if noise_warnings else None,
         "zero_pixels_pedestaled": zero_pixels_pedestaled,
+        "settings": {
+            "strength": options.strength,
+            "ai_version": options.ai_version,
+            "batch_size": options.batch_size,
+            "gpu": options.gpu,
+        },
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(output_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

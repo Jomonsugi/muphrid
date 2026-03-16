@@ -11,8 +11,11 @@ See graph_design.md for the architecture:
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import mimetypes
+import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +26,7 @@ from langgraph.types import interrupt
 from astro_agent.graph.hitl import (
     images_from_tool,
     is_affirmative,
+    is_autonomous,
     is_enabled,
     resolve_hitl_checkpoint,
     tool_cfg,
@@ -54,7 +58,7 @@ def phase_router(state: AstroState) -> dict[str, Any]:
     else:
         logger.info(f"Phase router: {phase.value} — routing to agent")
 
-    return {"_phase_prompt": phase_prompt}
+    return {}
 
 
 def route_after_phase_router(state: AstroState) -> str:
@@ -118,6 +122,133 @@ def _in_active_hitl(messages: list) -> bool:
     )
 
 
+# ── Stuck-loop detection ──────────────────────────────────────────────────────
+# Hard fail if the agent calls the same tool N times in a row. This is a
+# testing safety net — set MAX_CONSECUTIVE_SAME_TOOL in .env. 0 disables.
+
+
+class StuckLoopError(RuntimeError):
+    """Raised when the agent calls the same tool too many times consecutively."""
+
+
+def _check_stuck_loop(messages: list) -> None:
+    """
+    Walk backward through recent messages to detect repeated identical tool calls.
+    Raises StuckLoopError if the limit is hit. Does nothing if limit is 0.
+
+    Only triggers when both the tool name AND arguments are identical across
+    consecutive calls. Calling build_masters(file_type="bias") then
+    build_masters(file_type="dark") is intentional — not a stuck loop.
+    """
+    import json
+    import os
+    limit = int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "0"))
+    if limit <= 0:
+        return
+
+    # Collect (name, args_fingerprint) tuples for recent tool calls
+    recent_calls: list[str] = []  # serialized (name, sorted_args) for comparison
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                fingerprint = json.dumps(
+                    {"name": tc["name"], "args": tc.get("args", {})},
+                    sort_keys=True,
+                )
+                recent_calls.append(fingerprint)
+            if len(recent_calls) >= limit:
+                break
+        elif isinstance(msg, (ToolMessage,)):
+            continue  # skip tool results, look at the AI calls
+        elif isinstance(msg, HumanMessage):
+            break  # human intervention resets the counter
+        elif isinstance(msg, AIMessage) and not msg.tool_calls:
+            break  # text response resets the counter
+
+    if len(recent_calls) < limit:
+        return
+
+    check = recent_calls[:limit]
+    if len(set(check)) == 1:
+        # All calls are identical (same name + same args)
+        call_info = json.loads(check[0])
+        raise StuckLoopError(
+            f"Agent called '{call_info['name']}' {limit} times with identical "
+            f"arguments {call_info['args']} — aborting. "
+            f"This likely means the model is stuck or the tool is broken. "
+            f"Set MAX_CONSECUTIVE_SAME_TOOL=0 in .env to disable this check."
+        )
+
+
+# ── DeepSeek raw tool-call token rescue ───────────────────────────────────────
+# DeepSeek-V3 (via Together AI) occasionally degenerates and emits its internal
+# tool-call delimiters as plain text instead of populating the tool_calls field:
+#
+#   <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_name<｜tool▁sep｜>{...}<｜tool▁call▁end｜>
+#
+# When this happens, route_after_agent sees no tool_calls and routes to
+# agent_chat, which nudges the model — making the loop worse (growing indent).
+# This function detects the pattern and reconstructs a proper AIMessage so
+# the tool actually executes.
+
+_DEEPSEEK_TOOL_CALL_RE = re.compile(
+    r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)(?:<｜tool▁call▁end｜>|$)",
+    re.DOTALL,
+)
+
+
+def _rescue_raw_tool_calls(response: AIMessage) -> AIMessage:
+    """
+    If the model emitted DeepSeek native tool-call tokens as plain text,
+    parse them and return a proper AIMessage with structured tool_calls.
+    Returns the original response unchanged if no such pattern is found.
+    """
+    content = response.content if isinstance(response.content, str) else ""
+    if "<｜tool▁calls▁begin｜>" not in content:
+        return response
+
+    logger.info("DeepSeek rescue: detected raw tool-call tokens in response text — attempting parse")
+
+    matches = _DEEPSEEK_TOOL_CALL_RE.findall(content)
+    if not matches:
+        logger.warning("DeepSeek rescue: detected <｜tool▁calls▁begin｜> but regex found no tool call blocks")
+        return response
+
+    tool_calls = []
+    for tool_name, args_str in matches:
+        tool_name = tool_name.strip()
+        args_str = args_str.strip()
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            # Truncated JSON — try to recover by closing open braces
+            try:
+                open_braces = args_str.count("{") - args_str.count("}")
+                args = json.loads(args_str + "}" * max(open_braces, 1))
+                logger.info(f"DeepSeek rescue: recovered truncated JSON for {tool_name!r}")
+            except json.JSONDecodeError:
+                logger.warning(
+                    f"DeepSeek rescue: could not parse args for {tool_name!r}: {args_str[:100]!r}"
+                )
+                continue
+        tool_calls.append({
+            "name": tool_name,
+            "args": args,
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "tool_call",
+        })
+
+    if not tool_calls:
+        logger.warning("DeepSeek rescue: no tool calls successfully parsed — passing response through unchanged")
+        return response
+
+    logger.info(
+        f"DeepSeek rescue: successfully reconstructed {len(tool_calls)} tool call(s): "
+        f"{[tc['name'] for tc in tool_calls]}"
+    )
+    return AIMessage(content="", tool_calls=tool_calls)
+
+
 def make_agent_node(model_factory):
     """
     Create the agent node with a model factory for phase-gated tool binding.
@@ -130,22 +261,30 @@ def make_agent_node(model_factory):
         phase = state.get("phase", ProcessingPhase.INGEST)
         model = model_factory(phase)
 
-        # Build message list with system prompt
-        phase_prompt = state.get("_phase_prompt", "")
+        raw_messages = list(state.get("messages", []))
+
+        # Stuck-loop detection: hard fail if the agent repeats the same tool call.
+        _check_stuck_loop(raw_messages)
+
+        # Build message list with system prompt — read phase prompt directly
+        # from PHASE_PROMPTS so it's always in sync with the current phase
+        # (advance_phase tool updates state["phase"] mid-loop).
+        phase_prompt = _PHASE_PROMPTS.get(phase, "")
         system = f"{_SYSTEM_BASE}\n\n{phase_prompt}"
 
-        messages = [SystemMessage(content=system)] + list(state.get("messages", []))
+        messages = [SystemMessage(content=system)] + raw_messages
 
         # VLM scoping: images are only visible during active HITL conversations.
         # Once the human approves and we move on, strip all images from the view.
-        if not _in_active_hitl(state.get("messages", [])):
+        if not _in_active_hitl(raw_messages):
             messages = _strip_vlm_images(messages)
 
         response = model.invoke(messages)
+        response = _rescue_raw_tool_calls(response)
 
         logger.info(
             f"Agent response: {'tool_calls' if response.tool_calls else 'no tool_calls'}"
-            + (f" ({[tc['name'] for tc in response.tool_calls]})" if response.tool_calls else "")
+            + (f" ({[tc['name'] for tc in response.tool_calls]})" if response.tool_calls else f" | text: {str(response.content)[:300]!r}")
         )
 
         return {"messages": [response]}
@@ -159,9 +298,51 @@ def make_agent_node(model_factory):
 # controls which tools the LLM can *call* (via bind_tools), but the
 # ToolNode can execute any of them.
 
+
+def _format_tool_error(exc: Exception) -> str:
+    """
+    Custom error handler that never returns a blank error message.
+
+    LangGraph's default handler filters out validation errors for injected
+    parameters (state, tool_call_id). When ALL errors are about injected
+    params, the filtered list is empty and the LLM sees a blank error —
+    making it impossible to self-correct. This handler catches that case
+    and provides an actionable message.
+    """
+    from langgraph.prebuilt.tool_node import ToolInvocationError
+
+    msg = str(exc).strip()
+
+    if isinstance(exc, ToolInvocationError):
+        # Check if the filtered errors produced an empty message
+        if not msg or "with error:\n" in msg and msg.endswith("Please fix the error and try again."):
+            # The error was filtered away — it's an internal injection issue
+            # Give the LLM the ORIGINAL validation error so it has something to work with
+            original = getattr(exc, "source", None)
+            if original:
+                return (
+                    f"Tool '{exc.tool_name}' failed due to an internal validation error "
+                    f"(not caused by your arguments). Full error: {original}\n"
+                    f"Your arguments were: {exc.tool_kwargs}\n"
+                    f"Try calling the tool again — if this persists, the tool may have "
+                    f"a state dependency issue. Move on to the next step."
+                )
+            return (
+                f"Tool '{exc.tool_name}' failed with an internal error that could not "
+                f"be diagnosed. Your arguments {exc.tool_kwargs} appear valid. "
+                f"Try calling the tool again — if this persists, move on."
+            )
+        return msg
+
+    if not msg:
+        return f"Tool failed with {type(exc).__name__} (no details available). Try a different approach."
+
+    return msg
+
+
 def make_action_node():
     """Create the action node using LangGraph's prebuilt ToolNode."""
-    return ToolNode(all_tools(), handle_tool_errors=True)
+    return ToolNode(all_tools(), handle_tool_errors=_format_tool_error)
 
 
 # ── hitl_check ────────────────────────────────────────────────────────────────
@@ -263,53 +444,73 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     }
 
 
-# ── Phase ordering ────────────────────────────────────────────────────────────
-# The natural progression through the pipeline. phase_advance uses this to
-# determine the next phase when the agent finishes the current one.
+# ── agent_chat ────────────────────────────────────────────────────────────────
+# When the agent responds with text (no tool calls) and is not in an active
+# HITL conversation, it means the agent wants to communicate — ask a question,
+# explain a situation, report a blocker, etc. This node handles that:
+#
+#   HITL mode:      fire interrupt() so the human can read and respond
+#   Autonomous mode: inject a nudge message telling the agent to act or advance
 
-_PHASE_ORDER = [
-    ProcessingPhase.INGEST,
-    ProcessingPhase.CALIBRATION,
-    ProcessingPhase.REGISTRATION,
-    ProcessingPhase.ANALYSIS,
-    ProcessingPhase.STACKING,
-    ProcessingPhase.LINEAR,
-    ProcessingPhase.STRETCH,
-    ProcessingPhase.NONLINEAR,
-    ProcessingPhase.EXPORT,
-    ProcessingPhase.COMPLETE,
-]
-
-_NEXT_PHASE = {
-    _PHASE_ORDER[i]: _PHASE_ORDER[i + 1]
-    for i in range(len(_PHASE_ORDER) - 1)
-}
+_AUTONOMOUS_NUDGE = (
+    "You are in autonomous mode — no human is available to respond. "
+    "Either call a tool to continue processing, or call advance_phase "
+    "to move to the next phase. Do not respond with text again without "
+    "calling a tool."
+)
 
 
-# ── phase_advance ─────────────────────────────────────────────────────────────
-
-def phase_advance(state: AstroState) -> dict[str, Any]:
+def agent_chat(state: AstroState) -> dict[str, Any]:
     """
-    Advance to the next processing phase.
+    Handle text-only agent responses.
 
-    Called when the agent exits the ReAct loop (no tool_calls), meaning it
-    has completed all tasks for the current phase.
+    In HITL mode: fire interrupt() so the human can respond.
+    In autonomous mode: inject a nudge message and route back to agent.
     """
-    current = state.get("phase", ProcessingPhase.INGEST)
-    next_phase = _NEXT_PHASE.get(current, ProcessingPhase.COMPLETE)
-    logger.info(f"Phase advance: {current.value} → {next_phase.value}")
-    return {"phase": next_phase}
+    messages = state.get("messages", [])
+    phase = state.get("phase", ProcessingPhase.INGEST)
+
+    # Extract the agent's text for the interrupt payload
+    agent_text = ""
+    if messages:
+        last = messages[-1]
+        if isinstance(last, AIMessage):
+            agent_text = str(last.content)[:500]
+
+    if is_autonomous():
+        # No human available — nudge the agent to take action
+        logger.info(f"agent_chat (autonomous): nudging agent to act or advance (phase={phase.value})")
+        return {"messages": [HumanMessage(content=_AUTONOMOUS_NUDGE)]}
+
+    # HITL mode — let the human read the agent's message and respond
+    logger.info(f"agent_chat (HITL): firing interrupt for human response (phase={phase.value})")
+    response = interrupt({
+        "type": "agent_chat",
+        "title": f"Agent message ({phase.value} phase)",
+        "agent_text": agent_text,
+        "phase": phase.value,
+    })
+
+    response_text = str(response)
+    logger.info(f"agent_chat: human responded: {response_text!r}")
+
+    return {"messages": [HumanMessage(content=response_text)]}
 
 
 # ── Routing functions ─────────────────────────────────────────────────────────
 
 def route_after_agent(state: AstroState) -> str:
     """
-    After the agent node: if there are tool_calls, go to action.
-    If in an active HITL conversation (human chatting/discussing), route back
-    to hitl_check so interrupt() fires again and the human can continue.
-    If no tool_calls and no active HITL, advance to the next phase.
+    After the agent node:
+    - phase is COMPLETE → end the graph
+    - tool_calls → action (ReAct loop continues)
+    - active HITL conversation → hitl_check (re-fire interrupt for human)
+    - text only → agent_chat (human conversation or autonomous nudge)
     """
+    phase = state.get("phase", ProcessingPhase.INGEST)
+    if phase == ProcessingPhase.COMPLETE:
+        return "__end__"
+
     messages = state.get("messages", [])
     if messages:
         last = messages[-1]
@@ -321,4 +522,4 @@ def route_after_agent(state: AstroState) -> str:
     if state.get("active_hitl", False):
         return "hitl_check"
 
-    return "phase_advance"
+    return "agent_chat"

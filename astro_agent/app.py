@@ -28,14 +28,17 @@ from typing import Any
 
 import streamlit as st
 from langchain_core.messages import HumanMessage
+import sqlite3
+
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
 
 from astro_agent.config import check_dependencies, load_settings
 from astro_agent.graph.graph import build_graph
 from astro_agent.graph.hitl import APPROVE_SENTINEL
 from astro_agent.graph.memory import make_memory_store
-from astro_agent.graph.state import SessionContext, make_empty_state
+from astro_agent.graph.state import SessionContext, build_initial_message, make_empty_state
 from astro_agent.tools.preprocess.t01_ingest import ingest_dataset
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -109,7 +112,8 @@ def _init_graph() -> None:
         check_dependencies(settings)
         _ASTROAGENT_DIR.mkdir(exist_ok=True)
         store = make_memory_store()
-        checkpointer = SqliteSaver.from_conn_string(_DB_PATH)
+        serde = JsonPlusSerializer(allowed_msgpack_modules=[("astro_agent.graph.state", "ProcessingPhase")])
+        checkpointer = SqliteSaver(sqlite3.connect(_DB_PATH, check_same_thread=False), serde=serde)
         st.session_state["graph"] = build_graph(checkpointer=checkpointer, store=store)
 
 
@@ -253,7 +257,11 @@ def _start_new_session(
 
     initial_state = make_empty_state(dataset=dataset, session=session)
     initial_state["messages"] = [
-        HumanMessage(content=f"Process the dataset for {target}. Begin preprocessing.")
+        HumanMessage(content=build_initial_message(
+            dataset=dataset,
+            session=session,
+            ingest_summary=result.get("summary", {}),
+        ))
     ]
 
     thread_id = _make_thread_id(target)

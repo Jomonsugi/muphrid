@@ -29,9 +29,13 @@ Cross-validation:
 
 from __future__ import annotations
 
+import logging
+import os
 import uuid
 from pathlib import Path
 from typing import NamedTuple
+
+logger = logging.getLogger(__name__)
 
 import exiftool
 from langchain_core.tools import tool
@@ -86,6 +90,13 @@ class IngestDatasetInput(BaseModel):
             "determined from EXIF/headers or the filename."
         ),
     )
+    thread_id: str | None = Field(
+        default=None,
+        description=(
+            "Thread/run ID for the processing session. Used as the output "
+            "directory name: runs/<thread_id>/. Passed by the CLI."
+        ),
+    )
 
 
 # ── EXIF extraction via ExifTool ───────────────────────────────────────────────
@@ -123,7 +134,8 @@ def _sample_frame(file_path: Path) -> _FrameSample | None:
     try:
         with exiftool.ExifToolHelper() as et:
             tags = et.get_metadata(str(file_path))[0]
-    except Exception:
+    except Exception as e:
+        logger.warning("ExifTool failed on %s: %s", file_path, e)
         return None
 
     raw_iso = _first(tags, _ISO_KEYS)
@@ -158,7 +170,8 @@ def _extract_raw_meta(
     try:
         with exiftool.ExifToolHelper() as et:
             tags = et.get_metadata(str(light_files[0]))[0]
-    except Exception:
+    except Exception as e:
+        logger.warning("ExifTool failed on %s: %s — returning empty metadata", light_files[0], e)
         return _empty_meta("raw", override_target_name)
 
     raw_iso = _first(tags, _ISO_KEYS)
@@ -189,7 +202,7 @@ def _extract_raw_meta(
     return AcquisitionMeta(
         target_name=override_target_name,
         target_coords=None,  # populated later by T29 resolve_target
-        focal_length_mm=resolve_focal_length(focal),
+        focal_length_mm=resolve_focal_length() or (float(focal) if focal else None),
         pixel_size_um=px_um,
         exposure_time_s=exposure,
         iso=iso,
@@ -305,23 +318,56 @@ def _detect_format(root: Path, file_pattern: str | None) -> str:
         if ext in FITS_EXTENSIONS:
             return "fits"
 
+    raw_found = False
+    fits_found = False
     for f in root.rglob("*"):
         if not f.is_file():
             continue
-        if f.suffix.lower() in RAW_EXTENSIONS:
-            return "raw"
-        if f.suffix.lower() in FITS_EXTENSIONS:
-            return "fits"
+        ext = f.suffix.lower()
+        if ext in RAW_EXTENSIONS:
+            raw_found = True
+        elif ext in FITS_EXTENSIONS:
+            fits_found = True
+        if raw_found:
+            break  # RAW always wins — FITS outputs from prior Siril runs live alongside RAW inputs
 
+    if raw_found:
+        return "raw"
+    if fits_found:
+        return "fits"
     return "raw"  # default; will produce a clear error in _ingest_raw if truly empty
 
 
 # ── RAW ingestion ──────────────────────────────────────────────────────────────
 
+def _cleanup_previous_runs(runs_dir: Path, current_thread_id: str) -> list[str]:
+    """
+    Remove all previous run directories, keeping only the current run.
+
+    Each run lives in runs/<thread_id>/. On a fresh run, previous run folders
+    are deleted so stale intermediates don't accumulate. The current run's
+    folder (just created, empty) is preserved.
+
+    Controlled by CLEANUP_PREVIOUS_RUNS env var (default: true).
+    """
+    if not runs_dir.exists():
+        return []
+
+    import shutil
+    removed: list[str] = []
+    for item in sorted(runs_dir.iterdir()):
+        if item.is_dir() and item.name != current_thread_id:
+            shutil.rmtree(item)
+            removed.append(item.name)
+
+    return removed
+
+
 def _ingest_raw(
     root: Path,
     file_pattern: str | None,
     override_target_name: str | None,
+    thread_id: str | None = None,
 ) -> tuple[Dataset, list[str], dict]:
     target_name = override_target_name or root.name
     warnings: list[str] = []
@@ -329,10 +375,28 @@ def _ingest_raw(
         "lights": [], "darks": [], "flats": [], "biases": []
     }
 
+    # ── Set up run-scoped working directory ────────────────────────────────
+    # All pipeline outputs go into runs/<thread_id>/ so they are isolated
+    # from the raw input files and from other runs. On fresh run, previous
+    # run folders are cleaned up by default.
+    runs_dir = root / "runs"
+    run_id = thread_id or str(uuid.uuid4())
+    working_dir = runs_dir / run_id
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    cleaned: list[str] = []
+    if os.environ.get("CLEANUP_PREVIOUS_RUNS", "true").lower() in ("true", "1", "yes"):
+        cleaned = _cleanup_previous_runs(runs_dir, run_id)
+        if cleaned:
+            logger.info(f"Cleaned {len(cleaned)} previous run(s): {cleaned}")
+
     glob = file_pattern or "*"
 
     for subdir in sorted(root.iterdir()):
         if not subdir.is_dir():
+            continue
+        # Skip the runs/ directory when scanning for frame subdirectories
+        if subdir.name == "runs":
             continue
         frame_type = _DIR_MAP.get(subdir.name.lower())
         if frame_type is None:
@@ -363,6 +427,15 @@ def _ingest_raw(
     light_paths = [Path(p) for p in buckets["lights"]]
     meta = _extract_raw_meta(light_paths, target_name)
 
+    if meta.get("iso") is None and meta.get("exposure_time_s") is None:
+        warnings.append(
+            "ExifTool could not read EXIF metadata from the light frames. "
+            "ISO, exposure time, sensor characterization (black/white levels), "
+            "and focal length are all unknown. Downstream tools will use "
+            "equipment.toml or manual values. Check that ExifTool is installed "
+            "and the RAW files are not corrupted."
+        )
+
     # Cross-validate calibration frames against lights
     calib_warnings = _cross_validate_calibration(meta, buckets)
     warnings.extend(calib_warnings)
@@ -376,7 +449,7 @@ def _ingest_raw(
 
     dataset = Dataset(
         id=str(uuid.uuid4()),
-        working_dir=str(root),
+        working_dir=str(working_dir),
         files=inventory,
         acquisition_meta=meta,
     )
@@ -422,6 +495,8 @@ def _ingest_raw(
         "input_format":       "raw",
         "detected_extensions": extensions,
         "sensor":             sensor_summary,
+        "working_dir":        str(working_dir),
+        "cleaned_runs":       cleaned,
     }
 
     return dataset, warnings, summary
@@ -448,11 +523,16 @@ def ingest_dataset(
     root_directory: str,
     file_pattern: str | None = None,
     override_target_name: str | None = None,
+    thread_id: str | None = None,
 ) -> dict:
     """
     Scan a dataset directory, classify frames (lights/darks/flats/bias),
     extract acquisition metadata from EXIF (camera RAW) or FITS headers,
     and return a populated Dataset schema.
+
+    All pipeline outputs are written to runs/<thread_id>/ inside the dataset
+    root, keeping raw input files completely untouched. Previous run folders
+    are cleaned up by default (set CLEANUP_PREVIOUS_RUNS=false to keep them).
 
     The returned dataset.acquisition_meta now includes sensor characterization:
     black_level, white_level, bit_depth, raw_exposure_bias, sensor_type.
@@ -468,7 +548,9 @@ def ingest_dataset(
     fmt = _detect_format(root, file_pattern)
 
     if fmt == "raw":
-        dataset, warnings, summary = _ingest_raw(root, file_pattern, override_target_name)
+        dataset, warnings, summary = _ingest_raw(
+            root, file_pattern, override_target_name, thread_id=thread_id,
+        )
     else:
         dataset, warnings, summary = _ingest_fits(root, file_pattern, override_target_name)
 

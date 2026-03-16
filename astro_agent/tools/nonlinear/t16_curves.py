@@ -14,11 +14,18 @@ The agent may apply multiple passes with progressively refined parameters.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -104,15 +111,6 @@ class GHTCurvesOptions(BaseModel):
 
 
 class CurvesAdjustInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the non-linear FITS image to adjust. "
-            "Apply to the starless image (post T15) to avoid star bloat."
-        )
-    )
     method: str = Field(
         default="mtf",
         description=(
@@ -157,12 +155,12 @@ def _build_ght_curves_cmd(opts: GHTCurvesOptions) -> str:
 
 @tool(args_schema=CurvesAdjustInput)
 def curves_adjust(
-    working_dir: str,
-    image_path: str,
     method: str = "mtf",
     mtf_options: MTFOptions | None = None,
     ght_options: GHTCurvesOptions | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Fine-tune brightness, contrast, and per-channel tonal balance.
 
@@ -175,6 +173,9 @@ def curves_adjust(
 
     Multiple passes with small adjustments are better than one large adjustment.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     if mtf_options is None:
         mtf_options = MTFOptions()
 
@@ -208,11 +209,30 @@ def curves_adjust(
     if not output_path.exists():
         raise FileNotFoundError(f"curves_adjust did not produce: {output_path}")
 
-    return {
-        "adjusted_image_path": str(output_path),
+    summary: dict = {
+        "output_path": str(output_path),
         "method": method,
-        "statistics": {
-            "median_brightness": None,   # use analyze_image for current stats
-            "contrast_ratio": None,
-        },
+        "siril_command": adjust_cmd,
     }
+    if method == "mtf":
+        summary["mtf_parameters"] = {
+            "black_point": mtf_options.black_point,
+            "midtone": mtf_options.midtone,
+            "white_point": mtf_options.white_point,
+            "channels": mtf_options.channels,
+        }
+    elif method == "ght" and ght_options is not None:
+        summary["ght_parameters"] = {
+            "stretch_amount": ght_options.stretch_amount,
+            "local_intensity": ght_options.local_intensity,
+            "symmetry_point": ght_options.symmetry_point,
+            "shadow_protection": ght_options.shadow_protection,
+            "highlight_protection": ght_options.highlight_protection,
+            "channels": ght_options.channels,
+            "clip_mode": ght_options.clip_mode,
+        }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(output_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

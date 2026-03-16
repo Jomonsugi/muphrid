@@ -24,12 +24,19 @@ Safety: never returns an empty accepted_frames list.
 from __future__ import annotations
 
 import statistics
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 
-# ── Pydantic input schema ──────────────────────────────────────────────────────
+
+# ── Selection criteria schema ──────────────────────────────────────────────────
 
 class SelectionCriteria(BaseModel):
     max_fwhm_sigma: float = Field(
@@ -84,22 +91,6 @@ class SelectionCriteria(BaseModel):
     )
 
 
-class SelectFramesInput(BaseModel):
-    frame_metrics: dict = Field(
-        description=(
-            "Per-frame quality metrics dict from analyze_frames (T05). "
-            "Keys are frame indices (strings); values contain fwhm, "
-            "weighted_fwhm, roundness, quality, number_of_stars, "
-            "background_lvl, and pixel stats."
-        )
-    )
-    criteria: SelectionCriteria = Field(
-        description=(
-            "Rejection thresholds. All sigma-based thresholds adapt to the dataset "
-            "distribution, but min_star_count must be set explicitly from T05 "
-            "summary.median_star_count (~50% of median is a safe starting point)."
-        ),
-    )
 
 
 # ── Selection logic ───────────────────────────────────────────────────────────
@@ -177,62 +168,61 @@ def _select_frames(
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool(args_schema=SelectFramesInput)
+@tool
 def select_frames(
-    frame_metrics: dict,
-    criteria: dict | None = None,
-) -> dict:
+    criteria: SelectionCriteria,
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    state: Annotated[AstroState, InjectedState],
+) -> Command:
     """
-    Accept or reject frames based on per-frame registration metrics.
+    Accept or reject frames based on per-frame registration metrics from analyze_frames.
 
-    Sigma-clipping on FWHM, wFWHM, roundness, star count, background, and
-    quality.  Each threshold is independently tunable.
+    Frame metrics are read from state. Sigma-clipping on FWHM, wFWHM, roundness,
+    star count, background, and quality. Accepted frame keys are written to state
+    for siril_stack (T07) to consume.
 
-    Threshold guidance:
-      - Small dataset (< 15 subs): max_fwhm_sigma=3.0 (preserve integration)
-      - Variable seeing (seeing_stability > 0.3): max_fwhm_sigma=1.5 (be selective)
-      - Tracking issues (tracking_quality < 0.7): raise min_roundness to 0.6
-      - Dense field: lower min_star_count based on median_star_count
+    Args:
+        criteria: Rejection thresholds. Tune based on T05 summary statistics:
+          - Small dataset (< 15 subs): max_fwhm_sigma=3.0 (preserve integration time)
+          - Variable seeing (seeing_stability > 0.3): max_fwhm_sigma=1.5 (be selective)
+          - Tracking issues (tracking_quality < 0.7): raise min_roundness to 0.6
+          - min_star_count: set to ~50% of median_star_count from T05 summary
 
-    Never returns an empty accepted_frames list — if all frames fail every
-    criterion, all are returned with a warning.
+    Never produces an empty accepted list — if all frames fail, all are kept.
     """
+    frame_metrics = state["metrics"].get("frame_stats", {})
     if not frame_metrics:
         raise ValueError(
-            "frame_metrics is empty. Run analyze_frames (T05) first and pass "
-            "its frame_metrics output."
+            "frame_stats is empty in state. Run analyze_frames (T05) first."
         )
 
-    if isinstance(criteria, SelectionCriteria):
-        parsed_criteria = criteria
-    else:
-        parsed_criteria = SelectionCriteria(**(criteria or {}))
-
-    accepted, rejected_list, rejection_reasons = _select_frames(
-        frame_metrics, parsed_criteria
-    )
+    accepted, rejected_list, rejection_reasons = _select_frames(frame_metrics, criteria)
 
     n_total = len(frame_metrics)
     acceptance_rate = len(accepted) / n_total if n_total > 0 else 1.0
 
     warnings: list[str] = []
-
     if acceptance_rate < 0.5:
         warnings.append(
             f"Acceptance rate is {acceptance_rate:.0%} ({len(accepted)}/{n_total} frames). "
             "More than 50% rejected — review rejection reasons and consider loosening thresholds."
         )
-
     if len(accepted) < 3 and n_total >= 3:
         warnings.append(
             f"Only {len(accepted)} frames accepted from {n_total}. "
             "Stacking quality will be limited. Consider loosening criteria."
         )
 
-    return {
-        "accepted_frames":   accepted,
-        "rejected_frames":   rejected_list,
+    import json
+    result = {
+        "accepted_count": len(accepted),
+        "rejected_count": len(rejected_list),
+        "total_count": n_total,
+        "acceptance_rate": round(acceptance_rate, 3),
         "rejection_reasons": rejection_reasons,
-        "acceptance_rate":   round(acceptance_rate, 4),
-        "warnings":          warnings,
+        "warnings": warnings,
     }
+    return Command(update={
+        "paths": {**state["paths"], "selected_frames": accepted},
+        "messages": [ToolMessage(content=json.dumps(result, indent=2), tool_call_id=tool_call_id)],
+    })

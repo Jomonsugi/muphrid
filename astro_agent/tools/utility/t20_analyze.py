@@ -22,26 +22,26 @@ from __future__ import annotations
 import re
 import warnings
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 from astropy.io import fits as astropy_fits
 from astropy.stats import sigma_clipped_stats
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 from scipy.ndimage import gaussian_filter, sobel
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import SirilError, run_siril_script
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class AnalyzeImageInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description="Absolute path to the FITS image to analyze."
-    )
     detect_stars: bool = Field(
         default=True,
         description=(
@@ -346,13 +346,19 @@ def _detect_stars_full(lum: np.ndarray) -> dict:
             "fwhm_std": float(np.std(fwhm_arr)),
             "median_star_peak_ratio": float(np.median(peak_arr)) / (bg_med + 1e-9),
         }
-    except Exception:
+    except Exception as e:
         return {
             "count": 0,
             "median_fwhm": None,
             "median_roundness": None,
             "fwhm_std": None,
             "median_star_peak_ratio": None,
+            "detection_error": (
+                f"Star detection failed ({type(e).__name__}: {e}). "
+                "count=0 may not reflect actual star count. "
+                "Possible causes: image not loaded, corrupted FITS, or "
+                "incompatible image format for DAOStarFinder."
+            ),
         }
 
 
@@ -360,11 +366,11 @@ def _detect_stars_full(lum: np.ndarray) -> dict:
 
 @tool(args_schema=AnalyzeImageInput)
 def analyze_image(
-    working_dir: str,
-    image_path: str,
     detect_stars: bool = True,
     compute_histogram: bool = True,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Comprehensive image analysis tool — the agent's primary decision instrument.
 
@@ -392,6 +398,9 @@ def analyze_image(
     against star outliers. Background noise uses Siril's bgnoise (MAD-based).
     Linearity uses dual consensus: median threshold + histogram skewness.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -496,39 +505,36 @@ def analyze_image(
         }
 
     # Contrast ratio: usable dynamic range expressed as p95 - p5 of luminance.
-    # Measures the tonal spread the image actually occupies post-stretch.
-    # < 0.3 after stretch → image is flat, needs curves adjustment.
-    # 0.4–0.7 → good tonal distribution. > 0.8 → very contrasty.
     contrast_ratio = float(np.percentile(lum, 95) - np.percentile(lum, 5))
 
-    return {
-        "channels": channels,
-        "noise": {
-            "background_noise": bgnoise,
-            "method": "siril_bgnoise_MAD",
-        },
-        "background": {
-            "median": overall_median,
-            "flatness_score": flatness,
-            "gradient_magnitude": gradient_mag,
-            "per_channel_bg": per_channel_bg,
-        },
-        "stars": star_metrics,
-        "dynamic_range_db": dynamic_range_db,
+    metrics_update = {
+        "current_fwhm": star_metrics.get("median_fwhm"),
+        "current_background": overall_median,
+        "current_noise": bgnoise,
         "snr_estimate": snr_estimate,
-        "linearity": linearity,
+        "dynamic_range_db": dynamic_range_db,
+        "channel_stats": channels,
+        "background_flatness": flatness,
+        "gradient_magnitude": gradient_mag,
+        "per_channel_bg": per_channel_bg,
+        "green_excess": green_excess,
+        "channel_imbalance": channel_imbalance,
+        "mean_saturation": color_saturation.get("mean_saturation"),
+        "median_saturation": color_saturation.get("median_saturation"),
+        "is_linear_estimate": linearity.get("is_linear"),
+        "linearity_confidence": linearity.get("confidence"),
+        "histogram_skewness": linearity.get("histogram_skewness"),
         "signal_coverage_pct": signal_cov,
-        "clipping": {
-            "shadows_pct": shadows_pct,
-            "highlights_pct": highlights_pct,
-        },
-        "color_balance": {
-            "green_excess": green_excess,
-            "channel_imbalance": channel_imbalance,
-        },
-        "color": color_saturation,
+        "clipped_shadows_pct": shadows_pct,
+        "clipped_highlights_pct": highlights_pct,
+        "star_count": star_metrics.get("count"),
+        "fwhm_std": star_metrics.get("fwhm_std"),
+        "median_star_peak_ratio": star_metrics.get("median_star_peak_ratio"),
         "contrast_ratio": round(contrast_ratio, 5),
-        "histogram": histogram,
-        "image_shape": list(data.shape),
-        "is_color": is_color,
     }
+
+    import json
+    return Command(update={
+        "metrics": {**state["metrics"], **metrics_update},
+        "messages": [ToolMessage(content=json.dumps({"image": img_path.name, **metrics_update}, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

@@ -21,15 +21,22 @@ All I/O via astropy.io.fits so FITS remains the single source of truth.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 from astropy.io import fits as astropy_fits
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
-from skimage.color import rgb2gray
 from skimage.filters import gaussian
 from skimage.morphology import binary_dilation, binary_erosion, diamond, disk, square
+
+from astro_agent.graph.state import AstroState
 
 _FOOTPRINT_BUILDERS = {
     "disk": disk,
@@ -67,12 +74,6 @@ class ChannelDiffOptions(BaseModel):
 
 
 class CreateMaskInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the working directory for output FITS."
-    )
-    image_path: str = Field(
-        description="Absolute path to the source FITS image."
-    )
     mask_type: str = Field(
         description=(
             "Type of mask to generate:\n"
@@ -257,8 +258,6 @@ def _build_binary_mask(
 
 @tool(args_schema=CreateMaskInput)
 def create_mask(
-    working_dir: str,
-    image_path: str,
     mask_type: str = "luminance",
     luminance_options: LuminanceOptions | None = None,
     range_options: RangeOptions | None = None,
@@ -273,7 +272,9 @@ def create_mask(
     luminance_model: str = "rec709",
     invert: bool = False,
     output_stem: str | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Generate a float32 FITS mask (values 0.0–1.0) for targeted processing.
 
@@ -291,6 +292,9 @@ def create_mask(
     to confine any processing to a specific tonal region:
     "$processed$ * $mask$ + $original$ * (1 - $mask$)"
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     if luminance_options is None:
         luminance_options = LuminanceOptions()
     if range_options is None:
@@ -331,19 +335,40 @@ def create_mask(
 
     # Write single-channel float32 FITS
     out_stem = output_stem or f"{img_path.stem}_mask_{mask_type}"
-    out_path = Path(working_dir) / f"{out_stem}.fits"
+    mask_output_path = Path(working_dir) / f"{out_stem}.fits"
 
     hdu = astropy_fits.PrimaryHDU(data=mask)
     hdu.header["BUNIT"] = "mask"
     hdu.header["MASKTYPE"] = mask_type
     hdul = astropy_fits.HDUList([hdu])
-    hdul.writeto(out_path, overwrite=True)
+    hdul.writeto(mask_output_path, overwrite=True)
 
-    coverage_pct = float(np.mean(mask > 0.5) * 100)
-    mean_value = float(np.mean(mask))
+    mask_coverage_pct = round(float(np.mean(mask)) * 100, 2)
+    mask_min = float(np.min(mask))
+    mask_max = float(np.max(mask))
 
-    return {
-        "mask_path": str(out_path),
-        "coverage_pct": coverage_pct,
-        "mean_value": mean_value,
+    summary = {
+        "output_path": str(mask_output_path),
+        "mask_type": mask_type,
+        "source_image": str(image_path),
+        "mask_coverage_pct": mask_coverage_pct,
+        "mask_min": mask_min,
+        "mask_max": mask_max,
+        "dimensions": {"height": int(mask.shape[0]), "width": int(mask.shape[1])},
+        "settings": {
+            "feather_radius": feather_radius,
+            "feather_truncate": feather_truncate,
+            "feather_mode": feather_mode,
+            "expand_px": expand_px,
+            "contract_px": contract_px,
+            "morphology_iterations": morphology_iterations,
+            "structuring_element": structuring_element,
+            "luminance_model": luminance_model,
+            "invert": invert,
+        },
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "latest_mask": str(mask_output_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

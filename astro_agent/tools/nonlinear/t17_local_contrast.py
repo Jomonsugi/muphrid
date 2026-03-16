@@ -19,11 +19,18 @@ noise reduction.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
 
 
@@ -164,16 +171,6 @@ class EpfOptions(BaseModel):
 
 
 class LocalContrastInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the non-linear starless FITS image. "
-            "Must be post-star-removal (T15). "
-            "Apply before saturation adjustment (T18)."
-        )
-    )
     method: str = Field(
         default="wavelet",
         description=(
@@ -198,14 +195,14 @@ class LocalContrastInput(BaseModel):
 
 @tool(args_schema=LocalContrastInput)
 def local_contrast_enhance(
-    working_dir: str,
-    image_path: str,
     method: str = "wavelet",
     clahe_options: ClaheOptions | None = None,
     unsharp_options: UnsharpOptions | None = None,
     wavelet_options: WaveletOptions | None = None,
     epf_options: EpfOptions | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Enhance local contrast and fine detail in nebulosity/galaxy structure.
 
@@ -219,6 +216,9 @@ def local_contrast_enhance(
     - unsharp: simplest and gentlest. Good for star fields, mild enhancement,
       or as a first pass before more aggressive wavelet processing.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     if clahe_options is None:
         clahe_options = ClaheOptions()
     if unsharp_options is None:
@@ -285,7 +285,39 @@ def local_contrast_enhance(
     if not output_path.exists():
         raise FileNotFoundError(f"local_contrast_enhance did not produce: {output_path}")
 
-    return {
-        "enhanced_image_path": str(output_path),
+    summary: dict = {
+        "output_path": str(output_path),
         "method": method,
     }
+    if method == "clahe":
+        summary["clahe_parameters"] = {
+            "clip_limit": clahe_options.clip_limit,
+            "tile_size": clahe_options.tile_size,
+        }
+    elif method == "unsharp":
+        summary["unsharp_parameters"] = {
+            "sigma": unsharp_options.sigma,
+            "amount": unsharp_options.amount,
+        }
+    elif method == "edge_preserve":
+        summary["epf_parameters"] = {
+            "guided": epf_options.guided,
+            "diameter": epf_options.diameter,
+            "mod": epf_options.mod,
+        }
+        if epf_options.guided:
+            summary["epf_parameters"]["guided_sigma"] = epf_options.guided_sigma
+        else:
+            summary["epf_parameters"]["intensity_sigma"] = epf_options.intensity_sigma
+            summary["epf_parameters"]["spatial_sigma"] = epf_options.spatial_sigma
+    elif method == "wavelet":
+        summary["wavelet_parameters"] = {
+            "num_layers": wavelet_options.num_layers,
+            "algorithm": wavelet_options.algorithm,
+            "layer_weights": wavelet_options.layer_weights,
+        }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(output_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

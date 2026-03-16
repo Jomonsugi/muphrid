@@ -344,8 +344,9 @@ def make_llm(settings: Settings | None = None):
         return ChatOpenAI(
             model=settings.llm_model,
             api_key=settings.together_api_key,       # type: ignore[arg-type]
-            base_url="https://api.together.xyz/v1",
+            base_url="https://api.together.xyz/v1/",
             temperature=settings.llm_temperature,
+            timeout=120,
         )
 
     if settings.llm_provider == "anthropic":
@@ -354,6 +355,7 @@ def make_llm(settings: Settings | None = None):
             model=settings.llm_model,
             api_key=settings.anthropic_api_key,       # type: ignore[arg-type]
             temperature=settings.llm_temperature,
+            timeout=120,
         )
 
     if settings.llm_provider == "openai":
@@ -361,6 +363,7 @@ def make_llm(settings: Settings | None = None):
         return ChatOpenAI(
             model=settings.llm_model,
             temperature=settings.llm_temperature,
+            timeout=120,
         )
 
     raise ConfigError(f"Unknown LLM_PROVIDER: {settings.llm_provider!r}")

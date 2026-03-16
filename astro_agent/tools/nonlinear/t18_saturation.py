@@ -18,11 +18,18 @@ better results than one large boost.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import fits_nlayers, run_siril_script
 
 
@@ -80,15 +87,6 @@ class GHTSatOptions(BaseModel):
 
 
 class SaturationAdjustInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the non-linear starless FITS image. "
-            "Apply after local contrast enhancement (T17)."
-        )
-    )
     method: str = Field(
         description=(
             "Choose based on target type — there is no universal default:\n"
@@ -141,14 +139,14 @@ class SaturationAdjustInput(BaseModel):
 
 @tool(args_schema=SaturationAdjustInput)
 def saturation_adjust(
-    working_dir: str,
-    image_path: str,
     method: str,
     amount: float,
     background_factor: float = 1.5,
     hue_target: int | None = None,
     ght_sat_options: GHTSatOptions | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Adjust color saturation of the non-linear image.
 
@@ -163,6 +161,9 @@ def saturation_adjust(
     Always use background_factor > 0 to protect sky background noise from
     being color-boosted into a colorful noise pattern.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -212,13 +213,25 @@ def saturation_adjust(
     if not output_path.exists():
         raise FileNotFoundError(f"saturation_adjust did not produce: {output_path}")
 
-    hue_desc = HUE_RANGE_DESCRIPTIONS.get(hue_target, "all") if hue_target is not None else "all"
-
-    return {
-        "processed_image_path": str(output_path),
-        "saturated_image_path": str(output_path),  # backward-compat alias
+    summary: dict = {
+        "output_path": str(output_path),
         "method": method,
         "amount": amount,
-        "hue_target": hue_target,
-        "hue_description": hue_desc,
+        "background_factor": background_factor,
+        "siril_command": cmd,
     }
+    if method == "hue_targeted" and hue_target is not None:
+        summary["hue_target"] = hue_target
+        summary["hue_target_description"] = HUE_RANGE_DESCRIPTIONS.get(hue_target, "unknown")
+    if method == "ght_saturation" and ght_sat_options is not None:
+        summary["ght_sat_parameters"] = {
+            "stretch_amount": ght_sat_options.stretch_amount,
+            "local_intensity": ght_sat_options.local_intensity,
+            "symmetry_point": ght_sat_options.symmetry_point,
+            "clip_mode": ght_sat_options.clip_mode,
+        }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(output_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

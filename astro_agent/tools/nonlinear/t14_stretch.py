@@ -22,12 +22,19 @@ calibration to preserve white balance.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import fits_has_nan, run_siril_script
 
 
@@ -161,16 +168,6 @@ class AutostretchOptions(BaseModel):
 
 
 class StretchImageInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description=(
-            "Absolute path to the linear FITS image to stretch. "
-            "This is the calibrated, registered, stacked, and optionally "
-            "gradient-removed, color-calibrated, and noise-reduced linear image."
-        )
-    )
     method: str = Field(
         default="ghs",
         description=(
@@ -253,14 +250,14 @@ def _parse_stretch_stats(stdout: str) -> dict:
 
 @tool(args_schema=StretchImageInput)
 def stretch_image(
-    working_dir: str,
-    image_path: str,
     method: str = "ghs",
     ghs_options: GHSOptions | None = None,
     asinh_options: AsinhOptions | None = None,
     autostretch_options: AutostretchOptions | None = None,
     output_suffix: str = "stretch",
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Apply a non-linear stretch to the linear FITS image.
 
@@ -275,10 +272,47 @@ def stretch_image(
     - autostretch: reliable fallback, useful for a quick first look.
     - asinh: good for smooth shadow lifting without highlight crushing.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     if asinh_options is None:
         asinh_options = AsinhOptions()
     if autostretch_options is None:
         autostretch_options = AutostretchOptions()
+
+    # Duplicate-call guard: reject identical (output_suffix, args) combinations.
+    # This catches the model repeating the same stretch without making progress.
+    # Different args with the same suffix (HITL-driven re-stretch) are allowed —
+    # they overwrite the file intentionally with new parameters.
+    _args_fingerprint = json.dumps({
+        "method": method,
+        "ghs": ghs_options.model_dump() if ghs_options else None,
+        "asinh": asinh_options.model_dump() if asinh_options else None,
+        "autostretch": autostretch_options.model_dump() if autostretch_options else None,
+    }, sort_keys=True)
+    _stretch_variants: dict = state.get("metadata", {}).get("stretch_variants", {})
+    if _stretch_variants.get(output_suffix) == _args_fingerprint:
+        return Command(update={
+            "messages": [ToolMessage(
+                content=(
+                    f"DUPLICATE STRETCH REJECTED — output_suffix={output_suffix!r} with these "
+                    f"exact parameters was already successfully applied in this session.\n\n"
+                    f"Why this is a problem: stretch_image always operates on the current "
+                    f"image in state, which is now the already-stretched output from the "
+                    f"previous call. Applying the same transfer function again would "
+                    f"double-stretch that result — shadows crushed to black, highlights "
+                    f"blown out, stars bloated. The output would be corrupted and unusable.\n\n"
+                    f"What to do:\n"
+                    f"  - Call analyze_image to evaluate the existing {output_suffix!r} "
+                    f"variant before deciding whether a new one is needed.\n"
+                    f"  - To create a genuinely different variant: use a new output_suffix "
+                    f"AND change the parameters (e.g. lower stretch_amount for 'gentle', "
+                    f"higher for 'aggressive', different highlight_protection).\n"
+                    f"  - If the existing variants are good enough: call advance_phase."
+                ),
+                tool_call_id=tool_call_id,
+            )],
+        })
 
     img_path = Path(image_path)
     if not img_path.exists():
@@ -322,17 +356,44 @@ def stretch_image(
     if not output_path.exists():
         raise FileNotFoundError(f"Stretch did not produce: {output_path}")
 
-    stats = _parse_stretch_stats(result.stdout)
+    stretch_stats = _parse_stretch_stats(result.stdout)
 
-    return {
-        "stretched_image_path": str(output_path),
+    summary: dict = {
+        "output_path": str(output_path),
         "method": method,
         "output_suffix": output_suffix,
-        "is_linear": False,
-        "statistics": {
-            "median_brightness": stats.get("median_brightness"),
-            "mean_brightness": stats.get("mean_brightness"),
-            "clipped_shadows_pct": None,   # use analyze_image for full stats
-            "clipped_highlights_pct": None,
-        },
+        "siril_command": stretch_cmd,
     }
+    if method == "ghs" and ghs_options is not None:
+        summary["ghs_parameters"] = {
+            "stretch_amount": ghs_options.stretch_amount,
+            "local_intensity": ghs_options.local_intensity,
+            "symmetry_point": ghs_options.symmetry_point,
+            "shadow_protection": ghs_options.shadow_protection,
+            "highlight_protection": ghs_options.highlight_protection,
+            "color_model": ghs_options.color_model,
+            "channels": ghs_options.channels,
+            "clip_mode": ghs_options.clip_mode,
+        }
+    elif method == "asinh":
+        summary["asinh_parameters"] = {
+            "stretch_factor": asinh_options.stretch_factor,
+            "black_point_offset": asinh_options.black_point_offset,
+        }
+    elif method == "autostretch":
+        summary["autostretch_parameters"] = {
+            "shadows_clipping_sigma": autostretch_options.shadows_clipping_sigma,
+            "target_background": autostretch_options.target_background,
+            "linked": autostretch_options.linked,
+        }
+    if stretch_stats:
+        summary["stretch_stats"] = stretch_stats
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(output_path)},
+        "metadata": {
+            **state["metadata"],
+            "stretch_variants": {**_stretch_variants, output_suffix: _args_fingerprint},
+        },
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

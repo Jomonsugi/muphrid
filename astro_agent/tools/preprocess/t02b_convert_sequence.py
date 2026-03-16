@@ -1,12 +1,12 @@
 """
 T02b — convert_sequence
 
-Convert a set of raw frames into a Siril FITSEQ sequence.  This is the
-prerequisite for any Siril sequence operation (calibrate, register, stack).
+Convert all light frames into a Siril FITSEQ sequence. This is the
+prerequisite for T03 (calibrate). Light files come from state["dataset"]["files"]["lights"].
 
 Used by:
-  - T02 (build_masters) internally for calibration frames
-  - The pipeline for light frames before T03
+  - T02 (build_masters) internally for calibration frames via _convert_to_sequence
+  - The agent for light frames before T03
 
 Siril command (verified against Siril 1.4 docs):
     convert basename [-debayer] [-fitseq] [-ser] [-start=index] [-out=]
@@ -14,33 +14,20 @@ Siril command (verified against Siril 1.4 docs):
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
-from pydantic import BaseModel, Field
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import run_siril_script
-
-
-class ConvertSequenceInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the directory where the .seq and FITSEQ will be written."
-    )
-    input_files: list[str] = Field(
-        description="Absolute paths to the raw frames to convert."
-    )
-    sequence_name: str = Field(
-        description=(
-            "Base name for the output sequence (without .seq extension). "
-            "E.g. 'lights_seq', 'bias_seq', 'flat_seq'."
-        )
-    )
-    debayer: bool = Field(
-        default=False,
-        description="Debayer CFA frames during conversion. Usually False for calibration frames.",
-    )
 
 
 def _convert_to_sequence(
@@ -100,20 +87,33 @@ def _convert_to_sequence(
     }
 
 
-@tool(args_schema=ConvertSequenceInput)
+@tool
 def convert_sequence(
-    working_dir: str,
-    input_files: list[str],
     sequence_name: str,
     debayer: bool = False,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
-    Convert raw frames into a Siril FITSEQ sequence.
+    Convert all light frames into a Siril FITSEQ sequence.
 
-    Copies input files to a temporary directory with clean sequential naming,
-    runs Siril convert, and produces a .seq + .fit FITSEQ in working_dir.
+    Copies light files from the dataset into a temporary directory with clean
+    sequential naming, runs Siril convert, and produces a .seq + .fit FITSEQ
+    in the dataset working directory. Must be called before T03 (calibrate).
 
-    Use before T03 (calibrate) for lights, or internally by T02 for calibration
-    frames. The sequence_name must be unique within working_dir.
+    Args:
+        sequence_name: Base name for the output sequence (no .seq extension).
+            E.g. 'lights_seq'. Must be unique within the working directory.
+        debayer: Debayer CFA frames during conversion. Set True for OSC/DSLR
+            RAW files when converting for preview; False for calibration use
+            (calibrate does its own debayering internally). Default: False.
     """
-    return _convert_to_sequence(working_dir, input_files, sequence_name, debayer)
+    working_dir = state["dataset"]["working_dir"]
+    input_files = state["dataset"]["files"]["lights"]
+
+    result = _convert_to_sequence(working_dir, input_files, sequence_name, debayer)
+
+    return Command(update={
+        "paths": {**state["paths"], "lights_sequence": result["sequence_name"]},
+        "messages": [ToolMessage(content=json.dumps(result, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

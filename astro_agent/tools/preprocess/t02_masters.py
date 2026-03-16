@@ -28,14 +28,21 @@ Sensor-relative diagnostic thresholds:
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 from astropy.io import fits
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._sensor import (
     flat_fill_state,
     flat_siril_norm_thresholds,
@@ -45,54 +52,39 @@ from astro_agent.tools._siril import SirilError, run_siril_script
 from astro_agent.tools.preprocess.t02b_convert_sequence import _convert_to_sequence
 
 
-# ── Pydantic input schema ──────────────────────────────────────────────────────
+# ── Pydantic input schema ────────────────────────────────────────────────────
 
 class BuildMastersInput(BaseModel):
-    working_dir: str = Field(
-        description=(
-            "Absolute path to the directory where Siril will write the master frame. "
-            "Input files are copied here before conversion."
-        )
-    )
     file_type: str = Field(
-        description="Type of calibration frame: 'bias', 'dark', or 'flat'."
-    )
-    input_files: list[str] = Field(
-        description="Absolute paths to the raw calibration frames to stack."
-    )
-    master_bias_path: str | None = Field(
-        default=None,
         description=(
-            "Absolute path to master bias FITS. Required when file_type='flat' "
-            "to subtract bias pedestal before flat normalization. Optional for darks."
+            "Which calibration type to build: 'bias', 'dark', or 'flat'. "
+            "Build in order: bias first, then dark, then flat."
         ),
     )
     stack_method: str = Field(
-        default="median",
         description=(
-            "'median' (recommended for bias — lowest noise floor) or "
-            "'mean' (higher SNR for darks/flats with good rejection)."
+            "Stacking method. 'median': lowest noise floor, best for bias and "
+            "small frame counts. 'mean': higher SNR when combined with rejection, "
+            "preferred for darks/flats with enough frames (> 15). "
+            "Choose based on frame count and frame type."
         ),
     )
     rejection_method: str = Field(
-        default="winsorized",
         description=(
             "Rejection algorithm (only used when stack_method='mean'). "
-            "'sigma' (sigma clipping), 'winsorized' (default, better for small N < 15), "
-            "or 'none'. Ignored for median stacking."
+            "'winsorized': best for small N (< 15). "
+            "'sigma': reliable for medium N (15–50). "
+            "'linear': best for large N (> 50) where Gaussian statistics hold. "
+            "'none': no rejection. "
+            "Choose based on frame count. Ignored when stack_method='median'."
         ),
     )
     rejection_sigma: list[float] = Field(
         default=[3.0, 3.0],
-        description="[low_sigma, high_sigma] for rejection. Default [3.0, 3.0].",
-    )
-    acquisition_meta: dict | None = Field(
-        default=None,
         description=(
-            "AcquisitionMeta dict from T01 ingest_dataset. When provided, the tool "
-            "reads black_level and white_level to compute sensor-relative diagnostic "
-            "thresholds for flat quality. If omitted, EXIF is read from the first "
-            "input file. Pass dataset['acquisition_meta'] from T01's output."
+            "[low_sigma, high_sigma] for rejection clipping. "
+            "Tighter (e.g. [2.5, 2.5]) rejects more aggressively — use with large N. "
+            "Looser (e.g. [4.0, 4.0]) preserves more frames — use with small N."
         ),
     )
 
@@ -307,8 +299,10 @@ def _compute_diagnostics(
                             f"Flat median ({flat_med:.3f}) < 2× bias median ({bias_med:.3f}) "
                             f"— flat signal too weak for reliable calibration."
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                warnings.append(
+                    f"Could not read master bias for flat comparison: {e}"
+                )
 
     if file_type == "bias":
         bias_mean = quality_flags.get("bias_mean", 0.0)
@@ -372,8 +366,10 @@ def _compute_diagnostics(
                             f"({bias_mean_norm:.5f}). Dark frames cannot have less signal "
                             f"than bias — possible accidental calibration or wrong folder."
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                warnings.append(
+                    f"Could not read master bias for dark comparison: {e}"
+                )
 
     # ── Universal: high rejection rate ────────────────────────────────────
     if rejection_rate > 0.40:
@@ -382,11 +378,10 @@ def _compute_diagnostics(
             f"majority of frames are outliers; possible capture issue."
         )
 
-    warnings.extend(quality_issues)
-
     return {
         "quality_flags": quality_flags,
         "warnings": warnings,
+        "quality_issues": quality_issues,
     }
 
 
@@ -394,36 +389,51 @@ def _compute_diagnostics(
 
 @tool(args_schema=BuildMastersInput)
 def build_masters(
-    working_dir: str,
     file_type: str,
-    input_files: list[str],
-    master_bias_path: str | None = None,
-    stack_method: str = "median",
-    rejection_method: str = "winsorized",
-    rejection_sigma: list[float] | None = None,
-    acquisition_meta: dict | None = None,
-) -> dict:
+    stack_method: str,
+    rejection_method: str,
+    rejection_sigma: list[float] = [3.0, 3.0],
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Stack calibration frames (bias/dark/flat) into a master calibration frame.
 
-    Returns master_path, frame statistics, and diagnostics including quality
-    flags and warnings.
+    File lists and working directory come from the dataset in state. Master bias
+    path is automatically injected for darks and flats that need it.
+
+    Args:
+        file_type: Which calibration type to build: 'bias', 'dark', or 'flat'.
+            Build in order: bias first, then dark, then flat.
+        stack_method: 'median' (recommended for bias — lowest noise floor) or
+            'mean' (higher SNR for darks/flats with good rejection).
+        rejection_method: Rejection algorithm (only for stack_method='mean').
+            'sigma', 'winsorized' (best for small N < 15), or 'none'.
+        rejection_sigma: [low_sigma, high_sigma] for rejection. Default [3.0, 3.0].
     """
-    if rejection_sigma is None:
-        rejection_sigma = [3.0, 3.0]
+    working_dir = state["dataset"]["working_dir"]
+    acquisition_meta = state["dataset"].get("acquisition_meta")
 
-    file_type = _TYPE_NORMALIZE.get(file_type.lower().strip(), file_type.lower().strip())
-    if file_type not in ("bias", "dark", "flat"):
+    ft = _TYPE_NORMALIZE.get(file_type.lower().strip(), file_type.lower().strip())
+    if ft not in ("bias", "dark", "flat"):
         raise ValueError(f"file_type must be 'bias', 'dark', or 'flat'. Got: {file_type!r}")
-
     if stack_method not in ("median", "mean"):
         raise ValueError(f"stack_method must be 'median' or 'mean'. Got: {stack_method!r}")
+
+    # Resolve input files from dataset
+    files_map = {"bias": "biases", "dark": "darks", "flat": "flats"}
+    input_files = state["dataset"]["files"].get(files_map[ft], [])
+    if not input_files:
+        raise ValueError(f"No {ft} files found in dataset. Check the dataset folder structure.")
+
+    # Inject master_bias_path for darks and flats
+    master_bias_path = state["paths"]["masters"].get("bias")
 
     wdir = Path(working_dir)
     wdir.mkdir(parents=True, exist_ok=True)
 
-    seq_name = f"{file_type}_seq"
-    master_out = f"master_{file_type}"
+    seq_name = f"{ft}_seq"
+    master_out = f"master_{ft}"
 
     # ── Step 1: Convert raw frames to a FITSEQ sequence ───────────────────
     _convert_to_sequence(
@@ -435,7 +445,7 @@ def build_masters(
 
     # ── Step 2: For flats, calibrate (bias-subtract) before stacking ──────
     stack_seq = seq_name
-    if file_type == "flat" and master_bias_path:
+    if ft == "flat" and master_bias_path:
         run_siril_script(
             [f"calibrate {seq_name} -bias={master_bias_path} -fitseq"],
             working_dir=str(wdir),
@@ -444,9 +454,7 @@ def build_masters(
         stack_seq = f"pp_{seq_name}"
 
     # ── Step 3: Stack ─────────────────────────────────────────────────────
-    norm = "mulscale" if file_type == "flat" else "addscale"
-    if file_type == "bias":
-        norm = "addscale"
+    norm = "mulscale" if ft == "flat" else "addscale"
 
     stack_cmd = _build_stack_cmd(
         seq_name=stack_seq,
@@ -471,11 +479,10 @@ def build_masters(
         )
 
     # ── Step 5: Diagnostics ───────────────────────────────────────────────
-    # Pass the pre-stack sequence path so bias consistency can read per-frame medians
     seq_fits = wdir / f"{seq_name}.fit"
     diagnostics = _compute_diagnostics(
         master_path=master_fits,
-        file_type=file_type,
+        file_type=ft,
         frame_count=len(input_files),
         siril_stdout=result.stdout,
         master_bias_path=master_bias_path,
@@ -484,7 +491,43 @@ def build_masters(
         seq_path=seq_fits if seq_fits.exists() else None,
     )
 
-    return {
+    # ── Step 6: Write master path back to state ────────────────────────────
+    masters = {**state["paths"]["masters"], ft: str(master_fits)}
+
+    # Build a clear, concise result for the model.
+    # Separate quality_issues (critical) from warnings (informational) so the
+    # agent can distinguish "low frame count" from "wrong frame type."
+    quality = diagnostics.get("quality_flags", {})
+    warns = diagnostics.get("warnings", [])
+    issues = diagnostics.get("quality_issues", [])
+
+    # Summarize per-frame medians instead of dumping the full array
+    per_frame = quality.pop("bias_per_frame_medians", None)
+    per_frame_summary = None
+    if per_frame:
+        unique = sorted(set(round(v, 1) for v in per_frame))
+        if len(unique) == 1:
+            per_frame_summary = f"all {len(per_frame)} frames at {unique[0]} ADU"
+        else:
+            per_frame_summary = (
+                f"{len(per_frame)} frames, median range {min(unique)}–{max(unique)} ADU"
+            )
+
+    result = {
+        "file_type": ft,
         "master_path": str(master_fits),
-        "diagnostics": diagnostics,
+        "frame_count": len(input_files),
+        "quality_flags": quality,
     }
+    if per_frame_summary:
+        result["per_frame_summary"] = per_frame_summary
+    if issues:
+        result["quality_issues"] = issues
+    if warns:
+        result["warnings"] = warns
+
+    result_content = json.dumps(result, indent=2)
+    return Command(update={
+        "paths": {**state["paths"], "masters": masters},
+        "messages": [ToolMessage(content=result_content, tool_call_id=tool_call_id)],
+    })

@@ -27,14 +27,21 @@ Siril commands (verified against Siril 1.4 CLI docs):
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Annotated
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from astro_agent.equipment import resolve_focal_length as _resolve_fl
 from astro_agent.equipment import resolve_pixel_size as _resolve_px
 from astro_agent.equipment import resolve_target_coords as _resolve_target
+from astro_agent.graph.state import AstroState
 from astro_agent.tools._siril import SirilError, SirilResult, run_siril_script
 
 
@@ -229,12 +236,6 @@ class PlateSolveOptions(BaseModel):
 
 
 class ColorCalibrateInput(BaseModel):
-    working_dir: str = Field(
-        description="Absolute path to the Siril working directory."
-    )
-    image_path: str = Field(
-        description="Absolute path to the linear FITS image (post gradient removal)."
-    )
     method: str = Field(
         default="pcc",
         description=(
@@ -462,8 +463,6 @@ def _parse_plate_solve_result(result: SirilResult) -> dict:
 
 @tool(args_schema=ColorCalibrateInput)
 def color_calibrate(
-    working_dir: str,
-    image_path: str,
     method: str = "pcc",
     focal_length_mm: float = 0.0,
     pixel_size_um: float | None = None,
@@ -476,7 +475,9 @@ def color_calibrate(
     bgtol_upper: float | None = None,
     spcc_options: SpccOptions | None = None,
     platesolve_options: PlateSolveOptions | None = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
     """
     Correct white balance by matching star colors to photometric catalogs.
     Performs background neutralization and photometric or spectrophotometric
@@ -506,6 +507,9 @@ def color_calibrate(
     On plate solve failure, retry with adjusted platesolve_options (lower sigma,
     relax=True, explicit target_coords) or correct pixel_size_um / focal_length_mm.
     """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
     if spcc_options is None:
         spcc_options = SpccOptions()
     if platesolve_options is None:
@@ -572,14 +576,18 @@ def color_calibrate(
             f"Color calibration did not produce: {output_path}"
         )
 
-    return {
-        "calibrated_image_path": str(output_path),
-        "wcs_coords": {
-            "ra": wcs_info.get("ra"),
-            "dec": wcs_info.get("dec"),
-        },
-        "pixel_scale_arcsec": wcs_info.get("pixel_scale_arcsec"),
-        "measured_focal_length_mm": wcs_info.get("measured_focal_length_mm"),
-        "pixel_size_um_used": px_size,
-        "color_coefficients": None,
+    summary = {
+        "output_path": str(output_path),
+        "method": method.upper(),
+        "catalog": catalog if method == "pcc" else None,
+        "wcs_info": wcs_info,
+        "resolved_focal_length_mm": resolved_fl,
+        "resolved_pixel_size_um": px_size,
+        "resolved_coords": resolved_coords,
+        "limitmag": limitmag,
     }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(output_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })
