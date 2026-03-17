@@ -131,6 +131,47 @@ class StuckLoopError(RuntimeError):
     """Raised when the agent calls the same tool too many times consecutively."""
 
 
+class NudgeLimitError(RuntimeError):
+    """Raised when the agent refuses to call tools after repeated nudges."""
+
+
+class PhaseToolLimitError(RuntimeError):
+    """Raised when tool calls in a single phase exceed the configured limit."""
+
+
+def _check_phase_tool_limit(messages: list, phase) -> None:
+    """
+    Count tool calls in the current phase (since the last advance_phase
+    ToolMessage) and raise if the per-phase limit is exceeded.
+
+    Reads MAX_TOOLS_<PHASE> from .env (e.g. MAX_TOOLS_INGEST=5).
+    Falls back to MAX_TOOLS_PER_PHASE as a global default. 0 disables.
+    """
+    import os
+    phase_key = f"MAX_TOOLS_{phase.value.upper()}"
+    limit = int(os.environ.get(phase_key, os.environ.get("MAX_TOOLS_PER_PHASE", "0")))
+    if limit <= 0:
+        return
+
+    # Count AIMessage tool calls since the last advance_phase boundary
+    tool_call_count = 0
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "advance_phase":
+            break  # reached the start of this phase
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            tool_call_count += len(msg.tool_calls)
+
+    if tool_call_count >= limit:
+        raise PhaseToolLimitError(
+            f"Agent has made {tool_call_count} tool calls in the "
+            f"{phase.value.upper()} phase (limit: {limit}). This suggests the "
+            f"agent is not making meaningful progress. Review the processing "
+            f"log and consider whether the phase prompt or tool parameters "
+            f"need adjustment. Set {phase_key} or MAX_TOOLS_PER_PHASE in "
+            f".env to adjust (0 disables)."
+        )
+
+
 def _check_stuck_loop(messages: list) -> None:
     """
     Walk backward through recent messages to detect repeated identical tool calls.
@@ -200,53 +241,54 @@ _DEEPSEEK_TOOL_CALL_RE = re.compile(
 def _rescue_raw_tool_calls(response: AIMessage) -> AIMessage:
     """
     If the model emitted DeepSeek native tool-call tokens as plain text,
-    parse them and return a proper AIMessage with structured tool_calls.
-    Returns the original response unchanged if no such pattern is found.
+    return a corrective message instead of reconstructing the call.
+
+    Reconstructing bypasses bind_tools validation and phase gating.
+    Instead, tell the model what happened so it can make a proper
+    structured tool call on the next turn.
     """
     content = response.content if isinstance(response.content, str) else ""
     if "<｜tool▁calls▁begin｜>" not in content:
         return response
 
-    logger.info("DeepSeek rescue: detected raw tool-call tokens in response text — attempting parse")
-
+    # Extract tool names and args for the corrective message
     matches = _DEEPSEEK_TOOL_CALL_RE.findall(content)
-    if not matches:
-        logger.warning("DeepSeek rescue: detected <｜tool▁calls▁begin｜> but regex found no tool call blocks")
-        return response
-
-    tool_calls = []
+    parsed_calls = []
     for tool_name, args_str in matches:
         tool_name = tool_name.strip()
         args_str = args_str.strip()
         try:
             args = json.loads(args_str)
         except json.JSONDecodeError:
-            # Truncated JSON — try to recover by closing open braces
             try:
                 open_braces = args_str.count("{") - args_str.count("}")
                 args = json.loads(args_str + "}" * max(open_braces, 1))
-                logger.info(f"DeepSeek rescue: recovered truncated JSON for {tool_name!r}")
             except json.JSONDecodeError:
-                logger.warning(
-                    f"DeepSeek rescue: could not parse args for {tool_name!r}: {args_str[:100]!r}"
-                )
-                continue
-        tool_calls.append({
-            "name": tool_name,
-            "args": args,
-            "id": f"call_{uuid.uuid4().hex[:8]}",
-            "type": "tool_call",
-        })
+                args = args_str[:200]
+        parsed_calls.append({"tool": tool_name, "args": args})
 
-    if not tool_calls:
-        logger.warning("DeepSeek rescue: no tool calls successfully parsed — passing response through unchanged")
-        return response
-
-    logger.info(
-        f"DeepSeek rescue: successfully reconstructed {len(tool_calls)} tool call(s): "
-        f"{[tc['name'] for tc in tool_calls]}"
+    logger.warning(
+        f"DeepSeek rescue: detected raw tool-call tokens in response text "
+        f"(tools: {[c['tool'] for c in parsed_calls] or 'unparseable'}). "
+        f"Returning corrective message."
     )
-    return AIMessage(content="", tool_calls=tool_calls)
+
+    if parsed_calls:
+        calls_desc = json.dumps(parsed_calls, indent=2, default=str)
+        hint = (
+            f"Your previous response contained raw tool-call tokens as plain "
+            f"text instead of a structured tool call. The tool was NOT executed. "
+            f"Here is what you were trying to call:\n\n{calls_desc}\n\n"
+            f"Call the tool again using the structured tool_calls format."
+        )
+    else:
+        hint = (
+            "Your previous response contained raw tool-call tokens as plain "
+            "text instead of a structured tool call. The tool was NOT executed. "
+            "Call the tool again using the structured tool_calls format."
+        )
+
+    return AIMessage(content=hint, tool_calls=[])
 
 
 def make_agent_node(model_factory):
@@ -266,6 +308,10 @@ def make_agent_node(model_factory):
         # Stuck-loop detection: hard fail if the agent repeats the same tool call.
         _check_stuck_loop(raw_messages)
 
+        # Per-phase tool call cap: count tool calls since the last advance_phase
+        # and fail if the limit is exceeded.
+        _check_phase_tool_limit(raw_messages, phase)
+
         # Build message list with system prompt — read phase prompt directly
         # from PHASE_PROMPTS so it's always in sync with the current phase
         # (advance_phase tool updates state["phase"] mid-loop).
@@ -281,6 +327,32 @@ def make_agent_node(model_factory):
 
         response = model.invoke(messages)
         response = _rescue_raw_tool_calls(response)
+
+        # Phase gate enforcement: reject any tool call not available in the
+        # current phase. This catches DeepSeek rescue reconstructing calls
+        # from the full tool list in the system prompt.
+        if response.tool_calls:
+            allowed = {t.name for t in tools_for_phase(phase)}
+            rejected = [tc for tc in response.tool_calls if tc["name"] not in allowed]
+            if rejected:
+                rejected_names = [tc["name"] for tc in rejected]
+                allowed_names = sorted(allowed)
+                logger.warning(
+                    f"Phase gate rejected tool(s) {rejected_names} — "
+                    f"not available in {phase.value} phase"
+                )
+                return {"messages": [AIMessage(
+                    content=(
+                        f"PHASE GATE: You are in the {phase.value.upper()} phase. "
+                        f"The following tool(s) are not available in this phase: "
+                        f"{', '.join(rejected_names)}.\n\n"
+                        f"Tools available in {phase.value.upper()}: "
+                        f"{', '.join(allowed_names)}.\n\n"
+                        f"Complete this phase using the available tools, then call "
+                        f"advance_phase to move to the next phase."
+                    ),
+                    tool_calls=[],
+                )]}
 
         logger.info(
             f"Agent response: {'tool_calls' if response.tool_calls else 'no tool_calls'}"
@@ -453,9 +525,8 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
 #   Autonomous mode: inject a nudge message telling the agent to act or advance
 
 _AUTONOMOUS_NUDGE = (
-    "You are in autonomous mode — no human is available to respond. "
     "Either call a tool to continue processing, or call advance_phase "
-    "to move to the next phase. Do not respond with text again without "
+    "to move to the next phase. Do not respond with text without "
     "calling a tool."
 )
 
@@ -477,8 +548,30 @@ def agent_chat(state: AstroState) -> dict[str, Any]:
         if isinstance(last, AIMessage):
             agent_text = str(last.content)[:500]
 
+    # Count consecutive text-only AI responses (no tool calls between them).
+    # This catches both autonomous nudge loops AND CLI auto-respond loops
+    # where each interrupt+resume resets the recursion counter.
+    import os
+    max_nudges = int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "2"))
+    consecutive_text_only = 0
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and not msg.tool_calls:
+            consecutive_text_only += 1
+        elif isinstance(msg, HumanMessage):
+            continue  # human/nudge responses between AI text
+        else:
+            break  # hit a tool call — agent was making progress
+
+    if consecutive_text_only >= max_nudges:
+        raise NudgeLimitError(
+            f"Agent produced {consecutive_text_only} consecutive text-only responses "
+            f"without calling any tool. Current phase: {phase.value.upper()}. "
+            f"The agent must call tools to make progress or call advance_phase "
+            f"to move to the next phase. "
+            f"Set MAX_AUTONOMOUS_NUDGES in .env to adjust (current: {max_nudges})."
+        )
+
     if is_autonomous():
-        # No human available — nudge the agent to take action
         logger.info(f"agent_chat (autonomous): nudging agent to act or advance (phase={phase.value})")
         return {"messages": [HumanMessage(content=_AUTONOMOUS_NUDGE)]}
 

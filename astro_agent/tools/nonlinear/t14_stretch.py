@@ -43,9 +43,11 @@ from astro_agent.tools._siril import fits_has_nan, run_siril_script
 class GHSOptions(BaseModel):
     stretch_amount: float = Field(
         description=(
-            "D: stretch strength 0–10. The primary control. "
-            "Typical range: 1.5 (gentle, preserves faint detail) to 4.0 (aggressive). "
-            "Start with 2.5 for a moderate first pass."
+            "D: stretch intensity (0–10). The primary control — determines how "
+            "aggressively the non-linear transfer function redistributes pixel "
+            "values. Higher D moves the histogram further from linear. Choose "
+            "based on how much the histogram needs to shift to reveal the signal "
+            "of interest, then verify with analyze_image."
         ),
     )
     local_intensity: float = Field(
@@ -61,9 +63,10 @@ class GHSOptions(BaseModel):
     symmetry_point: float = Field(
         default=0.0,
         description=(
-            "SP: the pixel value at which the stretch is most intense (0–1). "
-            "0.0 = stretch darkest values most (standard first stretch). "
-            "Set to the median of faint nebulosity for targeted enhancement."
+            "SP: the brightness level where the stretch adds the most contrast "
+            "(0–1). Set SP to the region of the histogram where your signal of "
+            "interest lives. 0.0 targets the darkest values. Use analyze_image "
+            "histogram data to identify where the signal sits."
         ),
     )
     shadow_protection: float = Field(
@@ -76,9 +79,11 @@ class GHSOptions(BaseModel):
     highlight_protection: float = Field(
         default=1.0,
         description=(
-            "HP: high-end linear region (HP–1). Pixels above HP are stretched linearly. "
-            "Protects bright star cores from bloating. 1.0 = no protection. "
-            "0.9–0.95 prevents star bloat in most cases."
+            "HP: pixels above this value are stretched linearly instead of "
+            "non-linearly (0–1). Prevents bright pixels from clipping and "
+            "star cores from bloating. 1.0 = no protection. Lower HP to "
+            "protect more of the bright end. Check clipped_highlights_pct "
+            "in analyze_image to decide whether HP needs adjusting."
         ),
     )
     color_model: str = Field(
@@ -115,8 +120,9 @@ class AsinhOptions(BaseModel):
     stretch_factor: float = Field(
         default=100.0,
         description=(
-            "Stretch strength, typically 1–1000. "
-            "Higher values = stronger stretch. 100 is a reasonable starting point."
+            "Stretch strength (1–1000). Higher values produce a stronger "
+            "non-linear lift of faint signal. The effect depends on the data — "
+            "verify with analyze_image after applying."
         ),
     )
     black_point_offset: float = Field(
@@ -262,18 +268,25 @@ def stretch_image(
     Apply a non-linear stretch to the linear FITS image.
 
     Transforms linear (un-stretched) data into perceptual brightness space,
-    making faint signal visible. Use distinct output_suffix values (e.g.
-    'gentle', 'moderate', 'aggressive') to produce multiple variants for
-    comparison without overwriting each other.
+    making faint signal visible. All variants stretch from the same linear
+    master — they are independent, not chained. Use distinct output_suffix
+    values to produce multiple variants for comparison.
 
-    Method guidance:
-    - ghs: best control, recommended. Use highlight_protection=0.92-0.98 to
-      prevent star core saturation.
-    - autostretch: reliable fallback, useful for a quick first look.
-    - asinh: good for smooth shadow lifting without highlight crushing.
+    Methods:
+    - ghs: most control — five parameters shape the transfer function.
+      Choose parameters based on the histogram and verify with analyze_image.
+    - autostretch: automatic histogram-based stretch — useful as a quick
+      first look to understand the data before switching to GHS.
+    - asinh: smooth shadow lifting without harsh highlight compression.
     """
     working_dir = state["dataset"]["working_dir"]
-    image_path = state["paths"]["current_image"]
+    metadata = state.get("metadata", {})
+
+    # Always stretch from the linear master, not a previous variant.
+    # First call saves the linear image as pre_stretch_image in metadata.
+    # Subsequent calls load from that, so all variants are independent.
+    pre_stretch = metadata.get("pre_stretch_image")
+    image_path = pre_stretch if pre_stretch else state["paths"]["current_image"]
 
     if asinh_options is None:
         asinh_options = AsinhOptions()
@@ -296,19 +309,17 @@ def stretch_image(
             "messages": [ToolMessage(
                 content=(
                     f"DUPLICATE STRETCH REJECTED — output_suffix={output_suffix!r} with these "
-                    f"exact parameters was already successfully applied in this session.\n\n"
-                    f"Why this is a problem: stretch_image always operates on the current "
-                    f"image in state, which is now the already-stretched output from the "
-                    f"previous call. Applying the same transfer function again would "
-                    f"double-stretch that result — shadows crushed to black, highlights "
-                    f"blown out, stars bloated. The output would be corrupted and unusable.\n\n"
+                    f"exact parameters was already applied. The variant already exists "
+                    f"and re-running with identical parameters would produce an identical "
+                    f"result.\n\n"
                     f"What to do:\n"
-                    f"  - Call analyze_image to evaluate the existing {output_suffix!r} "
-                    f"variant before deciding whether a new one is needed.\n"
+                    f"  - Call select_stretch_variant(variant='{output_suffix}') to switch "
+                    f"to this variant, then call analyze_image to evaluate it.\n"
                     f"  - To create a genuinely different variant: use a new output_suffix "
                     f"AND change the parameters (e.g. lower stretch_amount for 'gentle', "
                     f"higher for 'aggressive', different highlight_protection).\n"
-                    f"  - If the existing variants are good enough: call advance_phase."
+                    f"  - If the existing variants are good enough: call "
+                    f"select_stretch_variant to pick the best one, then advance_phase."
                 ),
                 tool_call_id=tool_call_id,
             )],
@@ -393,7 +404,106 @@ def stretch_image(
         "paths": {**state["paths"], "current_image": str(output_path)},
         "metadata": {
             **state["metadata"],
+            "pre_stretch_image": metadata.get("pre_stretch_image", state["paths"]["current_image"]),
             "stretch_variants": {**_stretch_variants, output_suffix: _args_fingerprint},
         },
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })
+
+
+# ── Select variant tool ──────────────────────────────────────────────────────
+
+@tool
+def select_stretch_variant(
+    variant: Annotated[str, Field(
+        description=(
+            "The output_suffix of the variant to select (e.g. 'aggressive', "
+            "'moderate', 'gentle'). Must match a suffix used in a previous "
+            "stretch_image call."
+        ),
+    )],
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
+    """
+    Select a previously created stretch variant as the active image.
+
+    After creating multiple stretch variants with stretch_image and analyzing
+    each with analyze_image, call this tool to set the best variant as the
+    current image before advancing to the next phase. You can also select a
+    variant to analyze it further, then create additional variants informed
+    by those findings — all variants are independent stretches of the same
+    linear master.
+    """
+    metadata = state.get("metadata", {})
+    stretch_variants = metadata.get("stretch_variants", {})
+    pre_stretch = metadata.get("pre_stretch_image")
+
+    if not stretch_variants:
+        return Command(update={
+            "messages": [ToolMessage(
+                content="No stretch variants exist yet. Call stretch_image first.",
+                tool_call_id=tool_call_id,
+            )],
+        })
+
+    if variant not in stretch_variants:
+        available = ", ".join(f"'{k}'" for k in stretch_variants)
+        return Command(update={
+            "messages": [ToolMessage(
+                content=(
+                    f"Variant '{variant}' does not exist. "
+                    f"Available variants: {available}"
+                ),
+                tool_call_id=tool_call_id,
+            )],
+        })
+
+    if not pre_stretch:
+        return Command(update={
+            "messages": [ToolMessage(
+                content="Internal error: pre_stretch_image not set in metadata.",
+                tool_call_id=tool_call_id,
+            )],
+        })
+
+    # Build the variant file path from the linear master stem + suffix
+    linear_stem = Path(pre_stretch).stem
+    working_dir = state["dataset"]["working_dir"]
+    variant_path = Path(working_dir) / f"{linear_stem}_{variant}.fit"
+    if not variant_path.exists():
+        variant_path = variant_path.with_suffix(".fits")
+    if not variant_path.exists():
+        return Command(update={
+            "messages": [ToolMessage(
+                content=(
+                    f"Variant '{variant}' was recorded but the file is missing. "
+                    f"Call stretch_image with output_suffix='{variant}' to recreate it."
+                ),
+                tool_call_id=tool_call_id,
+            )],
+        })
+
+    # Parse the stored fingerprint to report which params this variant used
+    try:
+        params = json.loads(stretch_variants[variant])
+    except (json.JSONDecodeError, TypeError):
+        params = {}
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(variant_path)},
+        "messages": [ToolMessage(
+            content=json.dumps({
+                "selected_variant": variant,
+                "method": params.get("method", "unknown"),
+                "status": "active",
+                "hint": (
+                    "This variant is now the active image. Call analyze_image "
+                    "to evaluate it. You can create additional variants with "
+                    "stretch_image — all variants stretch from the same linear "
+                    "master, so they are independent."
+                ),
+            }, indent=2),
+            tool_call_id=tool_call_id,
+        )],
     })

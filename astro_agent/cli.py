@@ -167,7 +167,11 @@ def _run_graph(graph, config, initial_state=None, resume=False, autonomous=False
                 # Should not happen — agent_chat node handles autonomous mode
                 # internally. But just in case:
                 typer.echo("[autonomous] Auto-responding with nudge.")
-                response = "Continue processing autonomously."
+                response = (
+                    "Either call a tool to continue processing, or call "
+                    "advance_phase to move to the next phase. Do not respond "
+                    "with text without calling a tool."
+                )
             else:
                 response = typer.prompt("Your response").strip()
         else:

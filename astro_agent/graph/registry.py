@@ -35,7 +35,7 @@ from astro_agent.tools.linear.t13_deconvolution import deconvolution
 
 # ── Imports: Stretch ──────────────────────────────────────────────────────────
 
-from astro_agent.tools.nonlinear.t14_stretch import stretch_image
+from astro_agent.tools.nonlinear.t14_stretch import stretch_image, select_stretch_variant
 
 # ── Imports: Non-linear ───────────────────────────────────────────────────────
 
@@ -96,6 +96,7 @@ LINEAR_TOOLS = [
 
 STRETCH_TOOLS = [
     stretch_image,
+    select_stretch_variant,
 ]
 
 NONLINEAR_TOOLS = [

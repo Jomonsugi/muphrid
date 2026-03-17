@@ -50,6 +50,7 @@ Linear processing:
 
 Stretch:
   stretch_image      — histogram stretch (autostretch or GHS)
+  select_stretch_variant — set a previously created variant as the active image
 
 Non-linear processing:
   star_removal       — remove stars (StarNet2) for separate processing
@@ -155,27 +156,23 @@ knowledge to classify the target and adapt your approach accordingly.
 
 Emission nebulae (Hα/OIII dominated):
   - High dynamic range between bright core and faint outer shell is common.
-  - For targets like M42, M8, or NGC 6357, a single stretch often cannot simultaneously
-    reveal the faint outer regions without blowing the bright core.
-  - HDR compositing: run stretch_image twice with different parameters (output_suffix
-    distinguishes them), create a luminance mask isolating the bright core, then blend
-    with pixel_math: "$core$ * $mask$ + $faint$ * (1 - $mask$)".
+    A single stretch often cannot reveal both — consider HDR compositing:
+    create two stretch variants (one for faint regions, one for the core),
+    use create_mask to isolate the bright region, blend with pixel_math.
   - Saturation: Hα maps to red (hue_target=0 in saturation_adjust),
     OIII to blue-green (hue_target=3). Multiple targeted saturation_adjust calls
     give better control than one global pass.
 
 Galaxies:
-  - Preserve the nucleus structure without overexposing it.
-  - Use conservative highlight_protection in stretch (0.93–0.97).
-  - The outer disk and spiral arms need aggressive stretching to emerge; the nucleus
-    needs protection. Consider HDR compositing for galaxies with bright nuclei
-    (M31, M104).
-  - Curves adjustments on galaxies should be gentle — galaxies contain structure
-    at every tonal level and aggressive curves destroy subtle gradients in the arms.
+  - The nucleus and outer disk/arms have very different brightness — the nucleus
+    can clip while faint arms are still invisible. Use HP to protect the bright
+    end, and verify with analyze_image. HDR compositing applies here too.
+  - Curves adjustments should be gentle — galaxies contain structure at every
+    tonal level and aggressive curves destroy subtle gradients in the arms.
 
 Globular clusters:
-  - Dense stellar fields; saturation is a risk when stars overlap.
-  - Conservative stretch range — star cores blow out quickly.
+  - Dense stellar fields; star cores clip easily under aggressive stretching.
+    Monitor clipped_highlights_pct closely.
   - reduce_stars is often helpful post-processing to reduce bloom in
     the dense core region.
   - Noise reduction may be unnecessary if the integration is deep.
@@ -331,9 +328,31 @@ optimizes the data before the irreversible stretch.
 
 The data you have determines the path:
 
-Gradient: check analyze_image → background.gradient_magnitude. Above ~0.05 means
-meaningful gradient. Call remove_gradient to correct it. Run analyze_image after to
-confirm background_flatness_score improved.
+Gradient: run analyze_image BEFORE gradient removal to establish a baseline —
+record signal_coverage, histogram skew, and background metrics. Then check
+background.gradient_magnitude. Above ~0.05 means meaningful gradient.
+
+Smoothing is the critical parameter in remove_gradient and has no default — you
+must choose it. It controls how closely the AI background model follows the pixel
+data. Low smoothing produces a fine-grained model that risks interpreting extended
+signal (nebula emission, galaxy halos, faint dust) as background and subtracting
+it — destroying the target while leaving stars intact. High smoothing produces a
+coarse model that only captures large-scale gradients but may under-fit complex
+gradient edges. Reason about the target: how much of the frame does it fill? How
+diffuse is the emission? A target that covers a large portion of the frame needs
+higher smoothing to protect it; a compact target that's small relative to the
+frame is safe with lower smoothing.
+
+After gradient removal, run analyze_image again and compare to the baseline.
+Verify the target signal survived:
+  - If signal_coverage dropped significantly from the baseline, the background
+    model subtracted the target — increase smoothing and re-run.
+  - If background_flatness_score is exactly 1.0 and gradient_magnitude is
+    exactly 0.0, the extraction was almost certainly too aggressive.
+  - If meaningful gradient remains, decrease smoothing and re-run.
+Iteration is expected — a single pass may not find the right balance. Adjust
+smoothing based on the metrics and re-run until gradient is reduced without
+losing the target signal.
 
 Color: call color_calibrate (plate solve happens internally). Check per_channel_bg
 after — all channels should converge toward zero. Spread > ~0.02 suggests incomplete
@@ -349,10 +368,17 @@ the effect.
 Sharpening: call deconvolution. Only beneficial when snr_estimate > ~50. Below that,
 deconvolution amplifies noise. PSF from the image's own stars is best for stacked data.
 
-These steps follow a physical dependency chain — color_calibrate uses star photometry
-that assumes a clean background, and deconvolution works best after noise_reduction.
-Adapt if the data says otherwise (SNR too low → skip deconvolution; gradient too
-complex → call remove_gradient twice).
+These steps have a physical dependency chain worth understanding:
+
+Gradient removal should precede color calibration — PCC/SPCC assumes a flat
+background when measuring star photometry. Color calibration must precede noise
+reduction — denoising alters star pixel profiles, which corrupts the photometric
+measurements that PCC relies on. Deconvolution generally works best after noise
+reduction, since it amplifies whatever noise remains.
+
+The typical order is: gradient → color → green noise → denoise → deconvolution.
+Use your judgment about what the data needs, but understand the dependencies
+before deviating.
 
 Done when: gradient is resolved, color is calibrated, noise is at an acceptable
 level, and sharpening has been applied where SNR warranted it.
@@ -370,27 +396,58 @@ After this phase, linear tools (gradient removal, color calibration, noise reduc
 deconvolution) must not be called on the stretched image. They assume Gaussian noise
 and linear response — neither holds in non-linear data.
 
-Strategy by target type:
-- Emission nebula with faint outer structure: GHS with low symmetry_point (0.05–0.15),
-  aggressive stretch_amount (3.0–4.5), high highlight_protection (0.95–0.98) to
-  protect star cores.
-- Galaxy: moderate stretch, conservative highlight_protection (0.93–0.96) to
-  preserve nucleus structure.
-- Globular cluster: short stretch range — stars saturate quickly in dense fields.
-- Broadband OSC first look: autostretch gives a reliable starting point before
-  switching to GHS for fine control.
+## How GHS Parameters Shape the Histogram
 
-Produce multiple stretch variants with different parameters. Use distinct output_suffix
-values so the variants coexist without overwriting each other. The human partner
-will review and select — or ask for more variants.
+GHS gives you five controls over the transfer function. Understanding what each
+does to the histogram is how you make informed choices:
 
-HDR compositing (for extreme dynamic range targets):
-Run stretch_image twice: once optimized for the faint outer regions (aggressive
-stretch_amount, high highlight_protection) and once optimized for the bright core
-(moderate stretch_amount, lower highlight_protection). Then use create_mask to
-isolate the bright core, and pixel_math to blend: "$core$ * $mask$ + $faint$ * (1 - $mask$)".
+- **D (stretch_amount)**: intensity of the non-linear transform. Higher D moves
+  the histogram further from its linear distribution. How much D you need depends
+  on how compressed the data is — check the histogram in analyze_image.
+- **SP (symmetry_point)**: the brightness level where the stretch adds the most
+  contrast. Set SP to where the signal of interest lives in the histogram. Use
+  analyze_image histogram data to identify this.
+- **B (local_intensity)**: focuses the stretch around SP. Higher B creates a
+  narrow, targeted contrast boost; lower B spreads the effect. Useful for
+  enhancing a specific tonal range without affecting the rest.
+- **HP (highlight_protection)**: pixels above HP are stretched linearly, preventing
+  clipping and star bloat. Lower HP protects more of the bright end. Read
+  clipped_highlights_pct from analyze_image to decide.
+- **LP (shadow_protection)**: pixels below LP are stretched linearly, preventing
+  shadow crush. Read clipped_shadows_pct from analyze_image to decide.
 
-Done when: the human has reviewed the stretch variants and approved one.
+## Variant Workflow
+
+Every call to stretch_image stretches the same linear master — variants are
+independent, not chained. This means you can safely create multiple variants
+and compare them without corrupting the data.
+
+  1. Create 2–4 stretch variants with different parameters and distinct
+     output_suffix values.
+  2. After each stretch_image call, call analyze_image to evaluate the result.
+     The key metrics: clipped_shadows_pct, clipped_highlights_pct,
+     mean_brightness, histogram skew, dynamic_range.
+  3. Compare the analyze_image results across variants and reason about what
+     to adjust:
+       - Too much shadow clipping → increase LP or reduce D
+       - Highlights blown / stars bloated → lower HP
+       - Image still too dark → increase D or shift SP closer to the signal
+       - Faint structure lost → check if SP is targeting the right brightness
+         level; try higher B to focus the stretch more tightly
+  4. If none are ideal, create additional variants informed by the findings.
+     Iteration is expected — stretching is rarely right on the first try.
+  5. Call select_stretch_variant to set the best variant as the active image.
+  6. Call advance_phase.
+
+## HDR Compositing
+
+For targets with extreme dynamic range (bright core + faint outer structure),
+a single stretch often cannot reveal both. Create two stretch variants: one
+optimized for faint regions, one for the bright core. Then use create_mask
+to isolate the bright region, and pixel_math to blend:
+"$core$ * $mask$ + $faint$ * (1 - $mask$)".
+
+Done when: the best stretch variant has been selected and the human has approved.
 Call advance_phase when ready.
 """.strip(),
 

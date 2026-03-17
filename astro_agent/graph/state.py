@@ -8,6 +8,8 @@ Annotated reducers:
   - history:            operator.add  → append-only list of strings
   - messages:           add_messages  → LangChain message merge (handles dedup)
   - processing_report:  operator.add  → append-only list of ReportEntry
+  - paths:              merge_dicts   → deep-merge so parallel tool calls don't conflict
+  - metadata:           merge_dicts   → deep-merge so parallel tool calls don't conflict
 """
 
 from __future__ import annotations
@@ -18,6 +20,17 @@ from typing import Annotated
 
 from langgraph.graph.message import add_messages
 from typing import TypedDict
+
+
+def _merge_dicts(old: dict, new: dict) -> dict:
+    """Deep-merge two dicts. new values overwrite old; nested dicts are merged recursively."""
+    merged = dict(old)
+    for k, v in new.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _merge_dicts(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
 
 
 # ── Processing phases ──────────────────────────────────────────────────────────
@@ -283,8 +296,8 @@ class AstroState(TypedDict):
     # Core
     dataset:    Dataset
     phase:      ProcessingPhase
-    paths:      PathState
-    metadata:   Metadata
+    paths:      Annotated[PathState, _merge_dicts]
+    metadata:   Annotated[Metadata, _merge_dicts]
     metrics:    Metrics
 
     # Append-only logs — use operator.add reducer so updates accumulate

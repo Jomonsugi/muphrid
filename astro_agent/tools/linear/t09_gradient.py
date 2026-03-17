@@ -6,15 +6,14 @@ or vignetting residuals that survived flat calibration. Must be done in linear
 space before stretch — gradient removal in non-linear space corrupts color.
 
 Backend: GraXpert AI (direct subprocess). Handles complex, irregular gradients
-without manual sample placement. Confirmed working: v3.0.2, CoreML acceleration,
-model bge-ai-models/1.0.1.
+without manual sample placement. GraXpert automatically uses the latest
+available BGE AI model.
 
 """
 
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 from pathlib import Path
 from typing import Annotated
@@ -44,13 +43,16 @@ class GraXpertBGEOptions(BaseModel):
         ),
     )
     smoothing: float = Field(
-        default=0.5,
         description=(
             "Smoothing strength 0–1 applied to the AI background model. "
-            "Higher values produce a smoother background model but may under-fit "
-            "sharp gradient edges. 0.5 is a reliable default. "
-            "Increase toward 1.0 for very smooth gradients; reduce toward 0.0 "
-            "for complex multi-source gradients."
+            "Controls how closely the model follows pixel data. "
+            "Low smoothing produces a fine-grained model that can mistake "
+            "extended emission (nebulae, galaxy halos) for background and "
+            "subtract it. High smoothing produces a coarse model that only "
+            "captures large-scale gradients and preserves extended structure "
+            "but may under-fit complex gradient edges. "
+            "You must choose this value based on the target and data — "
+            "there is no safe default."
         ),
     )
     save_background_model: bool = Field(
@@ -58,13 +60,6 @@ class GraXpertBGEOptions(BaseModel):
         description=(
             "Also save the extracted background model as a separate FITS. "
             "Useful for inspecting what was removed and diagnosing over-correction."
-        ),
-    )
-    ai_version: str = Field(
-        default="1.0.1",
-        description=(
-            "BGE AI model version. 1.0.1 is the current best available. "
-            "Model is cached at ~/Library/Application Support/GraXpert/bge-ai-models/."
         ),
     )
 
@@ -80,14 +75,6 @@ def _normalize_correction_type(raw: str) -> str:
     mapping = {"subtraction": "Subtraction", "division": "Division"}
     return mapping.get(raw.lower(), raw.capitalize())
 
-
-def _validate_ai_version(version: str) -> str:
-    """Ensure ai_version matches semver-like N.N.N format required by GraXpert."""
-    if not re.match(r"^\d+\.\d+\.\d+$", version):
-        raise ValueError(
-            f"ai_version must be in N.N.N format (e.g. '1.0.1'). Got: {version!r}"
-        )
-    return version
 
 
 def _probe_output_path(base_stem: Path, parent: Path) -> Path | None:
@@ -117,11 +104,11 @@ def _run_graxpert_bge(
     graxpert_bin = settings.graxpert_bin
 
     correction = _normalize_correction_type(options.correction_type)
-    ai_version = _validate_ai_version(options.ai_version)
 
     # Pass output path WITHOUT extension — GraXpert appends .fits itself
     output_stem = image_path.parent / f"{image_path.stem}_bge"
 
+    # Omit -ai_version so GraXpert uses the latest available model automatically.
     cmd: list[str] = [
         graxpert_bin,
         str(image_path),
@@ -130,7 +117,6 @@ def _run_graxpert_bge(
         "-output", str(output_stem),
         "-correction", correction,
         "-smoothing", str(options.smoothing),
-        "-ai_version", ai_version,
     ]
     if options.save_background_model:
         cmd.append("-bg")
@@ -195,7 +181,6 @@ def remove_gradient(
         "settings": {
             "correction_type": graxpert_options.correction_type,
             "smoothing": graxpert_options.smoothing,
-            "ai_version": graxpert_options.ai_version,
             "save_background_model": graxpert_options.save_background_model,
         },
     }
