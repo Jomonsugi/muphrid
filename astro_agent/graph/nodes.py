@@ -40,6 +40,17 @@ from astro_agent.graph.state import AstroState, HITLPayload, ProcessingPhase
 logger = logging.getLogger(__name__)
 
 
+def _check_anthropic(model) -> bool:
+    """Check if the model is a ChatAnthropic instance (supports cache_control)."""
+    try:
+        from langchain_anthropic import ChatAnthropic
+        # model may be a RunnableBinding (from bind_tools), check the bound model
+        bound = getattr(model, "bound", model)
+        return isinstance(bound, ChatAnthropic)
+    except ImportError:
+        return False
+
+
 # ── phase_router ──────────────────────────────────────────────────────────────
 
 def phase_router(state: AstroState) -> dict[str, Any]:
@@ -99,6 +110,51 @@ def _strip_vlm_images(messages: list) -> list:
             text_blocks = [b for b in msg.content if b.get("type") == "text"]
             text = " ".join(b["text"] for b in text_blocks) if text_blocks else ""
             result.append(HumanMessage(content=text))
+        else:
+            result.append(msg)
+    return result
+
+
+_ANALYSIS_TOOLS = {"analyze_image", "analyze_frames"}
+
+
+def _prune_phase_analysis(messages: list) -> list:
+    """
+    Replace analyze_image/analyze_frames ToolMessage content from completed
+    phases with a short placeholder. Current phase messages are untouched.
+
+    The model's reasoning (AIMessages) captures the conclusions from analysis
+    results. The raw JSON served its purpose at decision time and is dead
+    weight once the phase ends.
+
+    Returns a new list — does not mutate state.
+    """
+    import os
+    if os.environ.get("PRUNE_PHASE_ANALYSIS", "").lower() not in ("1", "true"):
+        return messages
+
+    # Find the last successful advance_phase boundary
+    phase_boundary = 0
+    for i, msg in enumerate(messages):
+        if (
+            isinstance(msg, ToolMessage)
+            and getattr(msg, "name", None) == "advance_phase"
+            and "Cannot advance" not in str(msg.content)
+        ):
+            phase_boundary = i + 1
+
+    result = []
+    for i, msg in enumerate(messages):
+        if (
+            i < phase_boundary
+            and isinstance(msg, ToolMessage)
+            and getattr(msg, "name", None) in _ANALYSIS_TOOLS
+        ):
+            result.append(ToolMessage(
+                content="[Analysis from prior phase — see reasoning above]",
+                tool_call_id=msg.tool_call_id,
+                name=msg.name,
+            ))
         else:
             result.append(msg)
     return result
@@ -318,12 +374,41 @@ def make_agent_node(model_factory):
         phase_prompt = _PHASE_PROMPTS.get(phase, "")
         system = f"{_SYSTEM_BASE}\n\n{phase_prompt}"
 
-        messages = [SystemMessage(content=system)] + raw_messages
+        # Anthropic prompt caching: use content blocks with cache_control
+        # so the stable prefix is cached across calls within a phase.
+        # additional_kwargs doesn't work — must use inline content blocks.
+        _is_anthropic = _check_anthropic(model)
+
+        if _is_anthropic:
+            messages = [SystemMessage(content=[
+                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}},
+            ])] + raw_messages
+
+            # Mark the last successful advance_phase as a cache boundary so
+            # all completed-phase messages are cached alongside the system prompt.
+            for msg in reversed(messages):
+                if (
+                    isinstance(msg, ToolMessage)
+                    and getattr(msg, "name", None) == "advance_phase"
+                    and "Cannot advance" not in str(msg.content)
+                ):
+                    # Convert string content to content block with cache_control
+                    text = str(msg.content) if not isinstance(msg.content, list) else msg.content
+                    msg.content = [
+                        {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}},
+                    ]
+                    break
+        else:
+            messages = [SystemMessage(content=system)] + raw_messages
 
         # VLM scoping: images are only visible during active HITL conversations.
         # Once the human approves and we move on, strip all images from the view.
         if not _in_active_hitl(raw_messages):
             messages = _strip_vlm_images(messages)
+
+        # Prune analysis outputs from completed phases — the model's reasoning
+        # captured the conclusions; raw JSON is dead weight after phase ends.
+        messages = _prune_phase_analysis(messages)
 
         response = model.invoke(messages)
         response = _rescue_raw_tool_calls(response)

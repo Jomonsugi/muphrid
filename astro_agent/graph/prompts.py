@@ -222,16 +222,21 @@ Done when: target is resolved. Call advance_phase.
 ## Current Phase: Calibration
 
 FIRST: Check state.paths.masters — if bias, dark, and flat masters already exist
-(non-null paths), call advance_phase immediately. Do not rebuild masters that are
-already built.
+(non-null paths) AND a calibrated sequence exists, call advance_phase immediately.
 
-If masters are missing, build them in order:
+This phase has two stages:
+
+**Stage 1 — Build master calibration frames:**
   1. build_masters(file_type="bias", ...) — baseline readout pattern
   2. build_masters(file_type="dark", ...) — thermal noise model
   3. build_masters(file_type="flat", ...) — vignetting/dust correction
 
 There is ONE tool for all three: build_masters. The file_type parameter selects which
 calibration type to build. Do not invent separate tools per frame type.
+
+**Stage 2 — Apply masters to the light frames:**
+  4. convert_sequence(sequence_name="lights") — convert RAW lights to FITSEQ
+  5. calibrate(...) — apply master bias, dark, flat to the light sequence
 
 What to consider:
 - Dark frames must match the exposure time of the light subs for accurate subtraction.
@@ -244,7 +249,7 @@ Sensor type (from ingest) determines calibration parameters:
 - Bayer: standard CFA calibration
 - Mono: no CFA processing needed
 
-Done when: masters are built with acceptable quality diagnostics.
+Done when: masters are built, lights are converted and calibrated.
 Call advance_phase when ready.
 """.strip(),
 
@@ -254,10 +259,8 @@ Call advance_phase when ready.
 FIRST: Check state.paths — if registered_sequence already exists (non-null), call
 advance_phase immediately. Do not re-register frames that are already registered.
 
-If not done, convert light frames, then calibrate, then align:
-  1. convert_sequence(sequence_name="lights") — convert RAW lights to FITSEQ
-  2. calibrate(...) — apply master calibration frames to the light sequence
-  3. siril_register(...) — align calibrated frames using star matching
+If not done, align the calibrated frames:
+  1. siril_register(...) — align calibrated frames using star matching
 
 What to consider:
 - The default star detection parameters work for most datasets. For difficult data

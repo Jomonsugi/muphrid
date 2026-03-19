@@ -63,7 +63,16 @@ def _scan_phase_calls(messages: list) -> list[dict]:
     """
     phase_start = 0
     for i, msg in enumerate(messages):
-        if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "advance_phase":
+        if (
+            isinstance(msg, ToolMessage)
+            and getattr(msg, "name", None) == "advance_phase"
+            and "Cannot advance" not in str(msg.content)
+        ):
+            # Only successful advance_phase calls reset the boundary.
+            # Blocked calls return "Cannot advance..." — if these reset
+            # the boundary, tools called before the blocked attempt become
+            # invisible to the requirement checker, forcing the agent to
+            # redo work it already completed.
             phase_start = i + 1
     phase_messages = messages[phase_start:]
 
@@ -118,6 +127,13 @@ def _check_phase_requirements(
                         f"but {len(files[plural])} {frame_type} frame(s) are available. "
                         f"The master {frame_type} must be built before lights can be calibrated."
                     )
+
+        # convert_sequence is required to create the FITSEQ from raw lights
+        if "convert_sequence" not in called_tools:
+            violations.append(
+                "`convert_sequence` was not called. The raw light frames must be "
+                "converted to a Siril FITSEQ sequence before calibration can be applied."
+            )
 
         # calibrate is required if any calibration frames exist
         has_calib = any(files.get(k) for k in ("biases", "darks", "flats"))

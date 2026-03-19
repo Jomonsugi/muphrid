@@ -301,7 +301,7 @@ def _resume_session(thread_id: str) -> None:
     else:
         # No pending interrupt — resume streaming from last checkpoint
         st.session_state["pending_interrupt"] = None
-        _launch_thread(None, config, thread_id)
+        _launch_thread(Command(resume=None), config, thread_id)
 
 
 # ── Key metric extraction ──────────────────────────────────────────────────────

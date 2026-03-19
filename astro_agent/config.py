@@ -356,6 +356,9 @@ def make_llm(settings: Settings | None = None):
             api_key=settings.anthropic_api_key,       # type: ignore[arg-type]
             temperature=settings.llm_temperature,
             timeout=120,
+            model_kwargs={
+                "extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"},
+            },
         )
 
     if settings.llm_provider == "openai":
