@@ -19,12 +19,12 @@ vlm_enabled = false   # when true, inject preview image into agent context durin
 # ── Preprocessing ──────────────────────────────────────────────────────────────
 
 [hitl.T02_masters]
-enabled = true
+enabled = false
 type    = "data_review"
 title   = "T02 Master Frame Diagnostics"
 
 [hitl.T06_T07_stack]
-enabled = true
+enabled = false
 type    = "data_review"
 title   = "T06/T07 Frame Selection and Stack Results"
 
@@ -36,17 +36,17 @@ type    = "image_review"
 title   = "T09 Gradient Removal"
 
 [hitl.T10_color]
-enabled = true
+enabled = false
 type    = "data_review"
 title   = "T10 Color Calibration Results"
 
 [hitl.T12_denoise]
-enabled = true
+enabled = false
 type    = "data_review"
 title   = "T12 Noise Reduction Results"
 
 [hitl.T13_decon]
-enabled = true
+enabled = false
 type    = "image_review"
 title   = "T13 Deconvolution"
 
@@ -60,7 +60,7 @@ title   = "T14 Stretch"
 # ── Non-linear processing ──────────────────────────────────────────────────────
 
 [hitl.T15_star_removal]
-enabled = true
+enabled = false
 type    = "image_review"
 title   = "T15 Star Removal"
 
@@ -70,12 +70,12 @@ type    = "image_review"
 title   = "T16 Curves"
 
 [hitl.T17_local_contrast]
-enabled = true
+enabled = false
 type    = "image_review"
 title   = "T17 Local Contrast"
 
 [hitl.T18_saturation]
-enabled = true
+enabled = false
 type    = "image_review"
 title   = "T18 Saturation"
 
@@ -87,6 +87,6 @@ title   = "T19 Star Restoration"
 # ── Multiscale sharpening ──────────────────────────────────────────────────────
 
 [hitl.T27_multiscale]
-enabled = true
+enabled = false
 type    = "image_review"
 title   = "T27 Multiscale Sharpening"

@@ -386,14 +386,25 @@ def make_agent_node(model_factory):
 
             # Mark the last successful advance_phase as a cache boundary so
             # all completed-phase messages are cached alongside the system prompt.
+            # Anthropic allows max 4 cache_control blocks, so first revert any
+            # previously-marked advance_phase messages to plain strings, then
+            # mark only the most recent one.
+            for msg in messages:
+                if (
+                    isinstance(msg, ToolMessage)
+                    and getattr(msg, "name", None) == "advance_phase"
+                    and isinstance(msg.content, list)
+                ):
+                    # Revert to plain string
+                    msg.content = msg.content[0].get("text", str(msg.content)) if msg.content else ""
+
             for msg in reversed(messages):
                 if (
                     isinstance(msg, ToolMessage)
                     and getattr(msg, "name", None) == "advance_phase"
                     and "Cannot advance" not in str(msg.content)
                 ):
-                    # Convert string content to content block with cache_control
-                    text = str(msg.content) if not isinstance(msg.content, list) else msg.content
+                    text = str(msg.content)
                     msg.content = [
                         {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}},
                     ]
@@ -549,6 +560,32 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     # Fire HITL interrupt
     cfg = tool_cfg(hitl_key)
     image_paths = images_from_tool(messages, tool_name)
+
+    # Convert FITS paths to displayable previews for the UI.
+    # st.image() can't render FITS — generate_preview creates a JPG.
+    if image_paths and cfg["type"] == "image_review":
+        working_dir = state.get("dataset", {}).get("working_dir", "")
+        if working_dir:
+            from astro_agent.tools.utility.t22_generate_preview import generate_preview
+            preview_paths = []
+            for img in image_paths:
+                p = Path(img)
+                if p.suffix.lower() in (".fit", ".fits", ".fts"):
+                    try:
+                        result = generate_preview(
+                            working_dir=working_dir,
+                            fits_path=str(p),
+                            format="jpg",
+                            quality=95,
+                        )
+                        preview_paths.append(result["preview_path"])
+                    except Exception as e:
+                        logger.warning(f"HITL preview generation failed for {p.name}: {e}")
+                        preview_paths.append(img)  # fall back to raw path
+                else:
+                    preview_paths.append(img)
+            image_paths = preview_paths
+
     payload = HITLPayload(
         type=cfg["type"],
         title=cfg["title"],
@@ -633,28 +670,29 @@ def agent_chat(state: AstroState) -> dict[str, Any]:
         if isinstance(last, AIMessage):
             agent_text = str(last.content)[:500]
 
-    # Count consecutive text-only AI responses (no tool calls between them).
-    # This catches both autonomous nudge loops AND CLI auto-respond loops
-    # where each interrupt+resume resets the recursion counter.
-    import os
-    max_nudges = int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "2"))
-    consecutive_text_only = 0
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage) and not msg.tool_calls:
-            consecutive_text_only += 1
-        elif isinstance(msg, HumanMessage):
-            continue  # human/nudge responses between AI text
-        else:
-            break  # hit a tool call — agent was making progress
+    # If the human is actively chatting (active_hitl=True), no nudge limit —
+    # they're driving the conversation. Otherwise, count consecutive text-only
+    # AI responses to catch loops where the agent refuses to call tools.
+    if not state.get("active_hitl", False):
+        import os
+        max_nudges = int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "2"))
+        consecutive_text_only = 0
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and not msg.tool_calls:
+                consecutive_text_only += 1
+            elif isinstance(msg, HumanMessage):
+                continue  # nudge responses between AI text
+            else:
+                break  # hit a tool call — agent was making progress
 
-    if consecutive_text_only >= max_nudges:
-        raise NudgeLimitError(
-            f"Agent produced {consecutive_text_only} consecutive text-only responses "
-            f"without calling any tool. Current phase: {phase.value.upper()}. "
-            f"The agent must call tools to make progress or call advance_phase "
-            f"to move to the next phase. "
-            f"Set MAX_AUTONOMOUS_NUDGES in .env to adjust (current: {max_nudges})."
-        )
+        if consecutive_text_only >= max_nudges:
+            raise NudgeLimitError(
+                f"Agent produced {consecutive_text_only} consecutive text-only responses "
+                f"without calling any tool. Current phase: {phase.value.upper()}. "
+                f"The agent must call tools to make progress or call advance_phase "
+                f"to move to the next phase. "
+                f"Set MAX_AUTONOMOUS_NUDGES in .env to adjust (current: {max_nudges})."
+            )
 
     if is_autonomous():
         logger.info(f"agent_chat (autonomous): nudging agent to act or advance (phase={phase.value})")

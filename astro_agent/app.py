@@ -241,7 +241,8 @@ def _start_new_session(
 ) -> None:
     _init_graph()
 
-    result = ingest_dataset.invoke({"root_directory": directory})
+    thread_id = _make_thread_id(target)
+    result = ingest_dataset.invoke({"root_directory": directory, "thread_id": thread_id})
     dataset = result["dataset"]
 
     st.session_state["ingest_summary"] = result.get("summary", {})
@@ -263,8 +264,6 @@ def _start_new_session(
             ingest_summary=result.get("summary", {}),
         ))
     ]
-
-    thread_id = _make_thread_id(target)
     config = {"configurable": {"thread_id": thread_id}}
     _save_session(thread_id, target)
 
@@ -301,7 +300,7 @@ def _resume_session(thread_id: str) -> None:
     else:
         # No pending interrupt — resume streaming from last checkpoint
         st.session_state["pending_interrupt"] = None
-        _launch_thread(Command(resume=None), config, thread_id)
+        _launch_thread(None, config, thread_id)
 
 
 # ── Key metric extraction ──────────────────────────────────────────────────────
@@ -396,29 +395,41 @@ def _render_events(events: list[dict]) -> None:
 
 def _render_hitl_panel(payload: dict) -> None:
     st.divider()
-    st.subheader(f"Review required: {payload.get('title', 'Human Review')}")
 
     ptype = payload.get("type", "data_review")
     images = payload.get("images", [])
 
-    if ptype == "image_review" and images:
-        cols = st.columns(min(len(images), 2))
-        for i, img_path in enumerate(images):
-            p = Path(img_path)
-            with cols[i % len(cols)]:
-                if p.exists():
-                    st.image(str(p), caption=p.name, use_container_width=True)
-                else:
-                    st.warning(f"Image not found: {img_path}")
+    if ptype == "agent_chat":
+        # Agent sent a text message — display it and let the human respond
+        st.subheader(f"Agent message ({payload.get('phase', '')} phase)")
+        agent_text = payload.get("agent_text", "")
+        if agent_text:
+            with st.chat_message("assistant"):
+                st.write(agent_text)
+    else:
+        st.subheader(f"Review required: {payload.get('title', 'Human Review')}")
 
-    elif ptype == "data_review":
-        # Show last tool result from context for data review
-        context = payload.get("context", [])
-        for msg in reversed(context):
-            if hasattr(msg, "name") and hasattr(msg, "content"):
-                with st.expander(f"Result: {msg.name}", expanded=True):
-                    st.code(msg.content, language="json")
-                break
+        if ptype == "image_review" and images:
+            cols = st.columns(min(len(images), 2))
+            for i, img_path in enumerate(images):
+                p = Path(img_path)
+                with cols[i % len(cols)]:
+                    if p.exists():
+                        st.image(str(p), caption=p.name, use_container_width=True)
+                    else:
+                        st.warning(f"Image not found: {img_path}")
+
+        elif ptype == "data_review":
+            # Show last tool result from context for data review
+            context = payload.get("context", [])
+            for msg in reversed(context):
+                if hasattr(msg, "name") and hasattr(msg, "content"):
+                    content = msg.content
+                    if isinstance(content, list):
+                        content = content[0].get("text", str(content)) if content else ""
+                    with st.expander(f"Result: {msg.name}", expanded=True):
+                        st.code(content, language="json")
+                    break
 
     st.divider()
     feedback = st.text_area(
@@ -482,7 +493,7 @@ def main() -> None:
             placeholder="/path/to/dataset",
             help="Root directory containing lights/, darks/, flats/, bias/ subfolders.",
         )
-        target = st.text_input("Target name", placeholder="M42 Orion Nebula")
+        target = st.text_input("Target name", placeholder="M42, NGC 7000, etc.")
         bortle = st.number_input("Bortle scale", min_value=1, max_value=9, value=5, step=1)
         sqm_val = st.number_input(
             "SQM reading (optional)", value=0.0, step=0.1,

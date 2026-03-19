@@ -139,7 +139,12 @@ def images_from_tool(messages: list, tool_name: str) -> list[str]:
     for msg in messages:
         if isinstance(msg, ToolMessage) and msg.name == tool_name:
             try:
-                result = ast.literal_eval(msg.content)
+                # Content may be a string or a list (Anthropic content blocks).
+                content = msg.content
+                if isinstance(content, list):
+                    # Extract text from content blocks
+                    content = content[0].get("text", str(content)) if content else ""
+                result = ast.literal_eval(content)
                 if isinstance(result, dict):
                     for key in _IMAGE_PATH_KEYS:
                         if path := result.get(key):
