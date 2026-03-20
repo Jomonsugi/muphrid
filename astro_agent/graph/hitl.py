@@ -12,8 +12,10 @@ whether to pause — it just calls tools and gets intercepted.
 
 from __future__ import annotations
 
-import ast
+import json
 import tomllib
+
+from astro_agent.graph.content import text_content
 from pathlib import Path
 
 from langchain_core.messages import ToolMessage
@@ -63,8 +65,8 @@ def vlm_enabled() -> bool:
 TOOL_TO_HITL: dict[str, str] = {
     # Preprocessing
     "build_masters":          "T02_masters",
-    "siril_stack":            "T06_T07_stack",
-    "select_frames":          "T06_T07_stack",
+    "select_frames":          "T06_select",
+    "siril_stack":            "T07_stack",
     # Linear
     "remove_gradient":        "T09_gradient",
     "color_calibrate":        "T10_color",
@@ -111,7 +113,17 @@ APPROVE_SENTINEL = "__APPROVE__"
 
 
 def is_affirmative(response: str) -> bool:
-    return response.strip() == APPROVE_SENTINEL
+    """Check if the response starts with the approval sentinel."""
+    return response.strip().startswith(APPROVE_SENTINEL)
+
+
+def extract_approval_note(response: str) -> str:
+    """Extract the human's note from an approve-with-note response, or empty string."""
+    text = response.strip()
+    if text.startswith(APPROVE_SENTINEL):
+        note = text[len(APPROVE_SENTINEL):].strip()
+        return note
+    return ""
 
 
 # ── Image extraction from message history ─────────────────────────────────────
@@ -139,12 +151,8 @@ def images_from_tool(messages: list, tool_name: str) -> list[str]:
     for msg in messages:
         if isinstance(msg, ToolMessage) and msg.name == tool_name:
             try:
-                # Content may be a string or a list (Anthropic content blocks).
-                content = msg.content
-                if isinstance(content, list):
-                    # Extract text from content blocks
-                    content = content[0].get("text", str(content)) if content else ""
-                result = ast.literal_eval(content)
+                content = text_content(msg.content)
+                result = json.loads(content)
                 if isinstance(result, dict):
                     for key in _IMAGE_PATH_KEYS:
                         if path := result.get(key):

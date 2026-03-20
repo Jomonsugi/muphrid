@@ -24,6 +24,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
 from astro_agent.graph.hitl import (
+    TOOL_TO_HITL,
     images_from_tool,
     is_affirmative,
     is_autonomous,
@@ -32,6 +33,7 @@ from astro_agent.graph.hitl import (
     tool_cfg,
     vlm_enabled,
 )
+from astro_agent.graph.content import image_blocks, text_content
 from astro_agent.graph.prompts import PHASE_PROMPTS as _PHASE_PROMPTS
 from astro_agent.graph.prompts import SYSTEM_BASE as _SYSTEM_BASE
 from astro_agent.graph.registry import all_tools, tools_for_phase
@@ -102,14 +104,8 @@ def _strip_vlm_images(messages: list) -> list:
     """
     result = []
     for msg in messages:
-        if (
-            isinstance(msg, HumanMessage)
-            and isinstance(msg.content, list)
-            and any(block.get("type") == "image_url" for block in msg.content)
-        ):
-            text_blocks = [b for b in msg.content if b.get("type") == "text"]
-            text = " ".join(b["text"] for b in text_blocks) if text_blocks else ""
-            result.append(HumanMessage(content=text))
+        if isinstance(msg, HumanMessage) and image_blocks(msg.content):
+            result.append(HumanMessage(content=text_content(msg.content)))
         else:
             result.append(msg)
     return result
@@ -171,11 +167,7 @@ def _in_active_hitl(messages: list) -> bool:
     if not messages:
         return False
     last = messages[-1]
-    return (
-        isinstance(last, HumanMessage)
-        and isinstance(last.content, list)
-        and any(block.get("type") == "image_url" for block in last.content)
-    )
+    return isinstance(last, HumanMessage) and bool(image_blocks(last.content))
 
 
 # ── Stuck-loop detection ──────────────────────────────────────────────────────
@@ -396,7 +388,7 @@ def make_agent_node(model_factory):
                     and isinstance(msg.content, list)
                 ):
                     # Revert to plain string
-                    msg.content = msg.content[0].get("text", str(msg.content)) if msg.content else ""
+                    msg.content = text_content(msg.content)
 
             for msg in reversed(messages):
                 if (
@@ -545,12 +537,20 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         if not state.get("active_hitl", False):
             # No HITL mapping and no active conversation — pass through
             return {}
-        # Active HITL conversation but no new tool call — the agent just
-        # responded to a chat message. Re-fire interrupt so the human can
-        # continue. We need to find the original tool from earlier messages.
+        # Active HITL but the agent just called a non-HITL tool (e.g.
+        # analyze_image to gather data for its response). Let it pass
+        # through so the agent sees the result and can reason about it.
+        # The interrupt will re-fire when the agent responds with text
+        # (via route_after_agent → hitl_check when active_hitl=True and
+        # no tool_calls).
+        last = messages[-1] if messages else None
+        if isinstance(last, ToolMessage) and last.name not in TOOL_TO_HITL:
+            return {}
+
+        # Agent responded with text (no tool call) — re-fire interrupt
+        # so the human can see the response and continue the conversation.
         hitl_key, tool_name = _find_active_hitl_tool(messages)
         if hitl_key is None:
-            # Shouldn't happen, but fail safe
             return {"active_hitl": False}
 
     # HITL disabled for this tool (or autonomous mode) — pass through
@@ -571,27 +571,42 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
             for img in image_paths:
                 p = Path(img)
                 if p.suffix.lower() in (".fit", ".fits", ".fts"):
-                    try:
-                        result = generate_preview(
-                            working_dir=working_dir,
-                            fits_path=str(p),
-                            format="jpg",
-                            quality=95,
-                        )
-                        preview_paths.append(result["preview_path"])
-                    except Exception as e:
-                        logger.warning(f"HITL preview generation failed for {p.name}: {e}")
-                        preview_paths.append(img)  # fall back to raw path
+                    # Check if preview already exists (idempotent on node re-entry)
+                    preview_dir = Path(working_dir) / "previews"
+                    expected = preview_dir / f"preview_{p.stem}.jpg"
+                    if expected.exists():
+                        preview_paths.append(str(expected))
+                    else:
+                        try:
+                            result = generate_preview(
+                                working_dir=working_dir,
+                                fits_path=str(p),
+                                format="jpg",
+                                quality=95,
+                            )
+                            preview_paths.append(result["preview_path"])
+                        except Exception as e:
+                            logger.warning(f"HITL preview generation failed for {p.name}: {e}")
+                            # Do NOT fall back to raw FITS — UI can't render it
                 else:
                     preview_paths.append(img)
             image_paths = preview_paths
+
+    # Extract agent's latest text for multi-turn HITL display
+    _agent_text = ""
+    if state.get("active_hitl", False) and messages:
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage):
+                _agent_text = text_content(msg.content)[:500]
+                break
 
     payload = HITLPayload(
         type=cfg["type"],
         title=cfg["title"],
         tool_name=tool_name,
         images=image_paths,
-        context=messages[-6:],  # recent messages for continuity
+        context=messages[-6:],
+        agent_text=_agent_text,
     )
 
     # When vlm_enabled + image_review, inject the preview image BEFORE
@@ -622,11 +637,15 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
 
     if is_affirmative(response_text):
         # Human approved — HITL conversation is over.
-        # Return VLM image so it's in state (audit trail), but _strip_vlm_images
-        # will remove it from the agent's view on the next call.
-        result: dict[str, Any] = {"active_hitl": False}
-        if vlm_messages:
-            result["messages"] = vlm_messages
+        # Always inject a HumanMessage so the message list doesn't end with an
+        # AIMessage — Anthropic rejects conversations that end with assistant text.
+        from astro_agent.graph.hitl import extract_approval_note
+        note = extract_approval_note(response_text)
+        approval_text = note if note else "Approved. Continue to the next step."
+        result: dict[str, Any] = {
+            "active_hitl": False,
+            "messages": vlm_messages + [HumanMessage(content=approval_text)],
+        }
         return result
 
     # Human gave feedback or chat — inject VLM image + feedback text.
@@ -668,7 +687,7 @@ def agent_chat(state: AstroState) -> dict[str, Any]:
     if messages:
         last = messages[-1]
         if isinstance(last, AIMessage):
-            agent_text = str(last.content)[:500]
+            agent_text = text_content(last.content)[:500]
 
     # If the human is actively chatting (active_hitl=True), no nudge limit —
     # they're driving the conversation. Otherwise, count consecutive text-only
@@ -680,10 +699,10 @@ def agent_chat(state: AstroState) -> dict[str, Any]:
         for msg in reversed(messages):
             if isinstance(msg, AIMessage) and not msg.tool_calls:
                 consecutive_text_only += 1
-            elif isinstance(msg, HumanMessage):
-                continue  # nudge responses between AI text
+            elif isinstance(msg, HumanMessage) and msg.additional_kwargs.get("is_nudge"):
+                continue  # skip our own nudge injections
             else:
-                break  # hit a tool call — agent was making progress
+                break  # HITL feedback, tool results, etc. reset the counter
 
         if consecutive_text_only >= max_nudges:
             raise NudgeLimitError(
@@ -696,7 +715,10 @@ def agent_chat(state: AstroState) -> dict[str, Any]:
 
     if is_autonomous():
         logger.info(f"agent_chat (autonomous): nudging agent to act or advance (phase={phase.value})")
-        return {"messages": [HumanMessage(content=_AUTONOMOUS_NUDGE)]}
+        return {"messages": [HumanMessage(
+            content=_AUTONOMOUS_NUDGE,
+            additional_kwargs={"is_nudge": True},
+        )]}
 
     # HITL mode — let the human read the agent's message and respond
     logger.info(f"agent_chat (HITL): firing interrupt for human response (phase={phase.value})")

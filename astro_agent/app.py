@@ -5,14 +5,17 @@ Usage:
     streamlit run astro_agent/app.py
 
 Architecture:
-    The LangGraph pipeline runs in a background thread. A queue.Queue bridges
-    the thread and the Streamlit UI. The main thread polls the queue on each
-    rerun and calls st.rerun() while the graph is active. HITL interrupts pause
-    the thread; the user's response resumes it via a second input queue.
+    The LangGraph pipeline runs in a background daemon thread. An event queue
+    bridges graph events to the Streamlit UI. The main thread polls the queue
+    every 0.5s via st.rerun() and renders events as they arrive.
 
-    Sessions are persisted to ~/.astroagent/sessions.json so thread IDs survive
-    Streamlit restarts. SQLite checkpointing means any crash or sleep can be
-    resumed by entering the thread ID in the Resume section.
+    When an HITL interrupt fires, the thread blocks on an input queue waiting
+    for the user's response. The user types feedback or clicks Approve, the
+    response goes on the input queue, and the thread resumes. One code path
+    for all responses — no bifurcation.
+
+    Sessions are persisted to ~/.astroagent/sessions.json. SQLite checkpointing
+    means any crash can be resumed.
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ import json
 import logging
 import queue
 import re
+import sqlite3
 import threading
 import time
 from datetime import datetime
@@ -28,15 +32,15 @@ from typing import Any
 
 import streamlit as st
 from langchain_core.messages import HumanMessage
-import sqlite3
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
 
 from astro_agent.config import check_dependencies, load_settings
+from astro_agent.graph.content import text_content
 from astro_agent.graph.graph import build_graph
-from astro_agent.graph.hitl import APPROVE_SENTINEL
+from astro_agent.graph.hitl import APPROVE_SENTINEL, images_from_tool
 from astro_agent.graph.memory import make_memory_store
 from astro_agent.graph.state import SessionContext, build_initial_message, make_empty_state
 from astro_agent.tools.preprocess.t01_ingest import ingest_dataset
@@ -52,47 +56,70 @@ _DB_PATH = str(_ASTROAGENT_DIR / "checkpoints.db")
 
 
 def _load_sessions() -> list[dict]:
-    if _SESSIONS_FILE.exists():
-        try:
-            return json.loads(_SESSIONS_FILE.read_text())
-        except Exception:
-            return []
-    return []
+    """Load sessions, hiding any whose run data no longer exists on disk."""
+    if not _SESSIONS_FILE.exists():
+        return []
+    try:
+        sessions = json.loads(_SESSIONS_FILE.read_text())
+    except Exception:
+        return []
+    return [s for s in sessions if Path(s.get("working_dir", "")).is_dir()]
 
 
-def _save_session(thread_id: str, target: str) -> None:
+def _save_session(thread_id: str, target: str, working_dir: str) -> None:
     _ASTROAGENT_DIR.mkdir(exist_ok=True)
-    sessions = _load_sessions()
-    sessions = [s for s in sessions if s["thread_id"] != thread_id]
-    sessions.insert(0, {
+    try:
+        all_sessions = json.loads(_SESSIONS_FILE.read_text()) if _SESSIONS_FILE.exists() else []
+    except Exception:
+        all_sessions = []
+    all_sessions = [s for s in all_sessions if s["thread_id"] != thread_id]
+    all_sessions.insert(0, {
         "thread_id": thread_id,
         "target": target,
         "started": datetime.now().isoformat()[:19],
+        "working_dir": working_dir,
     })
-    _SESSIONS_FILE.write_text(json.dumps(sessions[:20], indent=2))
+    _SESSIONS_FILE.write_text(json.dumps(all_sessions[:20], indent=2))
+
+
+def _prune_stale_checkpoints() -> None:
+    """Remove checkpoint rows for sessions whose run data no longer exists."""
+    if not _SESSIONS_FILE.exists() or not Path(_DB_PATH).exists():
+        return
+    try:
+        all_sessions = json.loads(_SESSIONS_FILE.read_text())
+    except Exception:
+        return
+    stale_ids = [
+        s["thread_id"] for s in all_sessions
+        if not Path(s.get("working_dir", "")).is_dir()
+    ]
+    if not stale_ids:
+        return
+    try:
+        conn = sqlite3.connect(_DB_PATH)
+        for tid in stale_ids:
+            conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (tid,))
+            conn.execute("DELETE FROM writes WHERE thread_id = ?", (tid,))
+        conn.commit()
+        conn.close()
+        logging.getLogger(__name__).info(
+            f"Pruned checkpoints for {len(stale_ids)} stale session(s)"
+        )
+    except Exception:
+        pass
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 
 def _configure_logging(thread_id: str) -> None:
-    """
-    Configure root logger once per Streamlit process.
-
-    Writes to both the terminal (where `streamlit run` is invoked) and a
-    per-session file at ~/.astroagent/logs/<thread_id>.log.
-
-    The `if root.handlers` guard prevents duplicate handlers — Streamlit
-    re-executes the script on every UI interaction.
-    """
     root = logging.getLogger()
     if root.handlers:
-        return  # already configured
-
+        return
     log_dir = _ASTROAGENT_DIR / "logs"
     log_dir.mkdir(exist_ok=True)
     log_path = log_dir / f"{thread_id}.log"
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -103,7 +130,7 @@ def _configure_logging(thread_id: str) -> None:
     )
 
 
-# ── Graph initialisation (once per Streamlit session) ─────────────────────────
+# ── Graph initialisation ────────────────────────────────────────────────────
 
 
 def _init_graph() -> None:
@@ -112,12 +139,13 @@ def _init_graph() -> None:
         check_dependencies(settings)
         _ASTROAGENT_DIR.mkdir(exist_ok=True)
         store = make_memory_store()
-        serde = JsonPlusSerializer(allowed_msgpack_modules=[("astro_agent.graph.state", "ProcessingPhase")])
-        checkpointer = SqliteSaver(sqlite3.connect(_DB_PATH, check_same_thread=False), serde=serde)
+        serde = JsonPlusSerializer(
+            allowed_msgpack_modules=[("astro_agent.graph.state", "ProcessingPhase")]
+        )
+        checkpointer = SqliteSaver(
+            sqlite3.connect(_DB_PATH, check_same_thread=False), serde=serde
+        )
         st.session_state["graph"] = build_graph(checkpointer=checkpointer, store=store)
-
-
-# ── Thread ID helper ───────────────────────────────────────────────────────────
 
 
 def _make_thread_id(target: str) -> str:
@@ -126,109 +154,167 @@ def _make_thread_id(target: str) -> str:
     return f"run-{slug}-{ts}"
 
 
-# ── Background graph thread ────────────────────────────────────────────────────
+# ── Chunk → event conversion ─────────────────────────────────────────────────
+
+
+def _chunk_to_events(chunk: dict) -> list[dict]:
+    """Convert a graph stream chunk to a list of UI events."""
+    events: list[dict] = []
+
+    if "phase_advance" in chunk:
+        update = chunk["phase_advance"]
+        phase = update.get("phase")
+        if phase is not None:
+            val = phase.value if hasattr(phase, "value") else str(phase)
+            events.append({"type": "phase_change", "phase": val})
+
+    elif "agent" in chunk:
+        msgs = chunk["agent"].get("messages", [])
+        for msg in msgs:
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    events.append({
+                        "type": "tool_call",
+                        "name": tc["name"],
+                        "args": tc.get("args", {}),
+                    })
+            elif getattr(msg, "content", None):
+                events.append({
+                    "type": "agent_text",
+                    "content": text_content(msg.content),
+                })
+
+    elif "action" in chunk:
+        msgs = chunk["action"].get("messages", [])
+        for msg in msgs:
+            content = text_content(msg.content)
+            is_error = (
+                getattr(msg, "status", None) == "error"
+                or content.strip().startswith("Error")
+            )
+            events.append({
+                "type": "tool_error" if is_error else "tool_result",
+                "name": getattr(msg, "name", "unknown"),
+                "content": content,
+            })
+
+    return events
+
+
+# ── Background graph thread ──────────────────────────────────────────────────
 
 
 def _graph_thread(
     graph: Any,
     config: dict,
     stream_input: Any,
-    event_queue: queue.Queue,
-    input_queue: queue.Queue,
+    event_q: queue.Queue,
+    input_q: queue.Queue,
 ) -> None:
     """
-    Stream the graph in a background thread, pushing typed events to event_queue.
-    Blocks on input_queue when a HITL interrupt fires.
+    Stream the graph in a background thread. Push events to event_q.
+    Block on input_q when an HITL interrupt fires.
     """
     current_input = stream_input
 
     while True:
         interrupted = False
+        stream = graph.stream(current_input, config=config, stream_mode="updates")
         try:
-            for chunk in graph.stream(current_input, config=config, stream_mode="updates"):
+            for chunk in stream:
+                # Push UI events
+                for ev in _chunk_to_events(chunk):
+                    event_q.put(ev)
 
-                if "phase_advance" in chunk:
-                    update = chunk["phase_advance"]
-                    phase = update.get("phase")
-                    if phase is not None:
-                        val = phase.value if hasattr(phase, "value") else str(phase)
-                        event_queue.put({"type": "phase_change", "phase": val})
-
-                elif "agent" in chunk:
-                    msgs = chunk["agent"].get("messages", [])
-                    for msg in msgs:
-                        if hasattr(msg, "tool_calls") and msg.tool_calls:
-                            for tc in msg.tool_calls:
-                                event_queue.put({
-                                    "type": "tool_call",
-                                    "name": tc["name"],
-                                    "args": tc.get("args", {}),
-                                })
-                        elif getattr(msg, "content", None):
-                            event_queue.put({
-                                "type": "agent_text",
-                                "content": msg.content,
-                            })
-
-                elif "action" in chunk:
-                    msgs = chunk["action"].get("messages", [])
-                    for msg in msgs:
-                        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                        is_error = (
-                            getattr(msg, "status", None) == "error"
-                            or content.strip().startswith("Error")
-                        )
-                        event_queue.put({
-                            "type": "tool_error" if is_error else "tool_result",
-                            "name": getattr(msg, "name", "unknown"),
-                            "content": content,
-                        })
-
-                elif "__interrupt__" in chunk:
+                # Interrupt — push payload and wait for human
+                if "__interrupt__" in chunk:
                     payload = chunk["__interrupt__"][0].value
-                    event_queue.put({"type": "interrupt", "payload": payload})
+                    # Re-derive images from current state
+                    payload = _refresh_interrupt_payload(payload, graph, config)
+                    event_q.put({"type": "interrupt", "payload": payload})
                     interrupted = True
                     break
 
         except Exception as exc:
-            event_queue.put({"type": "error", "content": str(exc)})
+            event_q.put({"type": "error", "content": str(exc)})
             return
+        finally:
+            stream.close()
 
         if not interrupted:
-            event_queue.put({"type": "done"})
+            event_q.put({"type": "done"})
             return
 
-        # Wait for human input
-        response = input_queue.get()
+        # Wait for human response
+        response = input_q.get()
         current_input = Command(resume=response)
 
 
-# ── Session launchers ──────────────────────────────────────────────────────────
+def _refresh_interrupt_payload(payload: dict, graph, config: dict) -> dict:
+    """Re-derive display data (images, previews) from current graph state."""
+    ptype = payload.get("type", "")
+    tool_name = payload.get("tool_name", "")
+
+    if ptype == "image_review" and tool_name:
+        state = graph.get_state(config)
+        messages = state.values.get("messages", [])
+        working_dir = state.values.get("dataset", {}).get("working_dir", "")
+        raw_paths = images_from_tool(messages, tool_name)
+
+        if raw_paths and working_dir:
+            from astro_agent.tools.utility.t22_generate_preview import generate_preview
+            preview_paths = []
+            for img in raw_paths:
+                p = Path(img)
+                if p.suffix.lower() in (".fit", ".fits", ".fts"):
+                    preview_dir = Path(working_dir) / "previews"
+                    expected = preview_dir / f"preview_{p.stem}.jpg"
+                    if expected.exists():
+                        preview_paths.append(str(expected))
+                    else:
+                        try:
+                            result = generate_preview(
+                                working_dir=working_dir, fits_path=str(p),
+                                format="jpg", quality=95,
+                            )
+                            preview_paths.append(result["preview_path"])
+                        except Exception:
+                            pass
+                else:
+                    preview_paths.append(img)
+            payload["images"] = preview_paths
+
+    return payload
 
 
-def _launch_thread(stream_input: Any, config: dict, thread_id: str) -> None:
-    """Start the background graph thread and initialise session state."""
-    _configure_logging(thread_id)
+# ── Thread management ────────────────────────────────────────────────────────
+
+
+def _launch_thread(stream_input: Any) -> None:
+    """Start the background graph thread with fresh queues."""
     eq: queue.Queue = queue.Queue()
     iq: queue.Queue = queue.Queue()
 
-    st.session_state.update({
-        "thread_id": thread_id,
-        "config": config,
-        "event_queue": eq,
-        "input_queue": iq,
-        "events": st.session_state.get("events", []),  # preserve on HITL resume
-        "pending_interrupt": None,
-        "running": True,
-    })
+    st.session_state["event_queue"] = eq
+    st.session_state["input_queue"] = iq
+    st.session_state["pending_interrupt"] = None
+    st.session_state["running"] = True
 
     t = threading.Thread(
         target=_graph_thread,
-        args=(st.session_state["graph"], config, stream_input, eq, iq),
+        args=(
+            st.session_state["graph"],
+            st.session_state["config"],
+            stream_input,
+            eq,
+            iq,
+        ),
         daemon=True,
     )
-    st.session_state["graph_thread"] = t
     t.start()
+
+
+# ── Session launchers ────────────────────────────────────────────────────────
 
 
 def _start_new_session(
@@ -240,6 +326,7 @@ def _start_new_session(
     notes: str | None,
 ) -> None:
     _init_graph()
+    _prune_stale_checkpoints()
 
     thread_id = _make_thread_id(target)
     result = ingest_dataset.invoke({"root_directory": directory, "thread_id": thread_id})
@@ -264,11 +351,17 @@ def _start_new_session(
             ingest_summary=result.get("summary", {}),
         ))
     ]
-    config = {"configurable": {"thread_id": thread_id}}
-    _save_session(thread_id, target)
 
-    st.session_state["events"] = []  # fresh event log for new session
-    _launch_thread(initial_state, config, thread_id)
+    config = {"configurable": {"thread_id": thread_id}}
+    _save_session(thread_id, target, working_dir=dataset["working_dir"])
+    _configure_logging(thread_id)
+
+    st.session_state.update({
+        "thread_id": thread_id,
+        "config": config,
+        "events": [],
+    })
+    _launch_thread(initial_state)
 
 
 def _resume_session(thread_id: str) -> None:
@@ -276,7 +369,6 @@ def _resume_session(thread_id: str) -> None:
     config = {"configurable": {"thread_id": thread_id}}
     graph = st.session_state["graph"]
 
-    # Check for a pending interrupt in the checkpointer
     state = graph.get_state(config)
     pending: list = []
     for task in (state.tasks or []):
@@ -284,23 +376,26 @@ def _resume_session(thread_id: str) -> None:
             pending.extend(task.interrupts)
 
     _configure_logging(thread_id)
-    st.session_state["events"] = []  # fresh view for resume
-    st.session_state["thread_id"] = thread_id
-    st.session_state["config"] = config
-    st.session_state["running"] = False
+
+    st.session_state.update({
+        "thread_id": thread_id,
+        "config": config,
+        "events": [],
+    })
 
     if pending:
-        # Surface the pending interrupt immediately; thread starts on user response
+        # Re-derive display payload from current state, then show immediately
         payload = pending[0].value
+        payload = _refresh_interrupt_payload(payload, graph, config)
         st.session_state["pending_interrupt"] = payload
-        # We still need queues ready for when the user responds
+        st.session_state["running"] = False
+        st.session_state["events"].append({"type": "interrupt", "payload": payload})
+        # Create queues — thread will start when user responds
         st.session_state["event_queue"] = queue.Queue()
         st.session_state["input_queue"] = queue.Queue()
-        st.session_state["events"].append({"type": "interrupt", "payload": payload})
     else:
-        # No pending interrupt — resume streaming from last checkpoint
-        st.session_state["pending_interrupt"] = None
-        _launch_thread(None, config, thread_id)
+        # No pending interrupt — start streaming from checkpoint
+        _launch_thread(None)
 
 
 # ── Key metric extraction ──────────────────────────────────────────────────────
@@ -326,7 +421,6 @@ def _key_metric(content: str) -> str:
         m = re.search(pattern, content)
         if m:
             val = m.group(1)
-            # Truncate long paths
             if "/" in val:
                 val = Path(val).name
             return f"{label}: {val}"
@@ -356,7 +450,7 @@ def _render_events(events: list[dict]) -> None:
 
         if etype == "phase_change":
             label = _PHASE_LABELS.get(event["phase"].lower(), event["phase"].upper())
-            st.markdown(f"---\n#### ── {label} ──")
+            st.markdown(f"---\n#### {label}")
 
         elif etype == "agent_text":
             with st.chat_message("assistant"):
@@ -400,7 +494,6 @@ def _render_hitl_panel(payload: dict) -> None:
     images = payload.get("images", [])
 
     if ptype == "agent_chat":
-        # Agent sent a text message — display it and let the human respond
         st.subheader(f"Agent message ({payload.get('phase', '')} phase)")
         agent_text = payload.get("agent_text", "")
         if agent_text:
@@ -409,65 +502,79 @@ def _render_hitl_panel(payload: dict) -> None:
     else:
         st.subheader(f"Review required: {payload.get('title', 'Human Review')}")
 
+        # Show agent's response during multi-turn HITL
+        agent_reply = payload.get("agent_text", "")
+        if agent_reply:
+            with st.chat_message("assistant"):
+                st.write(agent_reply)
+
         if ptype == "image_review" and images:
             cols = st.columns(min(len(images), 2))
             for i, img_path in enumerate(images):
                 p = Path(img_path)
                 with cols[i % len(cols)]:
                     if p.exists():
-                        st.image(str(p), caption=p.name, use_container_width=True)
+                        st.image(str(p), caption=p.name, width="stretch")
                     else:
                         st.warning(f"Image not found: {img_path}")
 
         elif ptype == "data_review":
-            # Show last tool result from context for data review
             context = payload.get("context", [])
             for msg in reversed(context):
                 if hasattr(msg, "name") and hasattr(msg, "content"):
-                    content = msg.content
-                    if isinstance(content, list):
-                        content = content[0].get("text", str(content)) if content else ""
+                    content = text_content(msg.content)
                     with st.expander(f"Result: {msg.name}", expanded=True):
                         st.code(content, language="json")
                     break
 
     st.divider()
+    feedback_key = f"hitl_feedback_{st.session_state.get('_hitl_counter', 0)}"
     feedback = st.text_area(
         "Leave empty and click Approve to continue, or type feedback/questions:",
-        key="hitl_feedback",
+        key=feedback_key,
         height=80,
     )
 
     col1, col2, _ = st.columns([1, 1, 4])
     with col1:
         if st.button("Approve ✓", type="primary"):
-            _submit_hitl_response(APPROVE_SENTINEL)
+            if feedback.strip():
+                # Send the human's note, then approve
+                _submit_response(feedback.strip(), approve=True, record_feedback=True)
+            else:
+                _submit_response(APPROVE_SENTINEL)
     with col2:
         if st.button("Send") and feedback.strip():
-            _submit_hitl_response(feedback.strip(), record_feedback=True)
+            _submit_response(feedback.strip(), record_feedback=True)
 
 
-def _submit_hitl_response(response: str, record_feedback: bool = False) -> None:
+def _submit_response(
+    response: str,
+    record_feedback: bool = False,
+    approve: bool = False,
+) -> None:
+    """Put response on the input queue. One code path for all cases."""
     if record_feedback:
-        st.session_state["events"].append({
+        st.session_state.get("events", []).append({
             "type": "human_feedback",
             "content": response,
         })
 
-    if "input_queue" not in st.session_state:
-        # Resume case: thread hasn't started yet — launch it now with resume Command
-        thread_id = st.session_state["thread_id"]
-        config = st.session_state["config"]
-        eq = st.session_state["event_queue"]
-        iq = st.session_state["input_queue"] = queue.Queue()
-        # Re-init with the correct input queue in place
-        st.session_state["event_queue"] = queue.Queue()
-        _launch_thread(Command(resume=response), config, thread_id)
-    else:
-        st.session_state["input_queue"].put(response)
-        st.session_state["pending_interrupt"] = None
-        st.session_state["running"] = True
+    # Approve with a note: prefix the sentinel so hitl_check recognizes
+    # it as approval AND includes the human's text as a message.
+    if approve:
+        response = f"{APPROVE_SENTINEL}\n{response}"
 
+    # If thread is waiting on input_queue, feed it
+    if "input_queue" in st.session_state:
+        st.session_state["input_queue"].put(response)
+    else:
+        # Resume case: thread hasn't started. Launch with resume Command.
+        _launch_thread(Command(resume=response))
+
+    st.session_state["pending_interrupt"] = None
+    st.session_state["running"] = True
+    st.session_state["_hitl_counter"] = st.session_state.get("_hitl_counter", 0) + 1
     st.rerun()
 
 
@@ -506,19 +613,24 @@ def main() -> None:
             help="Whether to run star_removal + star_restoration.",
         )
         remove_stars = None if rs_opt == "ask via HITL" else (rs_opt == "yes")
-        notes = st.text_area("Session notes (optional)", height=60, placeholder="e.g. L-eNhance filter, gain 100, poor seeing")
+        notes = st.text_area(
+            "Session notes (optional)", height=60,
+            placeholder="e.g. L-eNhance filter, gain 100, poor seeing",
+        )
 
         start_disabled = not (directory.strip() and target.strip())
         if st.button("Start →", type="primary", disabled=start_disabled):
             with st.spinner("Ingesting dataset..."):
                 try:
-                    _start_new_session(directory.strip(), target.strip(), bortle, sqm, remove_stars, notes.strip() or None)
+                    _start_new_session(
+                        directory.strip(), target.strip(), bortle, sqm,
+                        remove_stars, notes.strip() or None,
+                    )
                 except Exception as e:
                     st.error(f"Failed to start: {e}")
                     st.stop()
             st.rerun()
 
-        # Ingest summary feedback
         if "ingest_summary" in st.session_state:
             s = st.session_state["ingest_summary"]
             st.caption(
@@ -535,12 +647,17 @@ def main() -> None:
 
         sessions = _load_sessions()
         if sessions:
-            options = [f"{s['target']} ({s['started'][:10]})" for s in sessions[:8]]
-            idx = st.selectbox("Recent sessions", range(len(options)), format_func=lambda i: options[i])
+            options = [f"{s['target']} — {s['started'][:19]}" for s in sessions[:8]]
+            idx = st.selectbox(
+                "Recent sessions", range(len(options)),
+                format_func=lambda i: options[i],
+            )
             resume_thread = sessions[idx]["thread_id"]
             st.caption(f"`{resume_thread}`")
         else:
-            resume_thread = st.text_input("Thread ID", placeholder="run-m42-20260311-120000")
+            resume_thread = st.text_input(
+                "Thread ID", placeholder="run-m42-20260311-120000",
+            )
 
         if st.button("Resume →", disabled=not resume_thread):
             with st.spinner("Loading checkpoint..."):
@@ -551,23 +668,23 @@ def main() -> None:
                     st.stop()
             st.rerun()
 
-        # Active thread info
         if "thread_id" in st.session_state:
             st.divider()
-            st.caption(f"Active thread:")
+            st.caption("Active thread:")
             st.code(st.session_state["thread_id"], language=None)
 
     # ── Main area ──────────────────────────────────────────────────────────────
 
     if "events" not in st.session_state:
         st.info(
-            "Enter your dataset directory and target name in the sidebar, then click **Start →**.\n\n"
+            "Enter your dataset directory and target name in the sidebar, "
+            "then click **Start →**.\n\n"
             "Or resume a previous session with the **Resume** section."
         )
         return
 
-    # Drain event queue
-    if st.session_state.get("running") and "event_queue" in st.session_state:
+    # Drain event queue — collect everything the background thread produced
+    if "event_queue" in st.session_state:
         eq: queue.Queue = st.session_state["event_queue"]
         new_events: list[dict] = []
         try:
@@ -582,23 +699,21 @@ def main() -> None:
                 if ev["type"] == "interrupt":
                     st.session_state["pending_interrupt"] = ev["payload"]
                     st.session_state["running"] = False
-                    break
                 if ev["type"] in ("done", "error"):
                     st.session_state["running"] = False
-                    break
 
-    # Render accumulated event log
-    _render_events(st.session_state["events"])
+    # Render the full event log — this is the conversation history
+    _render_events(st.session_state.get("events", []))
 
-    # Running indicator
-    if st.session_state.get("running"):
-        with st.spinner("Agent working…"):
-            time.sleep(0.5)
-        st.rerun()
-
-    # HITL panel (shown when interrupted)
+    # HITL panel (shown when interrupted — user can see and respond)
     if st.session_state.get("pending_interrupt"):
         _render_hitl_panel(st.session_state["pending_interrupt"])
+
+    # Poll while running
+    elif st.session_state.get("running"):
+        with st.spinner("Agent working..."):
+            time.sleep(0.5)
+        st.rerun()
 
 
 if __name__ == "__main__":

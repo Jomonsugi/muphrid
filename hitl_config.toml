@@ -23,10 +23,15 @@ enabled = false
 type    = "data_review"
 title   = "T02 Master Frame Diagnostics"
 
-[hitl.T06_T07_stack]
+[hitl.T06_select]
 enabled = false
 type    = "data_review"
-title   = "T06/T07 Frame Selection and Stack Results"
+title   = "T06 Frame Selection"
+
+[hitl.T07_stack]
+enabled = false
+type    = "data_review"
+title   = "T07 Stack Results"
 
 # ── Linear processing ──────────────────────────────────────────────────────────
 

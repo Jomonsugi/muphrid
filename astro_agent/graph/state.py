@@ -121,6 +121,7 @@ class Metrics(TypedDict):
     current_fwhm:        float | None
     current_background:  float | None
     current_noise:       float | None
+    wavelet_noise:       float | None
     snr_estimate:        float | None
     dynamic_range_db:    float | None
 
@@ -280,11 +281,12 @@ class HITLPayload(TypedDict):
     hitl_check calls interrupt(HITLPayload) and never does I/O.
     The caller reads this payload and handles all presentation.
     """
-    type:           str           # "data_review" or "image_review" (from hitl_config.toml)
+    type:           str           # "data_review", "image_review", or "agent_chat"
     title:          str           # human-readable title (from hitl_config.toml)
     tool_name:      str           # the tool that triggered this checkpoint
     images:         list[str]     # image paths produced by the tool (for image_review)
     context:        list          # recent messages for continuity (last N)
+    agent_text:     str           # agent's response text (for multi-turn HITL display)
 
 
 # ── Top-level graph state ──────────────────────────────────────────────────────
@@ -363,6 +365,7 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             current_fwhm=None,
             current_background=None,
             current_noise=None,
+            wavelet_noise=None,
             snr_estimate=None,
             dynamic_range_db=None,
             channel_stats=None,
