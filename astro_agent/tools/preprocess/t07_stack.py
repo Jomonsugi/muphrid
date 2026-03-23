@@ -295,13 +295,12 @@ _WEIGHTING_MAP = {
 @tool
 def siril_stack(
     rejection_method: str,
+    weighting: str,
     stack_method: str = "mean",
     rejection_sigma: list[float] | None = None,
     normalization: str = "addscale",
     fast_norm: bool = False,
     overlap_norm: bool = False,
-    output_norm: bool = False,
-    weighting: str = "wfwhm",
     output_32bit: bool = True,
     rgb_equal: bool = False,
     output_name: str = "master_light",
@@ -321,15 +320,23 @@ def siril_stack(
 
     Args:
         rejection_method: Pixel rejection algorithm (for stack_method='mean').
-            Choose based on accepted frame count from T06:
-            'winsorized' (< 15 frames), 'sigma_clipping' (15-50 frames),
-            'linear_fit' (> 50 frames), 'none' (< 5 frames).
-        stack_method: 'mean' (best SNR, default), 'median', 'sum', 'min', 'max'.
+            'winsorized', 'sigma_clipping', 'linear_fit', 'none'.
+            Choose based on accepted frame count from analyze_frames.
+        stack_method: 'mean' (best SNR), 'median', 'sum', 'min', 'max'.
         rejection_sigma: [low_sigma, high_sigma]. Default [3.0, 3.0].
-        normalization: 'addscale' (default), 'mulscale', 'add', 'mul', 'none'.
-        weighting: 'wfwhm' (default), 'noise', 'nbstars', 'nbstack', 'none'.
+        normalization: 'addscale', 'mulscale', 'add', 'mul', 'none'.
+        weighting: Frame weighting method. Choose based on what data is available:
+            'wfwhm' — weights by weighted FWHM from registration. Requires
+              per-frame wFWHM data in the sequence metadata. Available when
+              registration was computed on the same sequence being stacked.
+              May fail if registration data was lost during sequence operations.
+            'noise' — weights by inverse noise level computed from image data.
+              Always available regardless of registration method.
+            'nbstars' — weights by number of detected stars per frame.
+            'nbstack' — weights by number of stacked pixels per frame.
+            'none' — equal weighting for all frames.
         output_32bit: Write 32-bit float output. Required for linear processing.
-        output_name: Output filename stem (no extension). Default 'master_light'.
+        output_name: Output filename stem (no extension).
     """
     if rejection_sigma is None:
         rejection_sigma = [3.0, 3.0]
@@ -386,7 +393,13 @@ def siril_stack(
 
     if rgb_equal:
         stack_parts.append("-rgb_equal")
-    if output_norm:
+
+    # Output normalization: required for 32-bit float to produce [0,1] range.
+    # Without it, pixel values stay in raw ADU scale and downstream tools
+    # (which expect [0,1]) see near-zero values → data appears destroyed.
+    # Siril docs: use -output_norm for light stacking, NOT for master frames
+    # (master frames are built by build_masters, not this tool).
+    if output_32bit:
         stack_parts.append("-output_norm")
 
     stack_parts.append(f"-out={output_name}")

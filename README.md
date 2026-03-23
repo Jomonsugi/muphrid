@@ -53,18 +53,19 @@ Files are never copied — only paths are read.
 
 ## Running
 
-### Streamlit (recommended)
+### Gradio (recommended)
 
 ```bash
-streamlit run astro_agent/app.py
+uv run python -m astro_agent.gradio_app
 ```
 
-Open the sidebar: enter the dataset directory path, target name, and Bortle scale.
-Click **Start →**. The agent works autonomously, streaming live updates as it goes.
-HITL gates pause and show a review panel — approve or type feedback to continue.
+The app opens with a Processing tab (chat + image gallery + activity log),
+Equipment, HITL Config, and Model & Limits tabs. Enter the dataset path and
+target name, then click **Start Processing**. The agent streams tool calls
+in the activity log while you watch progress. HITL gates pause and show
+images in the gallery — chat with the agent or click **Approve** to continue.
 
-If you close the browser or the machine sleeps, resume any session:
-enter the thread ID in the **Resume** section. Recent sessions are listed automatically.
+Resume any session by entering the thread ID in the **Resume Session** section.
 
 ### CLI
 
@@ -91,7 +92,7 @@ tail -f ~/.astroagent/logs/run-*.log
 ```
 
 The log captures graph-level events (phase routing, agent decisions, HITL state) that
-aren't surfaced in the Streamlit UI. Useful for debugging after the fact.
+aren't surfaced in the Gradio UI. Useful for debugging after the fact.
 LangSmith tracing (`LANGCHAIN_TRACING_V2=true`) captures the full LLM reasoning trace.
 
 ## LangGraph Studio

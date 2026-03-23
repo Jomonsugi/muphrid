@@ -557,7 +557,21 @@ def analyze_image(
     - std: MAD-based robust standard deviation
     """
     working_dir = state["dataset"]["working_dir"]
-    image_path = state["paths"]["current_image"]
+    image_path = state["paths"].get("current_image")
+
+    if not image_path:
+        import json
+        return Command(update={
+            "messages": [ToolMessage(
+                content=json.dumps({
+                    "error": "No image available to analyze. current_image is not set in state. "
+                    "This is expected before stacking — the pipeline is working with a "
+                    "multi-frame sequence, not a single image. analyze_image will produce "
+                    "results after siril_stack creates the integrated master light."
+                }),
+                tool_call_id=tool_call_id,
+            )],
+        })
 
     img_path = Path(image_path)
     if not img_path.exists():
@@ -598,16 +612,20 @@ def analyze_image(
 
     # ── Background estimation on valid pixels ──
     if has_valid:
-        # Background2D needs a 2D array without NaN holes, so we use the
-        # full trimmed image (it handles near-zero backgrounds). But for
-        # scalar stats, we use valid-only pixels.
-        bg_est = _background_estimate(lum)
-        bg_level = bg_est["bg_level"]
-        bg_noise = bg_est["bg_noise"]
-        bg_map = bg_est["bg_map"]
+        if valid_pct > 50:
+            # Majority of pixels are valid — Background2D works well
+            bg_est = _background_estimate(lum)
+            bg_level = bg_est["bg_level"]
+            bg_noise = bg_est["bg_noise"]
+            bg_map = bg_est["bg_map"]
+        else:
+            # Too many zeros for Background2D (can hang or produce garbage).
+            # Use valid-pixel statistics directly.
+            bg_level = 0.0
+            bg_noise = 0.0
+            bg_map = None
 
-        # If Background2D returned zeros (common when >90% of pixels are
-        # exactly zero), fall back to valid-pixel statistics.
+        # If Background2D returned zeros or was skipped, use valid pixels
         if bg_noise <= 0 or bg_level <= 0:
             valid_lum = lum[valid_mask]
             bg_level = float(np.median(valid_lum))
@@ -640,11 +658,32 @@ def analyze_image(
         overall_median = float(np.median(lum))
         overall_max = float(np.max(lum))
 
-    gradient_mag = _gradient_magnitude(lum, bg_map=bg_map)
-    flatness = _flatness_score(lum, bg_map=bg_map)
-    per_channel_bg = _background_channel_medians(
-        r, g, b, lum, bg_noise=bg_noise
-    )
+    # For gradient, flatness, and per-channel background: if most pixels
+    # are zero (subsecond exposures), these functions produce degenerate
+    # results on the full array. Use valid-pixel data when available.
+    if has_valid and valid_pct < 50:
+        # Too few valid pixels for spatial analysis (gradient, flatness).
+        # Report what we can from valid pixels only.
+        gradient_mag = _gradient_magnitude(lum[valid_mask].reshape(-1, 1))
+        flatness = 0.0  # Can't assess spatial flatness without a full 2D field
+        # Per-channel bg: use valid pixels directly
+        valid_r = r[valid_mask]
+        valid_g = g[valid_mask]
+        valid_b = b[valid_mask]
+        p25 = float(np.percentile(valid_lum, 25))
+        bg_threshold = p25 + 3.0 * bg_noise
+        bg_mask_v = valid_lum < bg_threshold
+        n_bg = int(np.sum(bg_mask_v))
+        per_channel_bg = {}
+        for name, ch_v in (("red", valid_r), ("green", valid_g), ("blue", valid_b)):
+            per_channel_bg[name] = float(np.median(ch_v[bg_mask_v])) if n_bg >= 10 else float(np.median(ch_v))
+        per_channel_bg["n_background_pixels"] = n_bg
+    else:
+        gradient_mag = _gradient_magnitude(lum, bg_map=bg_map)
+        flatness = _flatness_score(lum, bg_map=bg_map)
+        per_channel_bg = _background_channel_medians(
+            r, g, b, lum, bg_noise=bg_noise
+        )
 
     # SNR: P95 of valid pixels / noise
     if has_valid:

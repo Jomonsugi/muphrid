@@ -61,6 +61,8 @@ Non-linear processing:
   create_mask        — create luminance/range masks for targeted processing
   reduce_stars       — morphological star reduction
   multiscale_process — wavelet-based multiscale sharpening
+  save_checkpoint    — bookmark the current image state with a descriptive name
+  restore_checkpoint — restore the working image to a previously saved checkpoint
 
 Export:
   export_final       — export to TIFF/JPG/JXL with ICC profiles
@@ -465,6 +467,24 @@ process the nebulosity independently, then call star_restoration at the end.
 This separation enables aggressive nebulosity processing without creating
 artifacts around bright stars. However, this is a choice — targets like sparse
 star fields or globular clusters may be better processed with stars present.
+
+## Checkpoints — Non-Destructive Iteration
+
+Every tool in this phase reads from current_image, processes it, and updates
+current_image to the new output. When you iterate on a step (trying different
+curves parameters), each call chains on the previous — after 3 curves attempts,
+the image has 3 cumulative passes baked in.
+
+Use save_checkpoint to bookmark the current image before any adjustment you
+might want to redo. Use restore_checkpoint to go back to that point and try
+again from a clean state.
+
+  1. star_removal → save_checkpoint("starless_base")
+  2. curves_adjust → analyze_image → if not right, restore_checkpoint("starless_base")
+  3. When satisfied: save_checkpoint("after_curves")
+  4. saturation_adjust → if wrong, restore_checkpoint("after_curves")
+
+The rule: if you would regret losing the current image state, checkpoint it.
 
 Key data-driven decisions:
 - analyze_image → contrast_ratio: below 0.3 → call curves_adjust. Above 0.8 →

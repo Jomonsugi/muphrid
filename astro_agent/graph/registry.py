@@ -47,6 +47,7 @@ from astro_agent.tools.nonlinear.t19_star_restoration import star_restoration
 from astro_agent.tools.scikit.t25_create_mask import create_mask
 from astro_agent.tools.scikit.t26_reduce_stars import reduce_stars
 from astro_agent.tools.scikit.t27_multiscale import multiscale_process
+from astro_agent.tools.nonlinear.t31_checkpoint import save_checkpoint, restore_checkpoint
 
 # ── Imports: Export ───────────────────────────────────────────────────────────
 
@@ -60,6 +61,7 @@ from astro_agent.tools.utility.t23_pixel_math import pixel_math
 from astro_agent.tools.utility.t28_extract_narrowband import extract_narrowband
 from astro_agent.tools.utility.t29_resolve_target import resolve_target
 from astro_agent.tools.utility.t30_advance_phase import advance_phase
+from astro_agent.tools.utility.t32_present_images import present_images
 
 
 # ── Tool groups ───────────────────────────────────────────────────────────────
@@ -71,6 +73,7 @@ UTILITY_TOOLS = [
     extract_narrowband,
     resolve_target,
     advance_phase,
+    present_images,
 ]
 
 PREPROCESS_TOOLS = [
@@ -108,6 +111,8 @@ NONLINEAR_TOOLS = [
     create_mask,
     reduce_stars,
     multiscale_process,
+    save_checkpoint,
+    restore_checkpoint,
 ]
 
 EXPORT_TOOLS = [

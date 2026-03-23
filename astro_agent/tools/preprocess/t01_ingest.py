@@ -101,11 +101,14 @@ class IngestDatasetInput(BaseModel):
 
 # ── EXIF extraction via ExifTool ───────────────────────────────────────────────
 
-_EXPOSURE_KEYS = ("EXIF:ExposureTime", "Composite:ShutterSpeed")
-_FOCAL_KEYS    = ("EXIF:FocalLength",)
+_EXPOSURE_KEYS = ("EXIF:ExposureTime", "Composite:ShutterSpeed",
+                  "Exptime", "Exposure", "FITS:Exptime", "FITS:Exposure")
+_FOCAL_KEYS    = ("EXIF:FocalLength", "Focallen", "FITS:Focallen")
 _ISO_KEYS      = ("EXIF:ISO",)
-_MODEL_KEYS    = ("EXIF:Model",)
-_MAKE_KEYS     = ("EXIF:Make",)
+_GAIN_KEYS     = ("Gain", "FITS:Gain")
+_MODEL_KEYS    = ("EXIF:Model", "Instrument", "FITS:Instrument")
+_MAKE_KEYS     = ("EXIF:Make", "Creator", "FITS:Creator")
+_PIXEL_SIZE_KEYS = ("Xpixsz", "FITS:Xpixsz")
 
 
 def _first(tags: dict, keys: tuple[str, ...]):
@@ -177,6 +180,9 @@ def _extract_raw_meta(
     raw_iso = _first(tags, _ISO_KEYS)
     iso: int | None = int(raw_iso) if raw_iso is not None else None
 
+    raw_gain = _first(tags, _GAIN_KEYS)
+    gain: int | None = int(raw_gain) if raw_gain is not None else None
+
     raw_exp = _first(tags, _EXPOSURE_KEYS)
     exposure: float | None = float(raw_exp) if raw_exp is not None else None
 
@@ -193,11 +199,19 @@ def _extract_raw_meta(
 
     sensor = sensor_info_from_tags(tags)
 
+    # Pixel size: equipment.toml first, then FITS header
     px_um: float | None = None
     try:
         px_um = resolve_pixel_size()
     except ValueError:
         pass
+    if px_um is None:
+        raw_px = _first(tags, _PIXEL_SIZE_KEYS)
+        if raw_px is not None:
+            try:
+                px_um = float(raw_px)
+            except (ValueError, TypeError):
+                pass
 
     return AcquisitionMeta(
         target_name=override_target_name,
@@ -206,7 +220,7 @@ def _extract_raw_meta(
         pixel_size_um=px_um,
         exposure_time_s=exposure,
         iso=iso,
-        gain=None,                             # DSLR/mirrorless has no ADU gain concept
+        gain=gain,
         filter=None,                           # no filter wheel on camera RAW setups
         bortle=None,
         camera_model=camera_model,
@@ -293,16 +307,10 @@ def _cross_validate_calibration(
                 )
 
     # ── Biases: exposure should be negligible ────────────────────────────────
-    bias_files = buckets.get("biases", [])
-    if bias_files:
-        sample = _sample_frame(Path(bias_files[0]))
-        if sample and sample.exposure_s is not None:
-            if sample.exposure_s > 0.001:
-                warnings.append(
-                    f"Bias frame exposure ({sample.exposure_s}s) is longer than expected "
-                    "(should be minimum shutter speed, typically ≤ 1/4000s). "
-                    "These may be dark frames placed in the wrong folder."
-                )
+    # Note: no bias exposure validation. DSLR bias frames use the shortest
+    # shutter speed, but CMOS astro cameras (ZWO, QHY) often use "offset"
+    # or "flat dark" frames at longer exposures in the bias folder. Both
+    # workflows are valid. The agent can reason about the data.
 
     return warnings
 
@@ -504,16 +512,174 @@ def _ingest_raw(
 
 # ── FITS ingestion (stub) ──────────────────────────────────────────────────────
 
+def _classify_fits_frame(fits_path: Path) -> str | None:
+    """
+    Classify a FITS file by IMAGETYP header or subdirectory name.
+    IMAGETYP is the FITS standard for frame classification (used by ZWO/ASIAIR).
+    Falls back to subdirectory name for manually organized datasets.
+    """
+    try:
+        from astropy.io import fits as astropy_fits
+        with astropy_fits.open(str(fits_path)) as hdul:
+            imagetyp = str(hdul[0].header.get("IMAGETYP", "")).strip().lower()
+            type_map = {
+                "light": "lights", "light frame": "lights",
+                "flat": "flats", "flat frame": "flats",
+                "dark": "darks", "dark frame": "darks",
+                "bias": "biases", "bias frame": "biases",
+                "offset": "biases",
+            }
+            if imagetyp in type_map:
+                return type_map[imagetyp]
+    except Exception:
+        pass
+    # Fall back to subdirectory name
+    parent = fits_path.parent.name.lower()
+    return _DIR_MAP.get(parent)
+
+
 def _ingest_fits(
     root: Path,
     file_pattern: str | None,
     override_target_name: str | None,
+    thread_id: str | None = None,
 ) -> tuple[Dataset, list[str], dict]:
-    raise NotImplementedError(
-        "FITS ingestion is not yet implemented. "
-        "The current pipeline is built for camera RAW (RAF/CR2/etc.) input. "
-        "Implement _ingest_fits() when a FITS-native camera (e.g. ZWO ASI) is used."
+    """
+    Ingest FITS files from a dedicated astronomy camera (ZWO, QHY, etc.).
+    Mirrors _ingest_raw() structure but classifies by IMAGETYP header
+    and reads metadata from FITS headers instead of EXIF.
+    """
+    target_name = override_target_name or root.name
+    warnings: list[str] = []
+    buckets: dict[str, list[str]] = {
+        "lights": [], "darks": [], "flats": [], "biases": []
+    }
+
+    # Set up run-scoped working directory (same as _ingest_raw)
+    runs_dir = root / "runs"
+    run_id = thread_id or str(uuid.uuid4())
+    working_dir = runs_dir / run_id
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    cleaned: list[str] = []
+    if os.environ.get("CLEANUP_PREVIOUS_RUNS", "true").lower() in ("true", "1", "yes"):
+        cleaned = _cleanup_previous_runs(runs_dir, run_id)
+        if cleaned:
+            logger.info(f"Cleaned {len(cleaned)} previous run(s): {cleaned}")
+
+    glob = file_pattern or "*"
+
+    # Scan for FITS files — try subdirectory classification first,
+    # then IMAGETYP header for flat directory structures
+    for subdir in sorted(root.iterdir()):
+        if not subdir.is_dir() or subdir.name == "runs":
+            continue
+
+        # Try subdirectory name first
+        frame_type = _DIR_MAP.get(subdir.name.lower())
+
+        files = sorted(
+            f for f in subdir.rglob(glob)
+            if f.is_file() and f.suffix.lower() in FITS_EXTENSIONS
+        )
+
+        if frame_type:
+            buckets[frame_type] = [str(f) for f in files]
+        elif files:
+            # Subdirectory name not recognized — try IMAGETYP header
+            classified_any = False
+            for f in files:
+                ftype = _classify_fits_frame(f)
+                if ftype:
+                    buckets[ftype].append(str(f))
+                    classified_any = True
+            if not classified_any:
+                warnings.append(
+                    f"Unrecognized subdirectory '{subdir.name}' contains "
+                    f"{len(files)} FITS file(s) — skipped. "
+                    "Rename to lights/, darks/, flats/, or bias/, or add "
+                    "IMAGETYP header to FITS files."
+                )
+
+    # Also check root directory for FITS files (flat directory structure)
+    root_fits = sorted(
+        f for f in root.glob(glob)
+        if f.is_file() and f.suffix.lower() in FITS_EXTENSIONS
     )
+    if root_fits and not any(buckets.values()):
+        for f in root_fits:
+            ftype = _classify_fits_frame(f)
+            if ftype:
+                buckets[ftype].append(str(f))
+
+    if not buckets["lights"]:
+        raise ValueError(
+            f"No FITS light frames found under {root}. "
+            "Expected subdirectories (lights/, darks/, etc.) or FITS files "
+            "with IMAGETYP header."
+        )
+
+    # Extract metadata using the same function as RAW
+    # (key tuples now include FITS fallbacks)
+    light_paths = [Path(p) for p in buckets["lights"]]
+    meta = _extract_raw_meta(light_paths, target_name)
+
+    calib_warnings = _cross_validate_calibration(meta, buckets)
+    warnings.extend(calib_warnings)
+
+    inventory = FileInventory(
+        lights=buckets["lights"],
+        darks=buckets["darks"],
+        flats=buckets["flats"],
+        biases=buckets["biases"],
+    )
+
+    dataset = Dataset(
+        id=str(uuid.uuid4()),
+        working_dir=str(working_dir),
+        files=inventory,
+        acquisition_meta=meta,
+    )
+
+    exp = meta.get("exposure_time_s")
+    total_exp = (exp * len(buckets["lights"])) if exp else 0.0
+
+    if not buckets["darks"]:
+        warnings.append("No dark frames found.")
+    if not buckets["flats"]:
+        warnings.append("No flat frames found.")
+    if not buckets["biases"]:
+        warnings.append("No bias frames found.")
+
+    extensions = sorted(
+        {Path(f).suffix.lower()
+         for files in buckets.values() for f in files}
+    )
+
+    sensor_summary: dict = {}
+    if meta.get("black_level") is not None:
+        sensor_summary = {
+            "black_level":   meta["black_level"],
+            "white_level":   meta["white_level"],
+            "bit_depth":     meta["bit_depth"],
+            "sensor_type":   meta.get("sensor_type"),
+            "gain":          meta.get("gain"),
+        }
+
+    summary = {
+        "lights_count":       len(buckets["lights"]),
+        "darks_count":        len(buckets["darks"]),
+        "flats_count":        len(buckets["flats"]),
+        "biases_count":       len(buckets["biases"]),
+        "total_exposure_s":   round(total_exp, 2),
+        "input_format":       "fits",
+        "detected_extensions": extensions,
+        "sensor":             sensor_summary,
+        "working_dir":        str(working_dir),
+        "cleaned_runs":       cleaned,
+    }
+
+    return dataset, warnings, summary
 
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
@@ -552,7 +718,9 @@ def ingest_dataset(
             root, file_pattern, override_target_name, thread_id=thread_id,
         )
     else:
-        dataset, warnings, summary = _ingest_fits(root, file_pattern, override_target_name)
+        dataset, warnings, summary = _ingest_fits(
+            root, file_pattern, override_target_name, thread_id=thread_id,
+        )
 
     return {
         "dataset":  dataset,

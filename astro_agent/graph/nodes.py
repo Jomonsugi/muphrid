@@ -15,7 +15,6 @@ import json
 import logging
 import mimetypes
 import re
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +30,8 @@ from astro_agent.graph.hitl import (
     is_enabled,
     resolve_hitl_checkpoint,
     tool_cfg,
-    vlm_enabled,
+    vlm_autonomous,
+    vlm_hitl,
 )
 from astro_agent.graph.content import image_blocks, text_content
 from astro_agent.graph.prompts import PHASE_PROMPTS as _PHASE_PROMPTS
@@ -168,6 +168,70 @@ def _in_active_hitl(messages: list) -> bool:
         return False
     last = messages[-1]
     return isinstance(last, HumanMessage) and bool(image_blocks(last.content))
+
+
+def _recent_present_images(messages: list) -> bool:
+    """
+    Check if the most recent ToolMessage is a present_images result.
+    Used to decide whether to inject VLM images for autonomous inspection.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            return msg.name == "present_images"
+        if isinstance(msg, AIMessage):
+            continue  # Skip the AI message that made the tool call
+        break
+    return False
+
+
+def _inject_present_images_vlm(
+    messages: list, working_dir: str, is_linear: bool
+) -> HumanMessage | None:
+    """
+    Extract image paths from the most recent present_images ToolMessage,
+    convert FITS to JPG previews, and build a VLM HumanMessage.
+    """
+    from astro_agent.tools.utility.t22_generate_preview import generate_preview
+
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage) and msg.name == "present_images":
+            try:
+                result = json.loads(text_content(msg.content))
+                if result.get("status") != "presented":
+                    return None
+                raw_paths = [img["path"] for img in result.get("images", []) if img.get("path")]
+            except (json.JSONDecodeError, TypeError, KeyError):
+                return None
+
+            # Convert FITS → JPG previews
+            preview_paths: list[str] = []
+            for img in raw_paths:
+                p = Path(img)
+                if p.suffix.lower() in (".fit", ".fits", ".fts") and working_dir:
+                    preview_dir = Path(working_dir) / "previews"
+                    expected = preview_dir / f"preview_{p.stem}.jpg"
+                    if expected.exists():
+                        preview_paths.append(str(expected))
+                    else:
+                        try:
+                            prev = generate_preview(
+                                working_dir=working_dir,
+                                fits_path=str(p),
+                                format="jpg",
+                                quality=95,
+                                auto_stretch_linear=is_linear,
+                            )
+                            preview_paths.append(prev["preview_path"])
+                        except Exception as e:
+                            logger.warning(f"VLM preview failed for {p.name}: {e}")
+                elif p.exists():
+                    preview_paths.append(str(p))
+
+            if preview_paths:
+                return _make_vlm_message(preview_paths, "Visual inspection of presented images")
+            return None
+        break
+    return None
 
 
 # ── Stuck-loop detection ──────────────────────────────────────────────────────
@@ -404,9 +468,25 @@ def make_agent_node(model_factory):
         else:
             messages = [SystemMessage(content=system)] + raw_messages
 
-        # VLM scoping: images are only visible during active HITL conversations.
-        # Once the human approves and we move on, strip all images from the view.
-        if not _in_active_hitl(raw_messages):
+        # VLM scoping: images are only visible when relevant.
+        # - During active HITL (vlm_hitl): preserve all images
+        # - After present_images call outside HITL (vlm_autonomous): inject
+        #   images for this one reasoning cycle
+        # - Otherwise: strip all images from the view
+        _active_hitl = _in_active_hitl(raw_messages)
+        _has_present_images = _recent_present_images(raw_messages)
+
+        if _active_hitl and vlm_hitl():
+            pass  # Keep images — agent is in visual HITL conversation
+        elif _has_present_images and vlm_autonomous() and not _active_hitl:
+            # Inject present_images results as base64 for autonomous inspection
+            working_dir = state.get("dataset", {}).get("working_dir", "")
+            is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
+            vlm_msg = _inject_present_images_vlm(raw_messages, working_dir, is_linear)
+            if vlm_msg:
+                messages.append(vlm_msg)
+                logger.info("VLM autonomous: injecting present_images for visual inspection")
+        else:
             messages = _strip_vlm_images(messages)
 
         # Prune analysis outputs from completed phases — the model's reasoning
@@ -505,6 +585,102 @@ def make_action_node():
     return ToolNode(all_tools(), handle_tool_errors=_format_tool_error)
 
 
+# ── VLM image injection ──────────────────────────────────────────────────────
+
+
+def _make_vlm_message(image_paths: list[str], label: str) -> HumanMessage | None:
+    """
+    Build a multimodal HumanMessage with base64-encoded preview images.
+
+    Converts FITS to JPG previews first. Returns None if no valid images.
+    Images must be JPG/PNG — raw FITS cannot be base64-encoded for LLMs.
+    """
+    content: list[dict] = [{"type": "text", "text": f"[VLM] {label}"}]
+    has_image = False
+
+    for img_path in image_paths:
+        p = Path(img_path)
+        if not p.exists():
+            continue
+        # Only encode rendered formats — skip raw FITS
+        if p.suffix.lower() in (".fit", ".fits", ".fts"):
+            continue
+        mime = mimetypes.guess_type(str(p))[0] or "image/jpeg"
+        b64 = base64.standard_b64encode(p.read_bytes()).decode()
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+        has_image = True
+
+    if not has_image:
+        return None
+    return HumanMessage(content=content)
+
+
+def _collect_hitl_images(messages: list, working_dir: str, is_linear: bool) -> list[str]:
+    """
+    Collect all image paths relevant to the current HITL conversation:
+    - Images from the HITL-triggering tool
+    - Images from any present_images calls during the conversation
+
+    Returns preview JPG paths (FITS converted via generate_preview).
+    """
+    from astro_agent.tools.utility.t22_generate_preview import generate_preview
+
+    raw_paths: list[str] = []
+
+    # Walk backward from the end to collect images in the current HITL exchange
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            try:
+                result = json.loads(text_content(msg.content))
+                if isinstance(result, dict):
+                    # present_images results
+                    if msg.name == "present_images" and result.get("status") == "presented":
+                        for img in result.get("images", []):
+                            if img.get("path"):
+                                raw_paths.append(img["path"])
+                    # HITL-triggering tool results
+                    elif msg.name in TOOL_TO_HITL:
+                        for key in ("output_path", "result_path", "stretched_image_path",
+                                    "starless_image_path", "preview_path", "mask_path"):
+                            if path := result.get(key):
+                                raw_paths.append(path)
+                        break  # Stop at the HITL trigger
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif isinstance(msg, HumanMessage):
+            # Hit a human message before finding the trigger — stop
+            break
+
+    # Convert FITS to JPG previews
+    preview_paths: list[str] = []
+    for img in raw_paths:
+        p = Path(img)
+        if p.suffix.lower() in (".fit", ".fits", ".fts") and working_dir:
+            preview_dir = Path(working_dir) / "previews"
+            expected = preview_dir / f"preview_{p.stem}.jpg"
+            if expected.exists():
+                preview_paths.append(str(expected))
+            else:
+                try:
+                    result = generate_preview(
+                        working_dir=working_dir,
+                        fits_path=str(p),
+                        format="jpg",
+                        quality=95,
+                        auto_stretch_linear=is_linear,
+                    )
+                    preview_paths.append(result["preview_path"])
+                except Exception as e:
+                    logger.warning(f"VLM preview generation failed for {p.name}: {e}")
+        elif p.exists():
+            preview_paths.append(str(p))
+
+    return preview_paths
+
+
 # ── hitl_check ────────────────────────────────────────────────────────────────
 
 
@@ -561,37 +737,6 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     cfg = tool_cfg(hitl_key)
     image_paths = images_from_tool(messages, tool_name)
 
-    # Convert FITS paths to displayable previews for the UI.
-    # st.image() can't render FITS — generate_preview creates a JPG.
-    if image_paths and cfg["type"] == "image_review":
-        working_dir = state.get("dataset", {}).get("working_dir", "")
-        if working_dir:
-            from astro_agent.tools.utility.t22_generate_preview import generate_preview
-            preview_paths = []
-            for img in image_paths:
-                p = Path(img)
-                if p.suffix.lower() in (".fit", ".fits", ".fts"):
-                    # Check if preview already exists (idempotent on node re-entry)
-                    preview_dir = Path(working_dir) / "previews"
-                    expected = preview_dir / f"preview_{p.stem}.jpg"
-                    if expected.exists():
-                        preview_paths.append(str(expected))
-                    else:
-                        try:
-                            result = generate_preview(
-                                working_dir=working_dir,
-                                fits_path=str(p),
-                                format="jpg",
-                                quality=95,
-                            )
-                            preview_paths.append(result["preview_path"])
-                        except Exception as e:
-                            logger.warning(f"HITL preview generation failed for {p.name}: {e}")
-                            # Do NOT fall back to raw FITS — UI can't render it
-                else:
-                    preview_paths.append(img)
-            image_paths = preview_paths
-
     # Extract agent's latest text for multi-turn HITL display
     _agent_text = ""
     if state.get("active_hitl", False) and messages:
@@ -600,6 +745,8 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                 _agent_text = text_content(msg.content)[:500]
                 break
 
+    # Payload carries raw FITS paths — the presenter (Gradio, CLI)
+    # handles conversion to displayable formats.
     payload = HITLPayload(
         type=cfg["type"],
         title=cfg["title"],
@@ -609,25 +756,19 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         agent_text=_agent_text,
     )
 
-    # When vlm_enabled + image_review, inject the preview image BEFORE
-    # interrupt() so the agent has it from the start of the HITL conversation.
-    # Side effects before interrupt() must be idempotent — appending a message
-    # is fine because on resume the node restarts and re-appends the same image.
+    # VLM during HITL: inject base64 preview images so the agent can see
+    # what it's discussing. Collects images from the HITL-triggering tool
+    # and any present_images calls during the conversation.
     vlm_messages: list = []
-    if vlm_enabled() and image_paths and cfg["type"] == "image_review":
-        latest_image = Path(image_paths[-1])
-        if latest_image.exists():
-            mime = mimetypes.guess_type(str(latest_image))[0] or "image/jpeg"
-            b64 = base64.standard_b64encode(latest_image.read_bytes()).decode()
-            vlm_content: list[dict] = [
-                {"type": "text", "text": f"[VLM] Current result from {tool_name}:"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{b64}"},
-                },
-            ]
-            vlm_messages = [HumanMessage(content=vlm_content)]
-            logger.info(f"VLM: injecting image {latest_image}")
+    if vlm_hitl():
+        working_dir = state.get("dataset", {}).get("working_dir", "")
+        is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
+        preview_paths = _collect_hitl_images(messages, working_dir, is_linear)
+        if preview_paths:
+            vlm_msg = _make_vlm_message(preview_paths, f"Current result from {tool_name}")
+            if vlm_msg:
+                vlm_messages = [vlm_msg]
+                logger.info(f"VLM HITL: injecting {len(preview_paths)} images")
 
     logger.info(f"HITL interrupt: {cfg['title']} (tool: {tool_name})")
     response = interrupt(payload)
@@ -642,15 +783,13 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         from astro_agent.graph.hitl import extract_approval_note
         note = extract_approval_note(response_text)
         approval_text = note if note else "Approved. Continue to the next step."
-        result: dict[str, Any] = {
+        return {
             "active_hitl": False,
             "messages": vlm_messages + [HumanMessage(content=approval_text)],
         }
-        return result
 
-    # Human gave feedback or chat — inject VLM image + feedback text.
-    # Keep active_hitl=True so the agent stays in the HITL loop even if
-    # it responds without tool calls (e.g. answering a question).
+    # Human gave feedback or chat — keep active_hitl=True so the agent
+    # stays in the HITL loop even if it responds without tool calls.
     return {
         "messages": vlm_messages + [HumanMessage(content=response_text)],
         "active_hitl": True,

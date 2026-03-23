@@ -33,6 +33,29 @@ def _load_config(path: Path = _CONFIG_PATH) -> dict:
 
 _CFG = _load_config()
 
+# Runtime overrides — CLI/Gradio can override toml settings.
+_RUNTIME_AUTONOMOUS: bool = False
+_RUNTIME_VLM_HITL: bool | None = None
+_RUNTIME_VLM_AUTONOMOUS: bool | None = None
+
+
+def set_autonomous(value: bool) -> None:
+    """Called by the CLI/app to override the toml autonomous flag."""
+    global _RUNTIME_AUTONOMOUS
+    _RUNTIME_AUTONOMOUS = value
+
+
+def set_vlm_hitl(value: bool) -> None:
+    """Called by the app to override the toml vlm_hitl flag."""
+    global _RUNTIME_VLM_HITL
+    _RUNTIME_VLM_HITL = value
+
+
+def set_vlm_autonomous(value: bool) -> None:
+    """Called by the app to override the toml vlm_autonomous flag."""
+    global _RUNTIME_VLM_AUTONOMOUS
+    _RUNTIME_VLM_AUTONOMOUS = value
+
 
 def tool_cfg(tool_id: str) -> dict:
     """Return the HITL config for a specific tool. Defaults to disabled."""
@@ -41,19 +64,28 @@ def tool_cfg(tool_id: str) -> dict:
 
 def is_enabled(tool_id: str) -> bool:
     """Check both the autonomous master flag and the per-tool enabled flag."""
-    if _CFG.get("autonomous", False):
+    if is_autonomous():
         return False
     return tool_cfg(tool_id).get("enabled", False)
 
 
 def is_autonomous() -> bool:
     """Check if the pipeline is running in autonomous mode (no human available)."""
-    return _CFG.get("autonomous", False)
+    return _RUNTIME_AUTONOMOUS or _CFG.get("autonomous", False)
 
 
-def vlm_enabled() -> bool:
-    """Check if VLM image injection is enabled for HITL feedback loops."""
-    return _CFG.get("vlm_enabled", False)
+def vlm_hitl() -> bool:
+    """Check if VLM is enabled during HITL conversations."""
+    if _RUNTIME_VLM_HITL is not None:
+        return _RUNTIME_VLM_HITL
+    return _CFG.get("vlm_hitl", False)
+
+
+def vlm_autonomous() -> bool:
+    """Check if VLM is enabled outside HITL (agent self-inspection)."""
+    if _RUNTIME_VLM_AUTONOMOUS is not None:
+        return _RUNTIME_VLM_AUTONOMOUS
+    return _CFG.get("vlm_autonomous", False)
 
 
 # ── Tool name → HITL config key mapping ──────────────────────────────────────
@@ -105,7 +137,7 @@ def resolve_hitl_checkpoint(messages: list) -> tuple[str | None, str | None]:
 
 
 # ── Affirmative detection ─────────────────────────────────────────────────────
-# HITL responses are structured, not free-text parsed. The UI (CLI, Streamlit,
+# HITL responses are structured, not free-text parsed. The UI (CLI, Gradio,
 # etc.) presents an explicit approve/revise choice and sends this sentinel
 # when the user approves. Any other string is treated as revision feedback.
 

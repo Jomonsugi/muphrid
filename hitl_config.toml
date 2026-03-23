@@ -14,7 +14,8 @@
 # produces them and the UI displays them — this is not enforced here.
 
 autonomous = false
-vlm_enabled = false   # when true, inject preview image into agent context during HITL feedback
+vlm_hitl = false         # when true, agent sees all images (base64) during HITL conversations
+vlm_autonomous = false   # when true, agent can visually inspect images outside of HITL via present_images
 
 # ── Preprocessing ──────────────────────────────────────────────────────────────
 

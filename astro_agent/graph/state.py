@@ -98,6 +98,7 @@ class Metadata(TypedDict):
     plate_solve_coords: dict | None  # {"ra": float, "dec": float}
     focal_length_mm:    float | None
     pixel_size_um:      float | None
+    checkpoints:        dict[str, str] | None  # agent-named image state bookmarks
 
 
 class FrameMetrics(TypedDict, total=False):
@@ -231,13 +232,11 @@ class SessionContext(TypedDict):
                       intensity for the subject. A frontier LLM already knows what
                       M42 looks like — naming it unlocks that knowledge.
 
-      bortle        — Required. Bortle scale of the imaging site (1–9).
+      bortle        — Optional. Bortle scale of the imaging site (1–9).
                       1–3 = rural dark sky, 4–5 = rural/suburban transition,
-                      6–7 = suburban, 8–9 = urban. Look up at
-                      lightpollutionmap.info if uncertain. Directly informs:
-                       - gradient removal aggressiveness (high → larger gradient)
-                       - noise reduction strength (high → more NL-Bayes passes)
-                       - stretch conservatism (high → preserve faint structure)
+                      6–7 = suburban, 8–9 = urban. When None/unknown, the agent
+                      uses analyze_image metrics to assess sky quality directly
+                      from the data.
 
       sqm_reading   — Optional. Sky Quality Meter reading in mag/arcsec²,
                       taken with an SQM-L at the imaging site before the session.
@@ -266,7 +265,7 @@ class SessionContext(TypedDict):
                         "Prioritise faint outer nebulosity over star quality"
     """
     target_name:  str          # required: "M42 Orion Nebula", "wide angle Milky Way core"
-    bortle:       int          # required: 1–9 Bortle scale (1=darkest, 9=city)
+    bortle:       int | None   # 1–9 Bortle scale. None = unknown, use analyze_image data instead.
     sqm_reading:  float | None # optional: SQM-L reading in mag/arcsec² (e.g. 20.8)
     remove_stars: bool | None  # True/False/None=ask via HITL
     notes:        str | None   # optional free-text session notes
@@ -276,7 +275,7 @@ class SessionContext(TypedDict):
 
 class HITLPayload(TypedDict):
     """
-    Stable contract between hitl_check and any presenter (CLI, Streamlit, etc.).
+    Stable contract between hitl_check and any presenter (CLI, Gradio, etc.).
 
     hitl_check calls interrupt(HITLPayload) and never does I/O.
     The caller reads this payload and handles all presentation.
@@ -358,6 +357,7 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             plate_solve_coords=None,
             focal_length_mm=None,
             pixel_size_um=None,
+            checkpoints=None,
         ),
         metrics=Metrics(
             frame_stats={},
@@ -495,7 +495,11 @@ def build_initial_message(dataset: Dataset, session: SessionContext, ingest_summ
 
     lines.append("")
     lines.append("## Session")
-    lines.append(f"- Bortle: {session.get('bortle', 'unknown')}")
+    bortle = session.get('bortle')
+    if bortle:
+        lines.append(f"- Bortle: {bortle}")
+    else:
+        lines.append("- Bortle: unknown — rely on analyze_image metrics to assess sky quality and guide processing decisions")
     if session.get("sqm_reading"):
         lines.append(f"- SQM: {session['sqm_reading']} mag/arcsec²")
     if session.get("remove_stars") is not None:

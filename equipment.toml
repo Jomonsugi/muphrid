@@ -1,27 +1,22 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# equipment.toml — User-maintained imaging equipment configuration
+# equipment.toml — Values that can't be read from file metadata
 #
-# This is the single source of truth for equipment-specific data that the
-# agent needs to produce correct results. Values here override all other
-# sources (env vars, FITS headers, etc.).
+# DSLR/mirrorless RAW (.RAF, .CR2): pixel size and accurate focal length
+# are NOT in EXIF — must be set here. X-Trans sensors also need sensor_type
+# so Siril uses 3-pass demosaic (critical for X-Trans quality).
 #
-# Update this file when you change equipment. The agent reads it at the start
-# of every session.
+# Dedicated astro cameras (.FITS from ZWO, QHY): pixel size and focal length
+# ARE in FITS headers. Nothing needed here — leave everything commented out.
 # ─────────────────────────────────────────────────────────────────────────────
 
-[camera]
-model = "Fujifilm X-T30 II"
-pixel_size_um = 3.76            # sensor_width_mm / sensor_width_px
-sensor_type = "xtrans"          # "bayer" | "xtrans" | "mono"
+# ── Uncomment for Fuji X-T30 II + Samyang 135mm f/2 (.RAF files) ────────────
 
-[optics]
-# Primary imaging setup. Comment out entries you don't use.
-focal_length_mm = 129.5         # Plate-solve-measured focal length (Siril, 2026-03-08). Samyang 135mm f/2 nominal.
-# aperture_mm = 50.0            # Primary aperture diameter (for Airy PSF)
-# obstruction_pct = 0.0         # Central obstruction as % of aperture area
+# [camera]
+# pixel_size_um = 3.76
+# sensor_type = "xtrans"          # Required for X-Trans 3-pass demosaic in Siril
 
-[location]
-# Observatory / imaging site (used for SPCC atmospheric correction)
-# latitude = 0.0                # Decimal degrees, positive = north
-# longitude = 0.0               # Decimal degrees, positive = east
-# elevation_m = 10              # Metres above sea level
+# [optics]
+# focal_length_mm = 129.5         # Plate-solve-measured. Samyang 135mm f/2.8 nominal.
+
+# ── ZWO ASI 2600MC Pro (.FITS files) — nothing needed ───────────────────────
+# All values read from FITS headers automatically.

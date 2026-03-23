@@ -145,11 +145,34 @@ def sensor_info_from_tags(tags: dict) -> SensorInfo:
     """
     Build a SensorInfo from an already-loaded ExifTool tags dict.
     Called by T01 which loads tags once and reuses them.
-    """
-    make  = str(tags.get("EXIF:Make",  "")).upper()
-    model = str(tags.get("EXIF:Model", ""))
 
-    # Black level
+    Supports both camera RAW (EXIF metadata) and FITS (FITS headers).
+    EXIF keys are checked first; FITS-native keys serve as fallbacks.
+    """
+    # Camera identification — EXIF first, then FITS headers
+    # ExifTool Python API prefixes FITS keys with "FITS:", CLI does not
+    make = str(
+        tags.get("EXIF:Make", "")
+        or tags.get("Make", "")
+        or tags.get("FITS:Creator", "")
+    ).upper()
+    model = str(
+        tags.get("EXIF:Model", "")
+        or tags.get("Instrument", "")
+        or tags.get("FITS:Instrument", "")
+        or tags.get("Model", "")
+    )
+
+    # If make is empty but model contains a known astro cam brand, extract it
+    if not make and model:
+        model_upper = model.upper()
+        for brand in _ASTRO_CAM_MAKES:
+            if brand in model_upper:
+                make = brand
+                break
+
+    # Black level — EXIF keys first, then leave as 0 for FITS
+    # (FITS cameras don't store black level in headers; T02 detects from data)
     black = 0
     for key in _BLACK_KEYS:
         v = _parse_first_int(tags.get(key))
@@ -170,9 +193,20 @@ def sensor_info_from_tags(tags: dict) -> SensorInfo:
         bit_depth = infer_bit_depth(white_exif)
         white = white_exif
     else:
-        is_astro = any(s in make for s in _ASTRO_CAM_MAKES)
-        bit_depth = 16 if is_astro else 14
-        white = (1 << bit_depth) - 1
+        # Check FITS BITPIX header (CLI: "Bitpix", Python API: "FITS:Bitpix")
+        bitpix = tags.get("Bitpix") or tags.get("FITS:Bitpix")
+        if bitpix is not None:
+            bp = abs(int(bitpix))
+            if bp in (8, 16, 32):
+                bit_depth = bp
+                white = (1 << min(bp, 16)) - 1
+            else:
+                bit_depth = 16
+                white = 65535
+        else:
+            is_astro = any(s in make for s in _ASTRO_CAM_MAKES)
+            bit_depth = 16 if is_astro else 14
+            white = (1 << bit_depth) - 1
 
     # Raw exposure bias (Fuji-specific; harmless elsewhere)
     raw_exp_bias: float | None = None
@@ -182,12 +216,21 @@ def sensor_info_from_tags(tags: dict) -> SensorInfo:
             raw_exp_bias = v
             break
 
-    # Sensor type
+    # Sensor type — EXIF make first, then FITS Bayerpat header
     sensor_type: str | None = None
     if "FUJIFILM" in make:
         sensor_type = "xtrans" if model.strip() in _XTRANS_MODELS else "bayer"
     elif make:
         sensor_type = "bayer"
+
+    # FITS fallback: Bayerpat header indicates Bayer CFA
+    if sensor_type is None:
+        bayerpat = str(tags.get("Bayerpat", "") or tags.get("FITS:Bayerpat", "")).strip()
+        if bayerpat:
+            sensor_type = "bayer"
+        elif any(s in make for s in _ASTRO_CAM_MAKES):
+            # Known astro cam without Bayer pattern → mono
+            sensor_type = "mono"
 
     return SensorInfo(
         black_level=black,
@@ -218,7 +261,8 @@ def read_frame_exif(file_path: Path) -> FrameExif:
     sensor = sensor_info_from_tags(tags)
 
     exp: float | None = None
-    for key in ("EXIF:ExposureTime", "Composite:ShutterSpeed"):
+    for key in ("EXIF:ExposureTime", "Composite:ShutterSpeed",
+                "Exptime", "Exposure", "FITS:Exptime", "FITS:Exposure"):
         v = _parse_float(tags.get(key))
         if v is not None:
             exp = v
@@ -229,8 +273,8 @@ def read_frame_exif(file_path: Path) -> FrameExif:
     if v is not None:
         iso = v
 
-    make  = tags.get("EXIF:Make")
-    model = tags.get("EXIF:Model")
+    make  = tags.get("EXIF:Make") or tags.get("Make") or tags.get("FITS:Creator")
+    model = tags.get("EXIF:Model") or tags.get("Instrument") or tags.get("FITS:Instrument")
 
     return FrameExif(
         sensor=sensor,

@@ -166,7 +166,10 @@ def configure_siril_for_equipment() -> str:
         equipment = tomllib.load(f)
 
     sensor_type = equipment.get("camera", {}).get("sensor_type", "").lower()
-    if sensor_type not in ("xtrans", "bayer", "mono"):
+    # sensor_type may be empty when equipment.toml is minimal (e.g. ZWO FITS
+    # where sensor_type is detected from file headers, not equipment.toml).
+    # Default to 1 xtrans pass (correct for Bayer and mono).
+    if sensor_type and sensor_type not in ("xtrans", "bayer", "mono"):
         raise ConfigError(
             f"equipment.toml camera.sensor_type={sensor_type!r} is not recognised. "
             "Valid values: 'xtrans' | 'bayer' | 'mono'."

@@ -72,8 +72,9 @@ class GHSOptions(BaseModel):
     shadow_protection: float = Field(
         default=0.0,
         description=(
-            "LP: low-end linear region (0–SP). Pixels below LP are stretched linearly. "
-            "Protects shadow detail from clipping. 0.0 = no protection (default)."
+            "LP: low-end linear region. Pixels below LP are stretched linearly. "
+            "Protects shadow detail from clipping. MUST be <= symmetry_point (SP). "
+            "0.0 = no protection (default)."
         ),
     )
     highlight_protection: float = Field(
@@ -203,6 +204,10 @@ class StretchImageInput(BaseModel):
 # ── Command builders ───────────────────────────────────────────────────────────
 
 def _build_ghs_cmd(opts: GHSOptions) -> str:
+    # Siril constraint: LP must be <= SP. Clamp if the agent violated this.
+    if opts.shadow_protection > opts.symmetry_point:
+        opts.shadow_protection = opts.symmetry_point
+
     cmd = f"ght -D={opts.stretch_amount}"
     if opts.local_intensity != 0.0:
         cmd += f" -B={opts.local_intensity}"

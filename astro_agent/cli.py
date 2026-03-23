@@ -48,7 +48,7 @@ def _make_thread_id(target: str) -> str:
 def process(
     directory: str = typer.Argument(..., help="Path to dataset directory."),
     target: str = typer.Option(..., help="Target name (e.g. 'M42 Orion Nebula')."),
-    bortle: int = typer.Option(5, help="Bortle scale of imaging site (1-9)."),
+    bortle: int = typer.Option(None, help="Bortle scale of imaging site (1-9). If unknown, omit."),
     sqm: float = typer.Option(None, help="SQM-L reading in mag/arcsec²."),
     remove_stars: bool = typer.Option(None, help="Run star removal/restoration. None=ask via HITL."),
     notes: str = typer.Option(None, help="Free-text session notes."),
@@ -62,6 +62,11 @@ def process(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+
+    # Set autonomous mode before anything else
+    if autonomous:
+        from astro_agent.graph.hitl import set_autonomous
+        set_autonomous(True)
 
     # Validate dependencies
     settings = load_settings()
@@ -87,13 +92,13 @@ def process(
         _run_graph(graph, config, resume=True, autonomous=autonomous)
     else:
         # New run — build initial state
-        session = SessionContext(
-            target_name=target,
-            bortle=bortle,
-            sqm_reading=sqm,
-            remove_stars=remove_stars,
-            notes=notes,
-        )
+        session = {
+            "target_name": target,
+            "bortle": bortle,
+            "sqm_reading": sqm,
+            "remove_stars": remove_stars,
+            "notes": notes,
+        }
 
         # T01 ingest runs first to discover the dataset
         typer.echo(f"Ingesting dataset from: {directory}")

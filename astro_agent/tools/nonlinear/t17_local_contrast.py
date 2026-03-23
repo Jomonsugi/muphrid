@@ -94,17 +94,15 @@ class WaveletOptions(BaseModel):
         ),
     )
     layer_weights: list[float] = Field(
-        default=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         description=(
             "Reconstruction weights for each layer (num_layers + 1 values). "
             "Layers ordered finest to coarsest: [layer1, layer2, ..., residual]. "
-            "Default is all 1.0 (passthrough — no change). Set weights > 1.0 to "
-            "sharpen, < 1.0 to suppress. Must be chosen based on target type:\n"
-            "  Nebulae with fine filaments: [1.3, 1.1, 1.0, 1.0, 1.0, 1.0]\n"
-            "  Galaxy spiral arms (mid-scale): [1.0, 1.2, 1.1, 1.0, 1.0, 1.0]\n"
-            "  Star fields / globular clusters: keep all 1.0 — wavelet sharpening "
-            "emphasizes star halos on star-dominated images. Use unsharp or clahe instead.\n"
-            "Start conservative (1.1–1.2) on fine layers only and iterate."
+            "1.0 = unchanged, > 1.0 = sharpen/boost that scale, < 1.0 = suppress. "
+            "Choose based on the target structure and what analyze_image shows: "
+            "fine-grained structure (filaments, dust lanes) lives in layers 1-2; "
+            "medium structure (spiral arms, nebula shells) in layers 2-3; "
+            "large structure (galaxy halo, diffuse emission) in layers 4+. "
+            "The residual (last value) is the smooth background."
         ),
     )
 

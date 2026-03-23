@@ -47,14 +47,13 @@ from astro_agent.tools._siril import run_siril_script
 
 class DenoiseOptions(BaseModel):
     strength: float = Field(
-        default=0.5,
         description=(
             "Denoising strength 0.0–1.0. "
             "Higher values remove more noise but risk smoothing fine detail. "
-            "0.5 is a reliable starting point for most stacks. "
-            "0.3–0.4 for high-SNR images with fine structure (galaxy spirals, "
-            "tight planetary nebulae). "
-            "0.6–0.8 for high-noise images (short exposures, high ISO, < 2h integration)."
+            "Lower values preserve detail but leave more noise. "
+            "Choose based on the image's SNR from analyze_image: "
+            "high SNR with fine structure needs less denoising, "
+            "low SNR from short exposures or high ISO needs more."
         ),
     )
     ai_version: str = Field(
