@@ -54,6 +54,7 @@ def process(
     notes: str = typer.Option(None, help="Free-text session notes."),
     resume: str = typer.Option("", help="Thread ID to resume from checkpoint."),
     autonomous: bool = typer.Option(False, "--autonomous", help="Skip all HITL interrupts."),
+    memory: bool = typer.Option(False, "--memory", help="Enable long-term memory (learns from HITL sessions)."),
     db: str = typer.Option("checkpoints.db", help="Path to SQLite checkpoint database."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
@@ -67,6 +68,27 @@ def process(
     if autonomous:
         from astro_agent.graph.hitl import set_autonomous
         set_autonomous(True)
+
+    # Initialize long-term memory if enabled
+    if memory:
+        from astro_agent.graph.hitl import set_memory_enabled
+        set_memory_enabled(True)
+        try:
+            from astro_agent.memory.embeddings import OllamaEmbedder
+            from astro_agent.memory.store import MemoryStore
+            from astro_agent.tools.utility.t33_memory_search import set_memory_store
+            from astro_agent.graph.registry import register_memory_tool
+
+            settings_pre = load_settings()
+            embedder = OllamaEmbedder(model=settings_pre.memory_embedding_model)
+            store = MemoryStore(db_path=settings_pre.memory_db_path, embedder=embedder)
+            embedder._db_conn = store._get_conn()
+            set_memory_store(store)
+            register_memory_tool()
+            logger.info("Long-term memory enabled")
+        except Exception as e:
+            logger.warning(f"Long-term memory init failed (non-fatal): {e}")
+            set_memory_enabled(False)
 
     # Validate dependencies
     settings = load_settings()

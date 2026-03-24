@@ -71,6 +71,11 @@ class Settings:
     langchain_api_key: str
     langchain_project: str
 
+    # Long-term memory
+    memory_enabled: bool
+    memory_db_path: str
+    memory_embedding_model: str
+
 
 def load_settings() -> Settings:
     provider = _optional("LLM_PROVIDER", "together").lower()
@@ -105,6 +110,10 @@ def load_settings() -> Settings:
         langchain_tracing=_optional("LANGCHAIN_TRACING_V2", "false").lower() == "true",
         langchain_api_key=_optional("LANGCHAIN_API_KEY"),
         langchain_project=_optional("LANGCHAIN_PROJECT", "astro-agent"),
+        # Long-term memory (off by default — enable when agent quality is stable)
+        memory_enabled=_optional("MEMORY_ENABLED", "false").lower() == "true",
+        memory_db_path=_optional("MEMORY_DB_PATH", str(Path.home() / ".astro_agent" / "memory.db")),
+        memory_embedding_model=_optional("MEMORY_EMBEDDING_MODEL", "qwen3-embedding"),
     )
 
 

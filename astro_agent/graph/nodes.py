@@ -783,6 +783,11 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         from astro_agent.graph.hitl import extract_approval_note
         note = extract_approval_note(response_text)
         approval_text = note if note else "Approved. Continue to the next step."
+
+        # Long-term memory extraction (v1: HITL-only, Lesson #1 + #9)
+        # Programmatic save — harness owns write timing, LLM decides what to extract
+        _extract_hitl_memories(state, messages, tool_name, note)
+
         return {
             "active_hitl": False,
             "messages": vlm_messages + [HumanMessage(content=approval_text)],
@@ -794,6 +799,113 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         "messages": vlm_messages + [HumanMessage(content=response_text)],
         "active_hitl": True,
     }
+
+
+# ── Long-term memory extraction from HITL ────────────────────────────────────
+
+def _extract_hitl_memories(state: AstroState, messages: list, tool_name: str, approval_note: str):
+    """
+    Extract and store memories after HITL approval (non-blocking, non-fatal).
+
+    Called programmatically by the harness after every HITL approval.
+    Uses the agent's LLM to extract observations, failures, and preferences
+    from the HITL conversation context.
+
+    Design: Lesson #1 (programmatic saves), #9 (HITL-only for v1),
+            #10 (schema-driven extraction)
+    """
+    from astro_agent.graph.hitl import is_memory_enabled
+    if not is_memory_enabled():
+        return
+
+    try:
+        from astro_agent.memory.extraction import (
+            build_hitl_conversation_text,
+            extract_hitl_memory,
+        )
+        from astro_agent.tools.utility.t33_memory_search import _MEMORY_STORE
+        from astro_agent.config import make_llm
+
+        if _MEMORY_STORE is None:
+            return
+
+        phase = state.get("phase", ProcessingPhase.INGEST)
+        phase_str = phase.value if hasattr(phase, "value") else str(phase)
+        session = state.get("session", {})
+        dataset = state.get("dataset", {})
+        acquisition = dataset.get("acquisition_meta", {})
+
+        session_context = {
+            "target_name": session.get("target_name", "unknown"),
+            "target_type": session.get("target_type", ""),
+            "sensor": acquisition.get("camera_name", ""),
+            "sensor_type": acquisition.get("sensor_type", ""),
+        }
+
+        # Build conversation text from message history
+        conversation_text = build_hitl_conversation_text(messages, tool_name)
+        if not conversation_text.strip():
+            return
+
+        # If the user added an approval note, append it
+        if approval_note:
+            conversation_text += f"\n\n[Human approval note]\n{approval_note}"
+
+        # Extract memories using the agent's LLM
+        llm = make_llm()
+        extraction = extract_hitl_memory(
+            conversation=conversation_text,
+            tool_name=tool_name,
+            phase=phase_str,
+            session_context=session_context,
+            llm=llm,
+        )
+
+        # Get thread_id for session linkage
+        # (thread_id is in the config, not state — use a placeholder for now)
+        session_id = None
+
+        # Store extracted memories
+        for obs in extraction.observations:
+            _MEMORY_STORE.add_observation(
+                content=obs.content,
+                phase=obs.phase or phase_str,
+                session_id=session_id,
+                source="hitl",
+                parameters=obs.parameters,
+                metrics=obs.metrics,
+            )
+
+        for fail in extraction.failures:
+            _MEMORY_STORE.add_failure(
+                content=fail.content,
+                phase=fail.phase or phase_str,
+                tool=fail.tool or tool_name,
+                session_id=session_id,
+                source="hitl",
+                parameters=fail.parameters,
+                root_cause=fail.root_cause,
+                resolution=fail.resolution,
+            )
+
+        for pref in extraction.preferences:
+            _MEMORY_STORE.add_preference(
+                content=pref.content,
+                tool=pref.tool or tool_name,
+                session_id=session_id,
+                source="hitl",
+                parameters=pref.parameters,
+                target_type=session_context.get("target_type"),
+                sensor=session_context.get("sensor"),
+            )
+
+        total = len(extraction.observations) + len(extraction.failures) + len(extraction.preferences)
+        if total > 0:
+            logger.info(f"Memory: stored {total} memories from {tool_name} HITL approval")
+
+    except Exception as e:
+        # Memory extraction is never fatal — the pipeline must continue
+        logger.warning(f"Memory extraction failed (non-fatal): {e}")
 
 
 # ── agent_chat ────────────────────────────────────────────────────────────────

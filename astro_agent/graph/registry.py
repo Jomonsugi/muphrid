@@ -76,6 +76,16 @@ UTILITY_TOOLS = [
     present_images,
 ]
 
+
+def register_memory_tool():
+    """Conditionally add memory_search to UTILITY_TOOLS when memory is enabled."""
+    from astro_agent.graph.hitl import is_memory_enabled
+    if is_memory_enabled():
+        from astro_agent.tools.utility.t33_memory_search import memory_search
+        if memory_search not in UTILITY_TOOLS:
+            UTILITY_TOOLS.append(memory_search)
+
+
 PREPROCESS_TOOLS = [
     # ingest_dataset intentionally excluded — runs once during session init
     # (CLI/app) before the graph starts. Dataset is already in state.

@@ -27,7 +27,7 @@ from langgraph.types import Command
 
 from astro_agent.config import check_dependencies, load_settings, make_llm
 from astro_agent.graph.graph import build_graph
-from astro_agent.graph.hitl import APPROVE_SENTINEL, set_autonomous, set_vlm_hitl, set_vlm_autonomous
+from astro_agent.graph.hitl import APPROVE_SENTINEL, set_autonomous, set_vlm_hitl, set_vlm_autonomous, set_memory_enabled
 from astro_agent.graph.content import text_content
 from astro_agent.graph.memory import make_memory_store
 from astro_agent.graph.state import (
@@ -334,6 +334,8 @@ async def start_session(
     autonomous_mode: bool,
     vlm_hitl: bool,
     vlm_present: bool,
+    # Memory
+    memory_mode: bool,
     # Model
     llm_model: str,
     llm_provider: str,
@@ -395,6 +397,27 @@ async def start_session(
     set_autonomous(autonomous_mode)
     set_vlm_hitl(vlm_hitl)
     set_vlm_autonomous(vlm_present)
+    set_memory_enabled(memory_mode)
+
+    # Initialize long-term memory if enabled
+    if memory_mode:
+        try:
+            from astro_agent.memory.embeddings import OllamaEmbedder
+            from astro_agent.memory.store import MemoryStore
+            from astro_agent.tools.utility.t33_memory_search import set_memory_store
+            from astro_agent.graph.registry import register_memory_tool
+
+            settings = load_settings()
+            embedder = OllamaEmbedder(model=settings.memory_embedding_model)
+            store = MemoryStore(db_path=settings.memory_db_path, embedder=embedder)
+            # Share the db connection with the embedder for cache access
+            embedder._db_conn = store._get_conn()
+            set_memory_store(store)
+            register_memory_tool()
+            logger.info("Long-term memory enabled")
+        except Exception as e:
+            logger.warning(f"Long-term memory init failed (non-fatal): {e}")
+            set_memory_enabled(False)
 
     # Build thread config
     thread_id = _make_thread_id(target_name)
@@ -739,6 +762,17 @@ def build_app() -> gr.Blocks:
                 label="VLM autonomous (agent can visually inspect images outside of HITL)",
                 value=False,
             )
+            gr.Markdown("### Long-Term Memory")
+            gr.Markdown(
+                "When enabled, the agent can search past processing sessions for relevant "
+                "experience (what worked, what failed, user preferences). Memories are "
+                "extracted from HITL conversations after approval. Keep OFF during debugging "
+                "and test runs — only enable when agent quality is stable."
+            )
+            memory_enabled = gr.Checkbox(
+                label="Long-term memory (agent learns from past HITL sessions)",
+                value=os.environ.get("MEMORY_ENABLED", "false").lower() == "true",
+            )
             gr.Markdown("### Per-tool HITL checkpoints")
             gr.Markdown("**Preprocessing**")
             hitl_t02 = gr.Checkbox(label="T02 Master Frame Diagnostics", value=hitl_tools.get("T02_masters", {}).get("enabled", False))
@@ -860,31 +894,32 @@ def build_app() -> gr.Blocks:
                 autonomous_mode=args[9],
                 vlm_hitl=args[10],
                 vlm_present=args[11],
-                llm_model=args[12],
-                llm_provider=args[13],
-                llm_temp=args[14],
-                recursion_limit=int(args[15]),
-                max_tools_phase=int(args[16]),
-                max_consecutive=int(args[17]),
-                max_nudges=int(args[18]),
-                phase_ingest=int(args[19]),
-                phase_calibration=int(args[20]),
-                phase_registration=int(args[21]),
-                phase_analysis=int(args[22]),
-                phase_stacking=int(args[23]),
-                phase_linear=int(args[24]),
-                phase_stretch=int(args[25]),
-                phase_nonlinear=int(args[26]),
-                phase_export=int(args[27]),
-                cleanup_runs=args[28],
-                prune_analysis=args[29],
-                state=args[30],
+                memory_mode=args[12],
+                llm_model=args[13],
+                llm_provider=args[14],
+                llm_temp=args[15],
+                recursion_limit=int(args[16]),
+                max_tools_phase=int(args[17]),
+                max_consecutive=int(args[18]),
+                max_nudges=int(args[19]),
+                phase_ingest=int(args[20]),
+                phase_calibration=int(args[21]),
+                phase_registration=int(args[22]),
+                phase_analysis=int(args[23]),
+                phase_stacking=int(args[24]),
+                phase_linear=int(args[25]),
+                phase_stretch=int(args[26]),
+                phase_nonlinear=int(args[27]),
+                phase_export=int(args[28]),
+                cleanup_runs=args[29],
+                prune_analysis=args[30],
+                state=args[31],
             ),
             inputs=[
                 dataset_path, target_name, bortle_input, sqm_input,
                 remove_stars_input, notes_input,
                 pixel_size, sensor_type, focal_length,
-                autonomous_mode, vlm_hitl, vlm_present,
+                autonomous_mode, vlm_hitl, vlm_present, memory_enabled,
                 llm_model, llm_provider, llm_temp,
                 recursion_limit, max_tools_phase,
                 max_consecutive, max_nudges,
