@@ -53,7 +53,9 @@ class Settings:
     # LLM
     llm_provider: str       # "together" | "anthropic" | "openai"
     llm_model: str
-    llm_temperature: float
+    llm_temperature: float | None  # None = use model default
+    llm_thinking: bool              # enable thinking/extended thinking mode
+    llm_thinking_budget: int        # token budget for Anthropic extended thinking
     together_api_key: str   # required when llm_provider == "together"
     anthropic_api_key: str  # required when llm_provider == "anthropic"
 
@@ -77,6 +79,50 @@ class Settings:
     memory_embedding_model: str
 
 
+# ── Per-model defaults ─────────────────────────────────────────────────────────
+# Each model has correct temperature and thinking mode settings baked in.
+# Users can override via .env but these are the researched defaults.
+
+_MODEL_DEFAULTS: dict[str, dict] = {
+    # Kimi K2.5: thinking mode enabled by default, fixed temp 1.0
+    # Instant mode: temp 0.6. Any other temp value errors.
+    "moonshotai/Kimi-K2.5": {
+        "temperature": None,        # don't send — model uses fixed 1.0 (thinking) or 0.6 (instant)
+        "thinking": True,
+        "thinking_budget": 0,       # not applicable for Kimi
+    },
+    # Claude Sonnet: extended thinking requires temp 1.0
+    "claude-sonnet-4-6": {
+        "temperature": 1.0,         # required for extended thinking
+        "thinking": True,
+        "thinking_budget": 10000,
+    },
+    # DeepSeek V3: no thinking mode, temp 0 for deterministic tool calling
+    "deepseek-ai/DeepSeek-V3": {
+        "temperature": 0.0,
+        "thinking": False,
+        "thinking_budget": 0,
+    },
+}
+
+_FALLBACK_DEFAULTS = {
+    "temperature": 0.0,
+    "thinking": False,
+    "thinking_budget": 0,
+}
+
+
+def _get_model_defaults(model: str) -> dict:
+    """Return the correct defaults for a given model."""
+    # Check exact match first, then prefix match
+    if model in _MODEL_DEFAULTS:
+        return _MODEL_DEFAULTS[model]
+    for key, defaults in _MODEL_DEFAULTS.items():
+        if key in model or model in key:
+            return defaults
+    return _FALLBACK_DEFAULTS
+
+
 def load_settings() -> Settings:
     provider = _optional("LLM_PROVIDER", "together").lower()
 
@@ -96,10 +142,25 @@ def load_settings() -> Settings:
             "Choose: together | anthropic | openai"
         )
 
+    model = _optional("LLM_MODEL", "moonshotai/Kimi-K2.5")
+
+    # Per-model defaults: temperature and thinking mode
+    # Kimi K2.5: fixed temp 1.0 in thinking mode, 0.6 instant. Don't override.
+    # Sonnet: extended thinking requires temp 1.0. Without thinking, 0 is best.
+    # DeepSeek V3: no thinking mode, temp 0 for deterministic tool calling.
+    model_defaults = _get_model_defaults(model)
+    temp_str = _optional("LLM_TEMPERATURE", "")
+    temperature = float(temp_str) if temp_str else model_defaults["temperature"]
+    thinking_str = _optional("LLM_THINKING", "")
+    thinking = thinking_str.lower() == "true" if thinking_str else model_defaults["thinking"]
+    thinking_budget = int(_optional("LLM_THINKING_BUDGET", str(model_defaults["thinking_budget"])))
+
     return Settings(
         llm_provider=provider,
-        llm_model=_optional("LLM_MODEL", "moonshotai/Kimi-K2.5"),
-        llm_temperature=float(_optional("LLM_TEMPERATURE", "0")),
+        llm_model=model,
+        llm_temperature=temperature,
+        llm_thinking=thinking,
+        llm_thinking_budget=thinking_budget,
         together_api_key=together_key,
         anthropic_api_key=anthropic_key,
         siril_bin=_optional("SIRIL_BIN", "siril-cli"),
@@ -353,33 +414,54 @@ def make_llm(settings: Settings | None = None):
 
     if settings.llm_provider == "together":
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=settings.llm_model,
-            api_key=settings.together_api_key,       # type: ignore[arg-type]
-            base_url="https://api.together.xyz/v1/",
-            temperature=settings.llm_temperature,
-            timeout=120,
-        )
+        kwargs: dict = {
+            "model": settings.llm_model,
+            "api_key": settings.together_api_key,      # type: ignore[arg-type]
+            "base_url": "https://api.together.xyz/v1/",
+            "timeout": 120,
+        }
+        # Only send temperature if not None (Kimi K2.5 uses fixed values)
+        if settings.llm_temperature is not None:
+            kwargs["temperature"] = settings.llm_temperature
+        # Kimi K2.5 thinking mode control
+        if not settings.llm_thinking and "Kimi" in settings.llm_model:
+            kwargs["model_kwargs"] = {
+                "extra_body": {"chat_template_kwargs": {"thinking": False}},
+            }
+        return ChatOpenAI(**kwargs)
 
     if settings.llm_provider == "anthropic":
         from langchain_anthropic import ChatAnthropic  # optional dep
-        return ChatAnthropic(
-            model=settings.llm_model,
-            api_key=settings.anthropic_api_key,       # type: ignore[arg-type]
-            temperature=settings.llm_temperature,
-            timeout=120,
-            model_kwargs={
-                "extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"},
-            },
-        )
+        model_kwargs: dict = {
+            "extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"},
+        }
+        anthro_kwargs: dict = {
+            "model": settings.llm_model,
+            "api_key": settings.anthropic_api_key,     # type: ignore[arg-type]
+            "timeout": 120,
+            "model_kwargs": model_kwargs,
+        }
+        if settings.llm_thinking:
+            # Extended thinking: temp must be 1.0, set budget
+            anthro_kwargs["temperature"] = 1.0
+            anthro_kwargs["max_tokens"] = 16000
+            anthro_kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": settings.llm_thinking_budget,
+            }
+        else:
+            anthro_kwargs["temperature"] = settings.llm_temperature if settings.llm_temperature is not None else 0.0
+        return ChatAnthropic(**anthro_kwargs)
 
     if settings.llm_provider == "openai":
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=settings.llm_model,
-            temperature=settings.llm_temperature,
-            timeout=120,
-        )
+        oai_kwargs: dict = {
+            "model": settings.llm_model,
+            "timeout": 120,
+        }
+        if settings.llm_temperature is not None:
+            oai_kwargs["temperature"] = settings.llm_temperature
+        return ChatOpenAI(**oai_kwargs)
 
     raise ConfigError(f"Unknown LLM_PROVIDER: {settings.llm_provider!r}")
 

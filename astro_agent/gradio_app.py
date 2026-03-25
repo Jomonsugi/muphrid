@@ -1,8 +1,31 @@
-"""
-Gradio HITL interface for AstroAgent.
+# AstroAgent - LLM agent for autonomous astrophotography post-processing
+# Copyright (C) 2026 Micah Shanks
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-Two-panel layout: chat (conversation) on the left, activity log + image gallery
-on the right. Settings are organized in tabs (Equipment, HITL Config, Model).
+"""
+Gradio 6 async HITL interface for AstroAgent.
+
+Async-first design:
+  - All event handlers are async generators
+  - Graph built with AsyncSqliteSaver, initialized on app.load()
+  - Settings applied reactively via .change() events
+  - Error recovery in every handler — app never crashes
+  - .queue() enabled for generator support and cancellation
+
+Layout: two-panel (50/50) with chat on the left, gallery + activity log
+on the right. Settings organized in tabs.
 
 Usage:
     uv run python -m astro_agent.gradio_app
@@ -13,21 +36,27 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sqlite3
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 import gradio as gr
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
 
 from astro_agent.config import check_dependencies, load_settings, make_llm
 from astro_agent.graph.graph import build_graph
-from astro_agent.graph.hitl import APPROVE_SENTINEL, set_autonomous, set_vlm_hitl, set_vlm_autonomous, set_memory_enabled
+from astro_agent.graph.hitl import (
+    APPROVE_SENTINEL,
+    set_autonomous,
+    set_vlm_hitl,
+    set_vlm_autonomous,
+    set_memory_enabled,
+    is_memory_enabled,
+)
 from astro_agent.graph.content import text_content
 from astro_agent.graph.memory import make_memory_store
 from astro_agent.graph.state import (
@@ -41,7 +70,8 @@ from astro_agent.tools.preprocess.t01_ingest import ingest_dataset
 logger = logging.getLogger(__name__)
 
 
-# ── Defaults from config files ──────────────────────────────────────────────
+# ── Config loaders (sync, pure functions) ────────────────────────────────────
+
 
 def _load_hitl_defaults() -> dict:
     """Read hitl_config.toml for initial checkbox values."""
@@ -74,16 +104,12 @@ def _load_equipment_defaults() -> dict:
 def _load_env_defaults() -> dict:
     """Read .env-sourced defaults from os.environ."""
     return {
-        # Model
         "llm_model": os.environ.get("LLM_MODEL", "moonshotai/Kimi-K2.5"),
         "llm_provider": os.environ.get("LLM_PROVIDER", "together"),
-        "llm_temperature": float(os.environ.get("LLM_TEMPERATURE", "0")),
-        # Safety limits
         "recursion_limit": int(os.environ.get("RECURSION_LIMIT", "100")),
         "max_tools_per_phase": int(os.environ.get("MAX_TOOLS_PER_PHASE", "30")),
         "max_consecutive_same_tool": int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "3")),
         "max_autonomous_nudges": int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "2")),
-        # Per-phase limits
         "max_tools_ingest": int(os.environ.get("MAX_TOOLS_INGEST", "10")),
         "max_tools_calibration": int(os.environ.get("MAX_TOOLS_CALIBRATION", "10")),
         "max_tools_registration": int(os.environ.get("MAX_TOOLS_REGISTRATION", "10")),
@@ -93,13 +119,10 @@ def _load_env_defaults() -> dict:
         "max_tools_stretch": int(os.environ.get("MAX_TOOLS_STRETCH", "25")),
         "max_tools_nonlinear": int(os.environ.get("MAX_TOOLS_NONLINEAR", "25")),
         "max_tools_export": int(os.environ.get("MAX_TOOLS_EXPORT", "5")),
-        # Behavior
         "cleanup_previous_runs": os.environ.get("CLEANUP_PREVIOUS_RUNS", "true").lower() == "true",
         "prune_phase_analysis": os.environ.get("PRUNE_PHASE_ANALYSIS", "true").lower() == "true",
     }
 
-
-# ── Graph helpers ────────────────────────────────────────────────────────────
 
 def _make_thread_id(target: str) -> str:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -107,22 +130,30 @@ def _make_thread_id(target: str) -> str:
     return f"run-{slug}-{ts}"
 
 
-def _build_graph():
-    """Build the LangGraph with SqliteSaver checkpointer."""
-    store = make_memory_store()
+# ── Async resource lifecycle ─────────────────────────────────────────────────
+
+_GRAPH = None
+
+
+async def _init_async_resources():
+    """Build the LangGraph with AsyncSqliteSaver. Called once on app.load()."""
+    global _GRAPH
+    if _GRAPH is not None:
+        return
+
     serde = JsonPlusSerializer(
         allowed_msgpack_modules=[("astro_agent.graph.state", "ProcessingPhase")]
     )
-    conn = sqlite3.connect("checkpoints.db", check_same_thread=False)
-    checkpointer = SqliteSaver(conn, serde=serde)
-    return build_graph(checkpointer=checkpointer, store=store)
+    conn = await aiosqlite.connect("checkpoints.db")
+    checkpointer = AsyncSqliteSaver(conn=conn, serde=serde)
+    await checkpointer.setup()
+    store = make_memory_store()
+    _GRAPH = build_graph(checkpointer=checkpointer, store=store)
+    logger.info("Async resources initialized: graph + AsyncSqliteSaver")
 
 
-# Module-level graph instance (built once on import)
-_GRAPH = _build_graph()
+# ── FITS preview conversion (sync utility) ───────────────────────────────────
 
-
-# ── FITS → preview conversion ───────────────────────────────────────────────
 
 def _convert_fits_to_preview(
     image_paths: list[str],
@@ -157,7 +188,8 @@ def _convert_fits_to_preview(
     return preview_paths
 
 
-# ── Stream chunk parsing ─────────────────────────────────────────────────────
+# ── Stream chunk parsing (sync, defensive) ───────────────────────────────────
+
 
 def _parse_stream_chunks(
     chunk: dict,
@@ -171,22 +203,20 @@ def _parse_stream_chunks(
     Parse a single stream chunk (stream_mode="updates") and update the UI lists.
 
     Returns the interrupt payload if this chunk contains one, else None.
+    Defensive: handles None values, non-dict updates, unexpected chunk formats.
     """
-    interrupt_payload = None
-
     if "__interrupt__" in chunk:
-        interrupt_payload = chunk["__interrupt__"][0].value
-        return interrupt_payload
+        return chunk["__interrupt__"][0].value
 
-    # Each chunk is {node_name: state_update_dict}
     for node_name, update in chunk.items():
         if node_name == "__interrupt__":
+            continue
+        if not isinstance(update, dict):
             continue
 
         messages = update.get("messages", [])
         for msg in messages:
             if isinstance(msg, AIMessage):
-                # Tool calls → activity log
                 if msg.tool_calls:
                     for tc in msg.tool_calls:
                         args_str = json.dumps(tc.get("args", {}), indent=2, default=str)
@@ -195,7 +225,6 @@ def _parse_stream_chunks(
                             "content": f"**{tc['name']}**",
                             "metadata": {"title": f"Tool Call: {tc['name']}", "log": args_str},
                         })
-                # Agent text → chat
                 agent_text = text_content(msg.content)
                 if agent_text.strip():
                     chat_messages.append({
@@ -206,7 +235,6 @@ def _parse_stream_chunks(
             elif isinstance(msg, ToolMessage):
                 result_text = text_content(msg.content)
 
-                # present_images → populate gallery
                 if msg.name == "present_images":
                     try:
                         result = json.loads(result_text)
@@ -214,7 +242,6 @@ def _parse_stream_chunks(
                             title = result.get("title", "")
                             description = result.get("description", "")
                             images = result.get("images", [])
-                            # Convert FITS → JPG and populate gallery
                             paths = [img["path"] for img in images]
                             labels = [img.get("label", f"Image {i+1}") for i, img in enumerate(images)]
                             preview_paths = _convert_fits_to_preview(paths, working_dir, is_linear)
@@ -222,7 +249,6 @@ def _parse_stream_chunks(
                             for path, label in zip(preview_paths, labels):
                                 if Path(path).exists():
                                     gallery_images.append((path, label))
-                            # Show description in chat if provided
                             if description:
                                 chat_messages.append({
                                     "role": "assistant",
@@ -231,7 +257,6 @@ def _parse_stream_chunks(
                     except (json.JSONDecodeError, KeyError):
                         pass
 
-                # All tool results → activity log (collapsible)
                 display_text = result_text[:500] + "..." if len(result_text) > 500 else result_text
                 activity_log.append({
                     "role": "assistant",
@@ -240,13 +265,8 @@ def _parse_stream_chunks(
                 })
 
             elif isinstance(msg, HumanMessage):
-                # HITL approval or feedback injected by the graph
-                human_text = text_content(msg.content)
-                if human_text and not human_text.startswith("Approved."):
-                    # Don't echo auto-generated approval messages
-                    pass
+                pass  # HITL approval/feedback — don't echo
 
-        # Phase changes
         new_phase = update.get("phase")
         if new_phase is not None:
             phase_name = new_phase.value if isinstance(new_phase, ProcessingPhase) else str(new_phase)
@@ -255,10 +275,11 @@ def _parse_stream_chunks(
                 "content": f"--- Phase: **{phase_name.upper()}** ---",
             })
 
-    return interrupt_payload
+    return None
 
 
-# ── Core streaming handler ───────────────────────────────────────────────────
+# ── Core streaming handler (async generator) ────────────────────────────────
+
 
 async def _stream_graph(
     graph,
@@ -272,7 +293,7 @@ async def _stream_graph(
 ):
     """
     Core async streaming loop. Yields (chat, activity, gallery) tuples.
-    Returns the interrupt payload if one fires, else None.
+    Handles interrupt payloads for HITL display.
     """
     interrupt_payload = None
 
@@ -283,11 +304,10 @@ async def _stream_graph(
         )
         if result is not None:
             interrupt_payload = result
-            # Don't break — let the stream end naturally
 
         yield chat_messages, activity_log, gallery_images
 
-    # Handle interrupt payload — update gallery with images
+    # After stream ends, handle any interrupt payload for UI display
     if interrupt_payload is not None:
         interrupt_type = interrupt_payload.get("type", "unknown")
         title = interrupt_payload.get("title", "Review")
@@ -301,7 +321,6 @@ async def _stream_graph(
                 if Path(p).exists():
                     gallery_images.append((p, f"Variant {i + 1}"))
 
-        # Show HITL context in chat
         if interrupt_type == "agent_chat":
             if agent_text:
                 chat_messages.append({
@@ -317,192 +336,121 @@ async def _stream_graph(
         yield chat_messages, activity_log, gallery_images
 
 
-# ── Event handlers ───────────────────────────────────────────────────────────
+# ── Event handlers (async generators, direct binding) ────────────────────────
+
 
 async def start_session(
     dataset_path: str,
     target_name: str,
     bortle: int | None,
     sqm: float | None,
-    remove_stars: bool | None,
+    remove_stars: str,
     notes: str,
-    # Equipment
     pixel_size: float | None,
     sensor_type: str | None,
     focal_length: float | None,
-    # HITL
-    autonomous_mode: bool,
-    vlm_hitl: bool,
-    vlm_present: bool,
-    # Memory
-    memory_mode: bool,
-    # Model
-    llm_model: str,
-    llm_provider: str,
-    llm_temp: float,
-    # Safety limits
-    recursion_limit: int,
-    max_tools_phase: int,
-    max_consecutive: int,
-    max_nudges: int,
-    # Per-phase limits
-    phase_ingest: int,
-    phase_calibration: int,
-    phase_registration: int,
-    phase_analysis: int,
-    phase_stacking: int,
-    phase_linear: int,
-    phase_stretch: int,
-    phase_nonlinear: int,
-    phase_export: int,
-    # Behavior
-    cleanup_runs: bool,
-    prune_analysis: bool,
-    # Session state
     state: dict,
 ):
-    """Start a new processing session."""
-    if not dataset_path or not target_name:
-        yield (
-            [{"role": "assistant", "content": "Please provide both a dataset path and target name."}],
-            [],
-            [],
-            state,
-        )
-        return
-
-    # Apply settings to environment
-    os.environ["LLM_MODEL"] = llm_model
-    os.environ["LLM_PROVIDER"] = llm_provider
-    os.environ["LLM_TEMPERATURE"] = str(llm_temp)
-    os.environ["RECURSION_LIMIT"] = str(int(recursion_limit))
-    os.environ["MAX_TOOLS_PER_PHASE"] = str(int(max_tools_phase))
-    os.environ["MAX_CONSECUTIVE_SAME_TOOL"] = str(int(max_consecutive))
-    os.environ["MAX_AUTONOMOUS_NUDGES"] = str(int(max_nudges))
-    # Per-phase limits
-    os.environ["MAX_TOOLS_INGEST"] = str(int(phase_ingest))
-    os.environ["MAX_TOOLS_CALIBRATION"] = str(int(phase_calibration))
-    os.environ["MAX_TOOLS_REGISTRATION"] = str(int(phase_registration))
-    os.environ["MAX_TOOLS_ANALYSIS"] = str(int(phase_analysis))
-    os.environ["MAX_TOOLS_STACKING"] = str(int(phase_stacking))
-    os.environ["MAX_TOOLS_LINEAR"] = str(int(phase_linear))
-    os.environ["MAX_TOOLS_STRETCH"] = str(int(phase_stretch))
-    os.environ["MAX_TOOLS_NONLINEAR"] = str(int(phase_nonlinear))
-    os.environ["MAX_TOOLS_EXPORT"] = str(int(phase_export))
-    # Behavior
-    os.environ["CLEANUP_PREVIOUS_RUNS"] = "true" if cleanup_runs else "false"
-    os.environ["PRUNE_PHASE_ANALYSIS"] = "true" if prune_analysis else "false"
-
-    # Set runtime mode flags
-    set_autonomous(autonomous_mode)
-    set_vlm_hitl(vlm_hitl)
-    set_vlm_autonomous(vlm_present)
-    set_memory_enabled(memory_mode)
-
-    # Initialize long-term memory if enabled
-    if memory_mode:
-        try:
-            from astro_agent.memory.embeddings import OllamaEmbedder
-            from astro_agent.memory.store import MemoryStore
-            from astro_agent.tools.utility.t33_memory_search import set_memory_store
-            from astro_agent.graph.registry import register_memory_tool
-
-            settings = load_settings()
-            embedder = OllamaEmbedder(model=settings.memory_embedding_model)
-            store = MemoryStore(db_path=settings.memory_db_path, embedder=embedder)
-            # Share the db connection with the embedder for cache access
-            embedder._db_conn = store._get_conn()
-            set_memory_store(store)
-            register_memory_tool()
-            logger.info("Long-term memory enabled")
-        except Exception as e:
-            logger.warning(f"Long-term memory init failed (non-fatal): {e}")
-            set_memory_enabled(False)
-
-    # Build thread config
-    thread_id = _make_thread_id(target_name)
-    config = {"configurable": {"thread_id": thread_id}}
-    if recursion_limit > 0:
-        config["recursion_limit"] = recursion_limit
-
-    # Ingest dataset
-    chat_messages = [{"role": "assistant", "content": f"Starting session **{thread_id}**\n\nIngesting dataset from `{dataset_path}`..."}]
+    """Start a new processing session. Async generator — yields UI updates."""
+    chat_messages: list[dict] = []
     activity_log: list[dict] = []
     gallery_images: list[tuple] = []
 
+    if not dataset_path or not target_name:
+        chat_messages.append({"role": "assistant", "content": "Please provide both a dataset path and target name."})
+        yield chat_messages, activity_log, gallery_images, state
+        return
+
+    # Parse remove_stars dropdown value
+    if remove_stars == "yes":
+        rs = True
+    elif remove_stars == "no":
+        rs = False
+    else:
+        rs = None
+
+    thread_id = _make_thread_id(target_name)
+    chat_messages.append({"role": "assistant", "content": f"Starting session **{thread_id}**\n\nIngesting dataset from `{dataset_path}`..."})
     yield chat_messages, activity_log, gallery_images, state
 
     try:
+        # Ingest dataset
         ingest_result = ingest_dataset.invoke({
             "root_directory": dataset_path,
             "thread_id": thread_id,
         })
-    except Exception as e:
-        chat_messages.append({"role": "assistant", "content": f"Ingest failed: {e}"})
+
+        # Build session context
+        session = SessionContext(
+            target_name=target_name,
+            bortle=bortle if bortle and bortle > 0 else None,
+            sqm_reading=sqm if sqm and sqm > 0 else None,
+            remove_stars=rs,
+            notes=notes if notes else None,
+        )
+
+        # Build initial state
+        dataset = ingest_result["dataset"]
+        initial_state = make_empty_state(dataset=dataset, session=session)
+        initial_state["messages"] = [
+            HumanMessage(content=build_initial_message(
+                dataset=dataset,
+                session=session,
+                ingest_summary=ingest_result.get("summary", {}),
+            ))
+        ]
+
+        working_dir = dataset.get("working_dir", "")
+
+        # Build config
+        config = {"configurable": {"thread_id": thread_id}}
+        recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
+        if recursion_limit > 0:
+            config["recursion_limit"] = recursion_limit
+
+        # Update session state
+        state = {
+            "thread_id": thread_id,
+            "config": config,
+            "working_dir": working_dir,
+            "is_linear": True,
+        }
+
+        # Display ingest results
+        warnings = ingest_result.get("warnings", [])
+        if warnings:
+            warn_text = "\n".join(f"- {w}" for w in warnings)
+            chat_messages.append({"role": "assistant", "content": f"Ingest warnings:\n{warn_text}"})
+
+        files = dataset.get("files", {})
+        chat_messages.append({
+            "role": "assistant",
+            "content": (
+                f"Dataset ingested: {len(files.get('lights', []))} lights, "
+                f"{len(files.get('darks', []))} darks, "
+                f"{len(files.get('flats', []))} flats, "
+                f"{len(files.get('biases', []))} biases\n\n"
+                f"Processing **{target_name}**..."
+            ),
+        })
+
         yield chat_messages, activity_log, gallery_images, state
-        return
 
-    # Build session context
-    session = SessionContext(
-        target_name=target_name,
-        bortle=bortle if bortle and bortle > 0 else None,
-        sqm_reading=sqm if sqm and sqm > 0 else None,
-        remove_stars=remove_stars,
-        notes=notes if notes else None,
-    )
+        # Initialize memory if enabled
+        if is_memory_enabled():
+            _init_memory()
 
-    # Build initial state
-    dataset = ingest_result["dataset"]
-    initial_state = make_empty_state(dataset=dataset, session=session)
-    initial_state["messages"] = [
-        HumanMessage(content=build_initial_message(
-            dataset=dataset,
-            session=session,
-            ingest_summary=ingest_result.get("summary", {}),
-        ))
-    ]
+        # Stream the graph
+        async for chat_msgs, act_log, gal_imgs in _stream_graph(
+            _GRAPH, config, initial_state,
+            chat_messages, activity_log, gallery_images,
+            working_dir, state.get("is_linear", True),
+        ):
+            yield chat_msgs, act_log, gal_imgs, state
 
-    working_dir = dataset.get("working_dir", "")
-
-    # Update session state
-    state = {
-        "thread_id": thread_id,
-        "config": config,
-        "working_dir": working_dir,
-        "is_linear": True,
-    }
-
-    warnings = ingest_result.get("warnings", [])
-    if warnings:
-        warn_text = "\n".join(f"- {w}" for w in warnings)
-        chat_messages.append({"role": "assistant", "content": f"Ingest warnings:\n{warn_text}"})
-
-    files = dataset.get("files", {})
-    chat_messages.append({
-        "role": "assistant",
-        "content": (
-            f"Dataset ingested: {len(files.get('lights', []))} lights, "
-            f"{len(files.get('darks', []))} darks, "
-            f"{len(files.get('flats', []))} flats, "
-            f"{len(files.get('biases', []))} biases\n\n"
-            f"Processing **{target_name}**..."
-        ),
-    })
-
-    yield chat_messages, activity_log, gallery_images, state
-
-    # Stream the graph
-    async for chat_msgs, act_log, gal_imgs in _stream_graph(
-        _GRAPH, config, initial_state,
-        chat_messages, activity_log, gallery_images,
-        working_dir, state.get("is_linear", True),
-    ):
-        yield chat_msgs, act_log, gal_imgs, state
-
-    # Check if pipeline completed (no interrupt)
-    # If we get here without an interrupt, the pipeline finished
-    if not any("HITL" in m.get("content", "") and "Awaiting" in m.get("content", "") for m in chat_messages[-3:]):
-        chat_messages.append({"role": "assistant", "content": "Pipeline complete."})
+    except Exception as e:
+        logger.exception(f"Session error: {e}")
+        chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
         yield chat_messages, activity_log, gallery_images, state
 
 
@@ -527,19 +475,20 @@ async def send_message(
         yield chat_messages, activity_log, gallery_images, state, ""
         return
 
-    # Add user message to chat
     chat_messages.append({"role": "user", "content": user_text})
     yield chat_messages, activity_log, gallery_images, state, ""
 
-    # Resume graph with user feedback
-    resume_value = user_text
-
-    async for chat_msgs, act_log, gal_imgs in _stream_graph(
-        _GRAPH, config, Command(resume=resume_value),
-        chat_messages, activity_log, gallery_images,
-        working_dir, is_linear,
-    ):
-        yield chat_msgs, act_log, gal_imgs, state, ""
+    try:
+        async for chat_msgs, act_log, gal_imgs in _stream_graph(
+            _GRAPH, config, Command(resume=user_text),
+            chat_messages, activity_log, gallery_images,
+            working_dir, is_linear,
+        ):
+            yield chat_msgs, act_log, gal_imgs, state, ""
+    except Exception as e:
+        logger.exception(f"Send message error: {e}")
+        chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
+        yield chat_messages, activity_log, gallery_images, state, ""
 
 
 async def approve_action(
@@ -561,12 +510,17 @@ async def approve_action(
     chat_messages.append({"role": "user", "content": "Approved."})
     yield chat_messages, activity_log, gallery_images, state
 
-    async for chat_msgs, act_log, gal_imgs in _stream_graph(
-        _GRAPH, config, Command(resume=APPROVE_SENTINEL),
-        chat_messages, activity_log, gallery_images,
-        working_dir, is_linear,
-    ):
-        yield chat_msgs, act_log, gal_imgs, state
+    try:
+        async for chat_msgs, act_log, gal_imgs in _stream_graph(
+            _GRAPH, config, Command(resume=APPROVE_SENTINEL),
+            chat_messages, activity_log, gallery_images,
+            working_dir, is_linear,
+        ):
+            yield chat_msgs, act_log, gal_imgs, state
+    except Exception as e:
+        logger.exception(f"Approve error: {e}")
+        chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
+        yield chat_messages, activity_log, gallery_images, state
 
 
 async def resume_session(
@@ -583,7 +537,7 @@ async def resume_session(
         return
 
     config = {"configurable": {"thread_id": resume_id}}
-    recursion_limit = int(os.environ.get("RECURSION_LIMIT", "200"))
+    recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
     if recursion_limit > 0:
         config["recursion_limit"] = recursion_limit
 
@@ -597,25 +551,103 @@ async def resume_session(
     chat_messages.append({"role": "assistant", "content": f"Resuming session **{resume_id}**..."})
     yield chat_messages, activity_log, gallery_images, state
 
-    async for chat_msgs, act_log, gal_imgs in _stream_graph(
-        _GRAPH, config, Command(resume=""),
-        chat_messages, activity_log, gallery_images,
-        state.get("working_dir", ""), state.get("is_linear", True),
-    ):
-        yield chat_msgs, act_log, gal_imgs, state
+    try:
+        async for chat_msgs, act_log, gal_imgs in _stream_graph(
+            _GRAPH, config, Command(resume="Continue from checkpoint."),
+            chat_messages, activity_log, gallery_images,
+            state.get("working_dir", ""), state.get("is_linear", True),
+        ):
+            yield chat_msgs, act_log, gal_imgs, state
+    except Exception as e:
+        logger.exception(f"Resume error: {e}")
+        chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
+        yield chat_messages, activity_log, gallery_images, state
+
+
+# ── Settings helpers ─────────────────────────────────────────────────────────
+
+
+def _apply_ui_settings(
+    recursion_limit, max_tools_phase, max_consecutive, max_nudges,
+    phase_ingest, phase_calibration, phase_registration,
+    phase_analysis, phase_stacking, phase_linear,
+    phase_stretch, phase_nonlinear, phase_export,
+    cleanup_runs, prune_analysis,
+    llm_model, llm_provider,
+):
+    """Apply all UI settings to os.environ. Called before start_session via .then() chaining."""
+    os.environ["LLM_MODEL"] = llm_model
+    os.environ["LLM_PROVIDER"] = llm_provider
+    os.environ["RECURSION_LIMIT"] = str(int(recursion_limit))
+    os.environ["MAX_TOOLS_PER_PHASE"] = str(int(max_tools_phase))
+    os.environ["MAX_CONSECUTIVE_SAME_TOOL"] = str(int(max_consecutive))
+    os.environ["MAX_AUTONOMOUS_NUDGES"] = str(int(max_nudges))
+    os.environ["MAX_TOOLS_INGEST"] = str(int(phase_ingest))
+    os.environ["MAX_TOOLS_CALIBRATION"] = str(int(phase_calibration))
+    os.environ["MAX_TOOLS_REGISTRATION"] = str(int(phase_registration))
+    os.environ["MAX_TOOLS_ANALYSIS"] = str(int(phase_analysis))
+    os.environ["MAX_TOOLS_STACKING"] = str(int(phase_stacking))
+    os.environ["MAX_TOOLS_LINEAR"] = str(int(phase_linear))
+    os.environ["MAX_TOOLS_STRETCH"] = str(int(phase_stretch))
+    os.environ["MAX_TOOLS_NONLINEAR"] = str(int(phase_nonlinear))
+    os.environ["MAX_TOOLS_EXPORT"] = str(int(phase_export))
+    os.environ["CLEANUP_PREVIOUS_RUNS"] = "true" if cleanup_runs else "false"
+    os.environ["PRUNE_PHASE_ANALYSIS"] = "true" if prune_analysis else "false"
+
+
+def _init_memory():
+    """Initialize long-term memory store. Called when memory is enabled."""
+    try:
+        from astro_agent.memory.embeddings import OllamaEmbedder
+        from astro_agent.memory.store import MemoryStore
+        from astro_agent.tools.utility.t33_memory_search import set_memory_store
+        from astro_agent.graph.registry import register_memory_tool
+
+        settings = load_settings()
+        embedder = OllamaEmbedder(model=settings.memory_embedding_model)
+        store = MemoryStore(db_path=settings.memory_db_path, embedder=embedder)
+        embedder._db_conn = store._get_conn()
+        set_memory_store(store)
+        register_memory_tool()
+        logger.info("Long-term memory initialized")
+    except Exception as e:
+        logger.warning(f"Long-term memory init failed (non-fatal): {e}")
+        set_memory_enabled(False)
+
+
+def _on_memory_toggle(enabled: bool):
+    """Handle memory checkbox toggle."""
+    set_memory_enabled(enabled)
+    if enabled:
+        _init_memory()
+
+
+def _format_model_info(model_name: str) -> str:
+    """Display model defaults dynamically from _MODEL_DEFAULTS config."""
+    from astro_agent.config import _get_model_defaults, _FALLBACK_DEFAULTS
+    defaults = _get_model_defaults(model_name)
+    if defaults is _FALLBACK_DEFAULTS:
+        return f"**{model_name}**: No preset defaults. Using fallback (temp=0, thinking=off)."
+    temp = defaults["temperature"]
+    temp_str = str(temp) if temp is not None else "fixed by model"
+    thinking = "enabled" if defaults["thinking"] else "disabled"
+    budget = defaults.get("thinking_budget", 0)
+    lines = [f"**{model_name}** defaults: temperature={temp_str}, thinking={thinking}"]
+    if budget > 0:
+        lines.append(f"Thinking budget: {budget} tokens")
+    return "  \n".join(lines)
 
 
 # ── Layout ───────────────────────────────────────────────────────────────────
+
 
 def build_app() -> gr.Blocks:
     hitl_defaults = _load_hitl_defaults()
     equip_defaults = _load_equipment_defaults()
     env_defaults = _load_env_defaults()
-
     hitl_tools = hitl_defaults.get("hitl", {})
 
     with gr.Blocks(title="AstroAgent") as app:
-        # Session state
         session_state = gr.State({
             "thread_id": None,
             "config": None,
@@ -625,43 +657,40 @@ def build_app() -> gr.Blocks:
 
         gr.Markdown("# AstroAgent")
 
+        # ── Processing tab ───────────────────────────────────────────
         with gr.Tab("Processing"):
-            with gr.Row():
-                # ── Left column: Chat ──────────────────────────────
-                with gr.Column(scale=3):
+            with gr.Row(equal_height=True):
+                with gr.Column(scale=1):
                     chatbot = gr.Chatbot(
                         label="AstroAgent",
                         height=600,
                         buttons=["copy", "copy_all"],
                     )
-                    with gr.Row():
-                        msg_input = gr.Textbox(
-                            placeholder="Type feedback, ask questions, or discuss the result...",
-                            scale=4,
-                            lines=3,
-                            max_lines=6,
-                            show_label=False,
-                            container=False,
-                        )
-                        send_btn = gr.Button("Send", scale=1)
-                        approve_btn = gr.Button("Approve", variant="primary", scale=1)
+                    msg_input = gr.Textbox(
+                        placeholder="Reply...",
+                        lines=1,
+                        max_lines=20,
+                        show_label=False,
+                        container=False,
+                        autoscroll=True,
+                    )
+                    approve_btn = gr.Button("Approve", variant="primary", size="sm")
 
-                # ── Right column: Gallery + Activity log ───────────
-                with gr.Column(scale=2):
+                with gr.Column(scale=1):
                     gallery = gr.Gallery(
                         label="Image Review",
                         columns=2,
-                        height=350,
+                        height=400,
                         allow_preview=True,
                         buttons=["download"],
+                        interactive=False,
                     )
                     activity = gr.Chatbot(
                         label="Activity Log",
-                        height=250,
+                        height=300,
                         buttons=[],
                     )
 
-            # ── Session controls ───────────────────────────────────
             with gr.Row():
                 with gr.Accordion("Start New Session", open=True):
                     with gr.Row():
@@ -679,7 +708,7 @@ def build_app() -> gr.Blocks:
                         bortle_input = gr.Number(
                             label="Bortle (1-9)",
                             value=None,
-                            minimum=1,
+                            minimum=None,
                             maximum=9,
                             precision=0,
                         )
@@ -703,6 +732,7 @@ def build_app() -> gr.Blocks:
                         )
                         resume_btn = gr.Button("Resume", scale=1)
 
+        # ── Session Notes tab ────────────────────────────────────────
         with gr.Tab("Session Notes"):
             gr.Markdown(
                 "Free-text context injected into the agent's initial prompt. "
@@ -711,19 +741,16 @@ def build_app() -> gr.Blocks:
             )
             notes_input = gr.Textbox(
                 label="Notes",
-                placeholder="Shot with Optolong L-eNhance duoband filter\nVery poor seeing — FWHM likely > 4px\n10-min subs, ASI2600, gain 100\nPrioritise faint outer nebulosity over star quality",
+                placeholder="Shot with Optolong L-eNhance duoband filter\nVery poor seeing — FWHM likely > 4px",
                 lines=10,
                 max_lines=20,
             )
 
+        # ── Equipment tab ────────────────────────────────────────────
         with gr.Tab("Equipment"):
             gr.Markdown(
                 "Override values that can't be read from file metadata. "
-                "Leave empty to auto-detect from FITS headers or EXIF.\n\n"
-                "**DSLR/mirrorless** (RAF, CR2, NEF, ARW): pixel size is never in EXIF. "
-                "X-Trans sensors (Fuji) need sensor_type for 3-pass demosaic.\n\n"
-                "**Dedicated astro cameras** (ZWO, QHY FITS): all values are in FITS headers. "
-                "Nothing needed here."
+                "Leave empty to auto-detect from FITS headers or EXIF."
             )
             pixel_size = gr.Number(
                 label="Pixel size (um)",
@@ -734,7 +761,7 @@ def build_app() -> gr.Blocks:
                 label="Sensor type",
                 choices=["", "bayer", "xtrans", "mono"],
                 value=equip_defaults.get("camera", {}).get("sensor_type", ""),
-                info="Required for X-Trans (Fuji) to enable 3-pass demosaic. Leave empty for auto-detect.",
+                info="Required for X-Trans (Fuji) to enable 3-pass demosaic.",
             )
             focal_length = gr.Number(
                 label="Focal length (mm)",
@@ -742,6 +769,7 @@ def build_app() -> gr.Blocks:
                 info="EXIF has nominal value; plate-solve-measured is more accurate",
             )
 
+        # ── HITL Config tab ──────────────────────────────────────────
         with gr.Tab("HITL Config"):
             gr.Markdown("Control which pipeline steps pause for human review.")
             autonomous_mode = gr.Checkbox(
@@ -751,11 +779,10 @@ def build_app() -> gr.Blocks:
             gr.Markdown("### VLM (Visual Language Model)")
             gr.Markdown(
                 "When enabled, preview images are injected as base64 into the agent's "
-                "context so it can visually reason about results. Images are stripped "
-                "from context after use to manage the context window."
+                "context so it can visually reason about results."
             )
             vlm_hitl = gr.Checkbox(
-                label="VLM during HITL (agent sees all images during human review — HITL-triggered and tool-triggered)",
+                label="VLM during HITL (agent sees images during human review)",
                 value=False,
             )
             vlm_present = gr.Checkbox(
@@ -765,9 +792,8 @@ def build_app() -> gr.Blocks:
             gr.Markdown("### Long-Term Memory")
             gr.Markdown(
                 "When enabled, the agent can search past processing sessions for relevant "
-                "experience (what worked, what failed, user preferences). Memories are "
-                "extracted from HITL conversations after approval. Keep OFF during debugging "
-                "and test runs — only enable when agent quality is stable."
+                "experience. Memories are extracted from HITL conversations after approval. "
+                "Keep OFF during debugging — only enable when agent quality is stable."
             )
             memory_enabled = gr.Checkbox(
                 label="Long-term memory (agent learns from past HITL sessions)",
@@ -793,6 +819,7 @@ def build_app() -> gr.Blocks:
             hitl_t19 = gr.Checkbox(label="T19 Star Restoration", value=hitl_tools.get("T19_star_restoration", {}).get("enabled", True))
             hitl_t27 = gr.Checkbox(label="T27 Multiscale Sharpening", value=hitl_tools.get("T27_multiscale", {}).get("enabled", False))
 
+        # ── Model & Limits tab ───────────────────────────────────────
         with gr.Tab("Model & Limits"):
             gr.Markdown("### Model")
             llm_model = gr.Dropdown(
@@ -806,13 +833,7 @@ def build_app() -> gr.Blocks:
                 choices=["together", "anthropic", "openai"],
                 value=env_defaults["llm_provider"],
             )
-            llm_temp = gr.Slider(
-                label="Temperature",
-                minimum=0,
-                maximum=1,
-                step=0.1,
-                value=env_defaults["llm_temperature"],
-            )
+            model_info = gr.Markdown(_format_model_info(env_defaults["llm_model"]))
 
             gr.Markdown("### Safety Limits")
             with gr.Row():
@@ -869,99 +890,74 @@ def build_app() -> gr.Blocks:
                 info="Remove analyze_image outputs from completed phases to save context window.",
             )
 
-        # ── Wire events ──────────────────────────────────────────────────
+        # ── Event wiring ─────────────────────────────────────────────
 
-        # Helper to convert remove_stars dropdown to bool | None
-        def _parse_remove_stars(val: str) -> bool | None:
-            if val == "yes":
-                return True
-            elif val == "no":
-                return False
-            return None
+        # Settings applied reactively via .change() — immediate effect
+        autonomous_mode.change(fn=lambda v: set_autonomous(v), inputs=[autonomous_mode])
+        vlm_hitl.change(fn=lambda v: set_vlm_hitl(v), inputs=[vlm_hitl])
+        vlm_present.change(fn=lambda v: set_vlm_autonomous(v), inputs=[vlm_present])
+        memory_enabled.change(fn=_on_memory_toggle, inputs=[memory_enabled])
+        llm_model.change(fn=_format_model_info, inputs=[llm_model], outputs=[model_info])
 
-        # Start session
+        # Start session: apply settings first, then stream
         start_btn.click(
-            fn=lambda *args: start_session(
-                dataset_path=args[0],
-                target_name=args[1],
-                bortle=args[2],
-                sqm=args[3],
-                remove_stars=_parse_remove_stars(args[4]),
-                notes=args[5],
-                pixel_size=args[6],
-                sensor_type=args[7] if args[7] else None,
-                focal_length=args[8],
-                autonomous_mode=args[9],
-                vlm_hitl=args[10],
-                vlm_present=args[11],
-                memory_mode=args[12],
-                llm_model=args[13],
-                llm_provider=args[14],
-                llm_temp=args[15],
-                recursion_limit=int(args[16]),
-                max_tools_phase=int(args[17]),
-                max_consecutive=int(args[18]),
-                max_nudges=int(args[19]),
-                phase_ingest=int(args[20]),
-                phase_calibration=int(args[21]),
-                phase_registration=int(args[22]),
-                phase_analysis=int(args[23]),
-                phase_stacking=int(args[24]),
-                phase_linear=int(args[25]),
-                phase_stretch=int(args[26]),
-                phase_nonlinear=int(args[27]),
-                phase_export=int(args[28]),
-                cleanup_runs=args[29],
-                prune_analysis=args[30],
-                state=args[31],
-            ),
+            fn=_apply_ui_settings,
             inputs=[
-                dataset_path, target_name, bortle_input, sqm_input,
-                remove_stars_input, notes_input,
-                pixel_size, sensor_type, focal_length,
-                autonomous_mode, vlm_hitl, vlm_present, memory_enabled,
-                llm_model, llm_provider, llm_temp,
-                recursion_limit, max_tools_phase,
-                max_consecutive, max_nudges,
+                recursion_limit, max_tools_phase, max_consecutive, max_nudges,
                 phase_ingest, phase_calibration, phase_registration,
                 phase_analysis, phase_stacking, phase_linear,
                 phase_stretch, phase_nonlinear, phase_export,
                 cleanup_runs, prune_analysis,
+                llm_model, llm_provider,
+            ],
+        ).then(
+            fn=start_session,
+            inputs=[
+                dataset_path, target_name, bortle_input, sqm_input,
+                remove_stars_input, notes_input,
+                pixel_size, sensor_type, focal_length,
                 session_state,
             ],
             outputs=[chatbot, activity, gallery, session_state],
         )
 
-        # Send message
-        send_btn.click(
-            fn=send_message,
-            inputs=[msg_input, chatbot, activity, gallery, session_state],
-            outputs=[chatbot, activity, gallery, session_state, msg_input],
-        )
+        # Direct handler binding — no wrappers
         msg_input.submit(
             fn=send_message,
             inputs=[msg_input, chatbot, activity, gallery, session_state],
             outputs=[chatbot, activity, gallery, session_state, msg_input],
         )
 
-        # Approve
         approve_btn.click(
             fn=approve_action,
             inputs=[chatbot, activity, gallery, session_state],
             outputs=[chatbot, activity, gallery, session_state],
         )
 
-        # Resume
         resume_btn.click(
-            fn=lambda rid, chat, act, gal, st: resume_session(rid, chat, act, gal, st),
+            fn=_apply_ui_settings,
+            inputs=[
+                recursion_limit, max_tools_phase, max_consecutive, max_nudges,
+                phase_ingest, phase_calibration, phase_registration,
+                phase_analysis, phase_stacking, phase_linear,
+                phase_stretch, phase_nonlinear, phase_export,
+                cleanup_runs, prune_analysis,
+                llm_model, llm_provider,
+            ],
+        ).then(
+            fn=resume_session,
             inputs=[resume_id, chatbot, activity, gallery, session_state],
             outputs=[chatbot, activity, gallery, session_state],
         )
+
+        # Initialize async resources on app load
+        app.load(fn=_init_async_resources)
 
     return app
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
+
 
 def main():
     logging.basicConfig(
@@ -969,6 +965,7 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
     app = build_app()
+    app.queue()
     app.launch(theme=gr.themes.Soft(primary_hue="blue"))
 
 

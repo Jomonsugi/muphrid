@@ -29,6 +29,7 @@ dependencies = [
     "typer>=0.24.1",
     "sqlite-vec>=0.1.6",
     "ollama>=0.4.0",
+    "aiosqlite>=0.22.1",
 ]
 
 [project.scripts]

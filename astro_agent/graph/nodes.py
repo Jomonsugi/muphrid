@@ -742,7 +742,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     if state.get("active_hitl", False) and messages:
         for msg in reversed(messages):
             if isinstance(msg, AIMessage):
-                _agent_text = text_content(msg.content)[:500]
+                _agent_text = text_content(msg.content)
                 break
 
     # Payload carries raw FITS paths — the presenter (Gradio, CLI)
@@ -938,7 +938,7 @@ def agent_chat(state: AstroState) -> dict[str, Any]:
     if messages:
         last = messages[-1]
         if isinstance(last, AIMessage):
-            agent_text = text_content(last.content)[:500]
+            agent_text = text_content(last.content)
 
     # If the human is actively chatting (active_hitl=True), no nudge limit —
     # they're driving the conversation. Otherwise, count consecutive text-only
@@ -963,6 +963,15 @@ def agent_chat(state: AstroState) -> dict[str, Any]:
                 f"to move to the next phase. "
                 f"Set MAX_AUTONOMOUS_NUDGES in .env to adjust (current: {max_nudges})."
             )
+
+    # Empty text with no active HITL = model pausing between tool calls.
+    # Nudge it forward instead of interrupting the human with nothing.
+    if not agent_text.strip() and not state.get("active_hitl", False):
+        logger.info(f"agent_chat: empty response, nudging agent (phase={phase.value})")
+        return {"messages": [HumanMessage(
+            content=_AUTONOMOUS_NUDGE,
+            additional_kwargs={"is_nudge": True},
+        )]}
 
     if is_autonomous():
         logger.info(f"agent_chat (autonomous): nudging agent to act or advance (phase={phase.value})")

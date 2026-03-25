@@ -51,4 +51,8 @@ manual_pipeline_output/
 
 # Runtime artifacts
 checkpoints.db
+checkpoints.db-shm
+checkpoints.db-wal
+*.db-shm
+*.db-wal
 .claude/
