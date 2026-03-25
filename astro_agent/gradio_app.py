@@ -647,7 +647,14 @@ def build_app() -> gr.Blocks:
     env_defaults = _load_env_defaults()
     hitl_tools = hitl_defaults.get("hitl", {})
 
-    with gr.Blocks(title="AstroAgent") as app:
+    with gr.Blocks(
+        title="AstroAgent",
+        css="""
+            .gradio-container { max-width: 100% !important; padding: 0 0.5rem !important; margin: 0 !important; }
+            .main { max-width: 100% !important; }
+            .contain { max-width: 100% !important; }
+        """,
+    ) as app:
         session_state = gr.State({
             "thread_id": None,
             "config": None,
