@@ -54,14 +54,14 @@ def section(title):
 section("Imports and @tool decoration")
 
 try:
-    from astro_agent.tools.utility.t20_analyze import analyze_image
+    from muphrid.tools.utility.t20_analyze import analyze_image
     check("T20 analyze_image imports", True)
 except Exception as e:
     check("T20 analyze_image imports", False, str(e))
     analyze_image = None
 
 try:
-    from astro_agent.tools.utility.t21_plate_solve import plate_solve, build_platesolve_cmd
+    from muphrid.tools.utility.t21_plate_solve import plate_solve, build_platesolve_cmd
     check("T21 plate_solve imports", True)
 except Exception as e:
     check("T21 plate_solve imports", False, str(e))
@@ -69,21 +69,21 @@ except Exception as e:
     build_platesolve_cmd = None
 
 try:
-    from astro_agent.tools.utility.t22_generate_preview import generate_preview
+    from muphrid.tools.utility.t22_generate_preview import generate_preview
     check("T22 generate_preview imports", True)
 except Exception as e:
     check("T22 generate_preview imports", False, str(e))
     generate_preview = None
 
 try:
-    from astro_agent.tools.utility.t23_pixel_math import pixel_math, _validate_and_broadcast as _validate_stems
+    from muphrid.tools.utility.t23_pixel_math import pixel_math, _validate_and_broadcast as _validate_stems
     check("T23 pixel_math imports", True)
 except Exception as e:
     check("T23 pixel_math imports", False, str(e))
     pixel_math = None
 
 try:
-    from astro_agent.tools.utility.t24_export import export_final, VALID_PROFILES
+    from muphrid.tools.utility.t24_export import export_final, VALID_PROFILES
     check("T24 export_final imports", True)
 except Exception as e:
     check("T24 export_final imports", False, str(e))
@@ -91,22 +91,22 @@ except Exception as e:
     VALID_PROFILES = set()
 
 try:
-    from astro_agent.tools.scikit.t25_create_mask import create_mask, _build_binary_mask, _load_channels
-    from astro_agent.tools.scikit.t25_create_mask import LuminanceOptions, RangeOptions, ChannelDiffOptions
+    from muphrid.tools.scikit.t25_create_mask import create_mask, _build_binary_mask, _load_channels
+    from muphrid.tools.scikit.t25_create_mask import LuminanceOptions, RangeOptions, ChannelDiffOptions
     check("T25 create_mask imports", True)
 except Exception as e:
     check("T25 create_mask imports", False, str(e))
     create_mask = None
 
 try:
-    from astro_agent.tools.scikit.t26_reduce_stars import reduce_stars
+    from muphrid.tools.scikit.t26_reduce_stars import reduce_stars
     check("T26 reduce_stars imports", True)
 except Exception as e:
     check("T26 reduce_stars imports", False, str(e))
     reduce_stars = None
 
 try:
-    from astro_agent.tools.scikit.t27_multiscale import (
+    from muphrid.tools.scikit.t27_multiscale import (
         multiscale_process, b3_atrous_decompose, b3_atrous_reconstruct,
         _soft_threshold, _apply_operation, ScaleOperation,
     )
@@ -285,7 +285,7 @@ check("denoise operation runs without error", denoised.shape == detail_test.shap
 
 # Verify T27 source code does NOT use pywt with 'b3'
 if multiscale_process is not None:
-    import astro_agent.tools.scikit.t27_multiscale as t27_module
+    import muphrid.tools.scikit.t27_multiscale as t27_module
     src = inspect.getsource(t27_module)
     check("T27: pywt.swt2 NOT called with 'b3'",
           "swt2" not in src or ("swt2" in src and "'b3'" not in src))
@@ -324,7 +324,7 @@ if generate_preview is not None:
 # ── T09: subsky syntax fix ─────────────────────────────────────────────────────
 section("T09 remove_gradient — subsky syntax fixes")
 
-import astro_agent.tools.linear.t09_gradient as t09_module
+import muphrid.tools.linear.t09_gradient as t09_module
 
 t09_src = inspect.getsource(t09_module)
 
@@ -346,7 +346,7 @@ check("T09: old positional polynomial syntax removed",
 # ── T10: limitmag and bgtol ───────────────────────────────────────────────────
 section("T10 color_calibrate — limitmag and bgtol")
 
-import astro_agent.tools.linear.t10_color_calibrate as t10_module
+import muphrid.tools.linear.t10_color_calibrate as t10_module
 
 t10_src = inspect.getsource(t10_module)
 check("T10: limitmag parameter in source",
@@ -361,7 +361,7 @@ check("T10: -limitmag= flag in PCC/SPCC builder",
 # ── T12: VST and nocosmetic ───────────────────────────────────────────────────
 section("T12 noise_reduction — vst and nocosmetic flags")
 
-import astro_agent.tools.linear.t12_noise_reduction as t12_module
+import muphrid.tools.linear.t12_noise_reduction as t12_module
 
 t12_src = inspect.getsource(t12_module)
 check("T12: use_vst field in SirilDenoiseOptions",
@@ -378,7 +378,7 @@ check("T12: VST only applies to standard method",
 # ── T13: makepsf manual and rl improvements ───────────────────────────────────
 section("T13 deconvolution — makepsf manual, rl -stop=, -fh")
 
-import astro_agent.tools.linear.t13_deconvolution as t13_module
+import muphrid.tools.linear.t13_deconvolution as t13_module
 
 t13_src = inspect.getsource(t13_module)
 check("T13: ManualPsfOptions class defined",
@@ -399,7 +399,7 @@ check("T13: makepsf stars NOT using -auto",
       "makepsf -auto" not in t13_src)
 
 # Verify manual Moffat command builds correctly
-from astro_agent.tools.linear.t13_deconvolution import ManualPsfOptions, PsfConfig, _build_makepsf_manual
+from muphrid.tools.linear.t13_deconvolution import ManualPsfOptions, PsfConfig, _build_makepsf_manual
 
 mo = ManualPsfOptions(profile="moffat", fwhm_px=2.5, moffat_beta=4.0)
 psf_cmd = _build_makepsf_manual(mo, PsfConfig())
@@ -423,7 +423,7 @@ check("T13: makepsf manual airy command builds",
 # ── T17: edge_preserve (epf) ─────────────────────────────────────────────────
 section("T17 local_contrast_enhance — edge_preserve (epf) method")
 
-import astro_agent.tools.nonlinear.t17_local_contrast as t17_module
+import muphrid.tools.nonlinear.t17_local_contrast as t17_module
 
 t17_src = inspect.getsource(t17_module)
 check("T17: EpfOptions class defined",
@@ -442,7 +442,7 @@ check("T17: -mod= blend strength flag",
       "-mod=" in t17_src)
 
 # Simulate epf command build
-from astro_agent.tools.nonlinear.t17_local_contrast import EpfOptions
+from muphrid.tools.nonlinear.t17_local_contrast import EpfOptions
 
 o = EpfOptions(guided=False, diameter=5, intensity_sigma=0.02, spatial_sigma=0.02, mod=0.8)
 epf_cmd = "epf"
@@ -459,7 +459,7 @@ check("T17: bilateral epf command builds correctly",
 section("T28 extract_narrowband — import and structure")
 
 try:
-    from astro_agent.tools.utility.t28_extract_narrowband import extract_narrowband as t28_tool
+    from muphrid.tools.utility.t28_extract_narrowband import extract_narrowband as t28_tool
     from langchain_core.tools import BaseTool
     check("T28 extract_narrowband imports", True)
     check("T28 is @tool decorated (BaseTool instance)",
@@ -469,7 +469,7 @@ except Exception as e:
     t28_tool = None
 
 if t28_tool is not None:
-    import astro_agent.tools.utility.t28_extract_narrowband as t28_module
+    import muphrid.tools.utility.t28_extract_narrowband as t28_module
     t28_src = inspect.getsource(t28_module)
     check("T28: extract_Ha command in source", "extract_Ha" in t28_src)
     check("T28: extract_HaOIII command in source", "extract_HaOIII" in t28_src)
@@ -484,7 +484,7 @@ if t28_tool is not None:
 # ── check_dependencies ────────────────────────────────────────────────────────
 section("check_dependencies()")
 try:
-    from astro_agent.config import check_dependencies
+    from muphrid.config import check_dependencies
     check_dependencies()
     check("check_dependencies() passes", True)
 except SystemExit as e:

@@ -26,7 +26,7 @@ os.chdir(project_root)
 
 from dotenv import load_dotenv
 load_dotenv(project_root / ".env")
-load_dotenv(project_root / "astro_agent" / ".env")
+load_dotenv(project_root / "muphrid" / ".env")
 
 _failures: list[str] = []
 
@@ -48,14 +48,14 @@ print("Phase 2 Verification\n" + "=" * 40)
 print("\nPhase 2 \u2014 Tool imports")
 
 tools_to_check = [
-    ("T01 ingest_dataset",     "astro_agent.tools.preprocess.t01_ingest",        "ingest_dataset"),
-    ("T02 build_masters",      "astro_agent.tools.preprocess.t02_masters",       "build_masters"),
-    ("T03 calibrate",          "astro_agent.tools.preprocess.t03_calibrate",     "calibrate"),
-    ("T04 siril_register",     "astro_agent.tools.preprocess.t04_register",      "siril_register"),
-    ("T05 analyze_frames",     "astro_agent.tools.preprocess.t05_analyze_frames","analyze_frames"),
-    ("T06 select_frames",      "astro_agent.tools.preprocess.t06_select_frames", "select_frames"),
-    ("T07 siril_stack",        "astro_agent.tools.preprocess.t07_stack",         "siril_stack"),
-    ("T08 auto_crop",          "astro_agent.tools.preprocess.t08_crop",          "auto_crop"),
+    ("T01 ingest_dataset",     "muphrid.tools.preprocess.t01_ingest",        "ingest_dataset"),
+    ("T02 build_masters",      "muphrid.tools.preprocess.t02_masters",       "build_masters"),
+    ("T03 calibrate",          "muphrid.tools.preprocess.t03_calibrate",     "calibrate"),
+    ("T04 siril_register",     "muphrid.tools.preprocess.t04_register",      "siril_register"),
+    ("T05 analyze_frames",     "muphrid.tools.preprocess.t05_analyze_frames","analyze_frames"),
+    ("T06 select_frames",      "muphrid.tools.preprocess.t06_select_frames", "select_frames"),
+    ("T07 siril_stack",        "muphrid.tools.preprocess.t07_stack",         "siril_stack"),
+    ("T08 auto_crop",          "muphrid.tools.preprocess.t08_crop",          "auto_crop"),
 ]
 
 imported_tools = {}
@@ -95,7 +95,7 @@ else:
     check("test_images directory exists", True, str(test_images))
 
     try:
-        from astro_agent.tools.preprocess.t01_ingest import ingest_dataset
+        from muphrid.tools.preprocess.t01_ingest import ingest_dataset
         result = ingest_dataset.invoke({
             "root_directory": str(test_images),
             "override_target_name": "Test Target",
@@ -130,7 +130,7 @@ else:
 print("\nPhase 2 \u2014 T06 select_frames logic")
 
 try:
-    from astro_agent.tools.preprocess.t06_select_frames import select_frames
+    from muphrid.tools.preprocess.t06_select_frames import select_frames
 
     # Build synthetic frame metrics — 10 good frames + 2 bad
     frame_metrics: dict = {}
@@ -187,7 +187,7 @@ except Exception as e:
 print("\nPhase 2 \u2014 check_dependencies (includes ExifTool)")
 
 try:
-    from astro_agent.config import load_settings, check_dependencies
+    from muphrid.config import load_settings, check_dependencies
     settings = load_settings()
     check_dependencies(settings)
     check("check_dependencies() passes", True, "ExifTool detected")

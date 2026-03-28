@@ -1,5 +1,5 @@
 """
-Math integrity regression checks for AstroAgent tools.
+Math integrity regression checks for Muphrid tools.
 
 Purpose:
 - Catch numerical/logic bugs in pure-Python math paths early.
@@ -19,28 +19,28 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
-from astro_agent.tools.preprocess.t05_analyze_frames import _compute_summary
-from astro_agent.tools.preprocess.t06_select_frames import (
+from muphrid.tools.preprocess.t05_analyze_frames import _compute_summary
+from muphrid.tools.preprocess.t06_select_frames import (
     SelectionCriteria,
     _select_frames,
     _sigma_threshold,
     select_frames,
 )
-from astro_agent.tools.preprocess.t08_crop import _find_crop_bounds
-from astro_agent.tools.scikit.t25_create_mask import _build_binary_mask, _load_channels
-from astro_agent.tools.scikit.t25_create_mask import (
+from muphrid.tools.preprocess.t08_crop import _find_crop_bounds
+from muphrid.tools.scikit.t25_create_mask import _build_binary_mask, _load_channels
+from muphrid.tools.scikit.t25_create_mask import (
     ChannelDiffOptions,
     LuminanceOptions,
     RangeOptions,
 )
-from astro_agent.tools.scikit.t26_reduce_stars import _compute_luminance, reduce_stars
-from astro_agent.tools.scikit.t27_multiscale import (
+from muphrid.tools.scikit.t26_reduce_stars import _compute_luminance, reduce_stars
+from muphrid.tools.scikit.t27_multiscale import (
     b3_atrous_decompose,
     b3_atrous_reconstruct,
     _soft_threshold,
     multiscale_process,
 )
-from astro_agent.tools.utility.t20_analyze import (
+from muphrid.tools.utility.t20_analyze import (
     _background_channel_medians,
     _clipping,
     _color_saturation,
@@ -333,7 +333,7 @@ def test_t20_load_fits_nan_replacement(tmp_dir: Path) -> None:
 
 
 def test_t20_nan_input_sanitized(tmp_dir: Path) -> None:
-    from astro_agent.tools.utility.t20_analyze import analyze_image
+    from muphrid.tools.utility.t20_analyze import analyze_image
 
     data = np.random.rand(3, 64, 64).astype(np.float32)
     data[0, 0, 0] = np.nan
@@ -455,7 +455,7 @@ def test_t25_range_mask() -> None:
 
 def test_t25_inversion_logic(tmp_dir: Path) -> None:
     """After inversion, 0→1 and 1→0."""
-    from astro_agent.tools.scikit.t25_create_mask import create_mask
+    from muphrid.tools.scikit.t25_create_mask import create_mask
 
     # Create an image that is half bright, half dark
     data = np.zeros((3, 32, 32), dtype=np.float32)

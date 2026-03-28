@@ -313,7 +313,7 @@ langmem treats the **system prompt itself** as a memory type. The prompt optimiz
 analyzes conversation trajectories (especially failures) and generates refined
 prompt instructions.
 
-### How it could work for AstroAgent
+### How it could work for Muphrid
 After N sessions, analyze patterns in failures table:
 - "The agent consistently uses too-conservative stretch parameters on first attempt"
 - "The agent forgets to check clipping after stretch"
@@ -370,12 +370,12 @@ As the memory system grows, you'll want to inspect what's stored:
 
 ### CLI commands
 ```
-astro-agent memory stats        # count by type, source, phase
-astro-agent memory search "..."  # test search from command line
-astro-agent memory list          # recent memories with metadata
-astro-agent memory inspect 42    # full detail of a specific memory
-astro-agent memory invalidate 42 # manually mark a memory invalid
-astro-agent memory export        # dump to JSON for analysis
+muphrid memory stats        # count by type, source, phase
+muphrid memory search "..."  # test search from command line
+muphrid memory list          # recent memories with metadata
+muphrid memory inspect 42    # full detail of a specific memory
+muphrid memory invalidate 42 # manually mark a memory invalid
+muphrid memory export        # dump to JSON for analysis
 ```
 
 ### Gradio tab
@@ -418,7 +418,7 @@ If adding columns to existing tables in future versions:
 - Consider a `schema_version` table for tracking
 
 ### Data portability
-The memory store is a single SQLite file (`~/.astro_agent/memory.db`). It can be:
+The memory store is a single SQLite file (`~/.muphrid/memory.db`). It can be:
 - Copied between machines
 - Backed up trivially
 - Shared with other users (their agent benefits from your HITL teaching)

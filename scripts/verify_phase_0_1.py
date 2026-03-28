@@ -21,7 +21,7 @@ os.chdir(project_root)
 from dotenv import load_dotenv
 
 load_dotenv(project_root / ".env")
-load_dotenv(project_root / "astro_agent" / ".env")  # fallback if stored in package
+load_dotenv(project_root / "muphrid" / ".env")  # fallback if stored in package
 
 _failures: list[str] = []
 
@@ -43,7 +43,7 @@ print("Phase 0+1 Verification\n" + "=" * 40)
 print("\nPhase 0 \u2014 Config")
 
 try:
-    from astro_agent.config import load_settings, check_dependencies, PROFILE_DEFAULTS, make_llm
+    from muphrid.config import load_settings, check_dependencies, PROFILE_DEFAULTS, make_llm
     check("imports (config module)", True)
 except Exception as e:
     check("imports (config module)", False, str(e))
@@ -97,7 +97,7 @@ if settings is not None:
 print("\nPhase 0 \u2014 Siril engine")
 
 try:
-    from astro_agent.tools._siril import (
+    from muphrid.tools._siril import (
         run_siril_script,
         build_script,
         SirilResult,
@@ -140,7 +140,7 @@ else:
 print("\nPhase 1 \u2014 State schemas")
 
 try:
-    from astro_agent.graph.state import (
+    from muphrid.graph.state import (
         AstroState,
         PathState,
         MasterPaths,

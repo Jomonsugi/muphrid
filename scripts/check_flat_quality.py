@@ -45,9 +45,9 @@ os.chdir(project_root)
 from dotenv import load_dotenv
 
 load_dotenv(project_root / ".env")
-load_dotenv(project_root / "astro_agent" / ".env")
+load_dotenv(project_root / "muphrid" / ".env")
 
-from astro_agent.tools._sensor import (
+from muphrid.tools._sensor import (
     TARGET_FILL_CENTER,
     TARGET_FILL_MAX,
     TARGET_FILL_MIN,
@@ -58,8 +58,8 @@ from astro_agent.tools._sensor import (
     infer_white_level,
     read_frame_exif,
 )
-from astro_agent.tools._siril import run_siril_script
-from astro_agent.tools.preprocess.t02_masters import build_masters
+from muphrid.tools._siril import run_siril_script
+from muphrid.tools.preprocess.t02_masters import build_masters
 
 
 RAW_EXTS = {".raf", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2", ".pef"}

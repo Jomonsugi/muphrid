@@ -1,6 +1,6 @@
-# AstroAgent
+# Muphrid
 
-LLM-powered autonomous astrophotography post-processing. Point it at a dataset of
+Muphrid Astro Agent — LLM-powered autonomous astrophotography post-processing. Point it at a dataset of
 raw frames, tell it the target and sky conditions, and it handles calibration,
 stacking, stretching, and enhancement — pausing at key decision points (stretch,
 curves, star restoration) for your review.
@@ -9,16 +9,16 @@ curves, star restoration) for your review.
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/your-username/astro-agent.git
-cd astro-agent
-pip install uv          # if you don't have uv
+git clone https://github.com/Jomonsugi/muphrid.git
+cd muphrid
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if you don't have uv
 uv sync
 
 # 2. Configure
 cp .env.example .env    # then edit — see "Setup" below
 
 # 3. Launch
-uv run python -m astro_agent
+uv run python -m muphrid
 ```
 
 Enter your dataset path and target name in the UI, click **Start Processing**.
@@ -31,7 +31,7 @@ Requires **Python 3.12+** and [uv](https://docs.astral.sh/uv/) for dependency ma
 
 ### System binaries
 
-Install these before running. AstroAgent checks for them at startup and will
+Install these before running. Muphrid checks for them at startup and will
 tell you exactly what's missing and how to fix it.
 
 | Tool | Install | Notes |
@@ -79,6 +79,7 @@ the corresponding key:
 | Model | Provider | Key |
 |-------|----------|-----|
 | moonshotai/Kimi-K2.5 (default) | Together AI | `TOGETHER_API_KEY` |
+| deepseek-ai/DeepSeek-V3 | Together AI | `TOGETHER_API_KEY` |
 | claude-sonnet-4-20250514 | Anthropic | `ANTHROPIC_API_KEY` |
 | gpt-4o | OpenAI | `OPENAI_API_KEY` |
 
@@ -100,7 +101,7 @@ modified — all outputs go to a `runs/<session-id>/` folder.
 ### Gradio (recommended)
 
 ```bash
-uv run python -m astro_agent
+uv run python -m muphrid
 ```
 
 The UI has four tabs:
@@ -117,7 +118,7 @@ Resume a previous session by entering the thread ID in the Resume section.
 ### CLI
 
 ```bash
-astro-agent process /path/to/dataset --target "M42 Orion Nebula" --bortle 5
+muphrid process /path/to/dataset --target "M42 Orion Nebula" --bortle 5
 ```
 
 | Flag | Description |
@@ -169,7 +170,7 @@ embedding_model = "qwen3-embedding" # must match your provider
 
 **Ollama** — external service, large models, best quality. Requires
 [Ollama](https://ollama.com) installed and the model pulled
-(`ollama pull qwen3-embedding`). AstroAgent auto-starts the service if needed.
+(`ollama pull qwen3-embedding`). Muphrid auto-starts the service if needed.
 
 **FastEmbed** — in-process ONNX inference, no external service. Lighter models,
 downloaded automatically on first use. Good alternative if you don't want to
@@ -181,7 +182,7 @@ vector index: set `rebuild_embeddings = true` in `processing.toml` (or pass
 
 ## Troubleshooting
 
-AstroAgent validates all dependencies at startup. If something is missing,
+Muphrid validates all dependencies at startup. If something is missing,
 the error message tells you exactly what to install and how.
 
 | Error | Fix |

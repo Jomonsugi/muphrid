@@ -28,33 +28,33 @@ os.chdir(project_root)
 from dotenv import load_dotenv
 
 load_dotenv(project_root / ".env")
-load_dotenv(project_root / "astro_agent" / ".env")
+load_dotenv(project_root / "muphrid" / ".env")
 
-from astro_agent.tools.linear.t09_gradient import remove_gradient
-from astro_agent.tools.linear.t10_color_calibrate import color_calibrate
-from astro_agent.tools.linear.t11_green_noise import remove_green_noise
-from astro_agent.tools.linear.t12_noise_reduction import noise_reduction
-from astro_agent.tools.linear.t13_deconvolution import deconvolution
-from astro_agent.tools.nonlinear.t14_stretch import stretch_image
-from astro_agent.tools.nonlinear.t15_star_removal import star_removal
-from astro_agent.tools.nonlinear.t16_curves import curves_adjust
-from astro_agent.tools.nonlinear.t17_local_contrast import local_contrast_enhance
-from astro_agent.tools.nonlinear.t18_saturation import saturation_adjust
-from astro_agent.tools.nonlinear.t19_star_restoration import star_restoration
-from astro_agent.tools.preprocess.t01_ingest import ingest_dataset
-from astro_agent.tools.preprocess.t02_masters import build_masters
-from astro_agent.tools.preprocess.t02b_convert_sequence import convert_sequence
-from astro_agent.tools.preprocess.t03_calibrate import calibrate
-from astro_agent.tools.preprocess.t04_register import siril_register
-from astro_agent.tools.preprocess.t05_analyze_frames import analyze_frames
-from astro_agent.tools.preprocess.t06_select_frames import select_frames
-from astro_agent.tools.preprocess.t07_stack import siril_stack
-from astro_agent.tools.preprocess.t08_crop import auto_crop
-from astro_agent.tools.scikit.t25_create_mask import create_mask
-from astro_agent.tools.scikit.t27_multiscale import multiscale_process
-from astro_agent.tools.utility.t23_pixel_math import pixel_math
-from astro_agent.tools.utility.t24_export import export_final
-from astro_agent.tools.utility.t29_resolve_target import resolve_target
+from muphrid.tools.linear.t09_gradient import remove_gradient
+from muphrid.tools.linear.t10_color_calibrate import color_calibrate
+from muphrid.tools.linear.t11_green_noise import remove_green_noise
+from muphrid.tools.linear.t12_noise_reduction import noise_reduction
+from muphrid.tools.linear.t13_deconvolution import deconvolution
+from muphrid.tools.nonlinear.t14_stretch import stretch_image
+from muphrid.tools.nonlinear.t15_star_removal import star_removal
+from muphrid.tools.nonlinear.t16_curves import curves_adjust
+from muphrid.tools.nonlinear.t17_local_contrast import local_contrast_enhance
+from muphrid.tools.nonlinear.t18_saturation import saturation_adjust
+from muphrid.tools.nonlinear.t19_star_restoration import star_restoration
+from muphrid.tools.preprocess.t01_ingest import ingest_dataset
+from muphrid.tools.preprocess.t02_masters import build_masters
+from muphrid.tools.preprocess.t02b_convert_sequence import convert_sequence
+from muphrid.tools.preprocess.t03_calibrate import calibrate
+from muphrid.tools.preprocess.t04_register import siril_register
+from muphrid.tools.preprocess.t05_analyze_frames import analyze_frames
+from muphrid.tools.preprocess.t06_select_frames import select_frames
+from muphrid.tools.preprocess.t07_stack import siril_stack
+from muphrid.tools.preprocess.t08_crop import auto_crop
+from muphrid.tools.scikit.t25_create_mask import create_mask
+from muphrid.tools.scikit.t27_multiscale import multiscale_process
+from muphrid.tools.utility.t23_pixel_math import pixel_math
+from muphrid.tools.utility.t24_export import export_final
+from muphrid.tools.utility.t29_resolve_target import resolve_target
 
 
 def _step(name: str, fn, **kwargs):

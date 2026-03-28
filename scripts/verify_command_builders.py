@@ -40,7 +40,7 @@ def section(title: str) -> None:
 # ── T07 siril_stack — rejection command structure ─────────────────────────────
 section("T07 siril_stack — command string verification")
 
-from astro_agent.tools.preprocess.t07_stack import (
+from muphrid.tools.preprocess.t07_stack import (
     _REJECTION_ALGO_MAP,
     _STACK_TYPE_MAP,
     _REJECTION_STACK_TYPES,
@@ -96,7 +96,7 @@ check("T07 uses -32b (not -32bit)", "-32bit" not in built_cmd and "-32b" in buil
 # ── T11 remove_green_noise — rmgreen command string ───────────────────────────
 section("T11 remove_green_noise — rmgreen command")
 
-import astro_agent.tools.linear.t11_green_noise as t11_mod
+import muphrid.tools.linear.t11_green_noise as t11_mod
 import inspect
 
 t11_src = inspect.getsource(t11_mod)
@@ -128,7 +128,7 @@ check("T11 source: rmgreen command does not include amount",
 # ── T14 stretch_image — GHS color model flag ─────────────────────────────────
 section("T14 stretch_image — GHS color model flags")
 
-from astro_agent.tools.nonlinear.t14_stretch import (
+from muphrid.tools.nonlinear.t14_stretch import (
     _build_ghs_cmd,
     GHSOptions,
     _build_asinh_cmd,
@@ -195,7 +195,7 @@ check("T14 autostretch no -linked when linked=False",
 # ── T16 curves_adjust — MTF and GHT command strings ──────────────────────────
 section("T16 curves_adjust — command string verification")
 
-from astro_agent.tools.nonlinear.t16_curves import (
+from muphrid.tools.nonlinear.t16_curves import (
     _build_mtf_cmd,
     MTFOptions,
     _build_ght_curves_cmd,
@@ -226,7 +226,7 @@ section("T18 saturation_adjust — command string verification")
 
 # The satu command is built inline in the tool function — verify it
 # by examining the source code conditional logic
-import astro_agent.tools.nonlinear.t18_saturation as t18_mod
+import muphrid.tools.nonlinear.t18_saturation as t18_mod
 
 t18_src = inspect.getsource(t18_mod)
 
@@ -242,7 +242,7 @@ check("T18 method guard: ght_saturation requires opts",
 # ── T19 star_restoration — pixel math expression ─────────────────────────────
 section("T19 star_restoration — pixel math expression")
 
-import astro_agent.tools.nonlinear.t19_star_restoration as t19_mod
+import muphrid.tools.nonlinear.t19_star_restoration as t19_mod
 
 t19_src = inspect.getsource(t19_mod)
 
@@ -270,11 +270,11 @@ check("T19 pm expression: dollar-sign stem notation correct",
 # ── T09 subsky command strings ────────────────────────────────────────────────
 section("T09 remove_gradient — subsky command strings")
 
-from astro_agent.tools.linear.t09_gradient import _run_siril_subsky, SirilSubskyOptions
+from muphrid.tools.linear.t09_gradient import _run_siril_subsky, SirilSubskyOptions
 
 # We can't call _run_siril_subsky (it needs files), but verify the command
 # string construction via the source code + a functional simulation
-import astro_agent.tools.linear.t09_gradient as t09_mod
+import muphrid.tools.linear.t09_gradient as t09_mod
 
 t09_src = inspect.getsource(t09_mod)
 
@@ -324,7 +324,7 @@ check("T09 RBF with dither: -dither present",
 # ── T10 color_calibrate — PCC/SPCC with limitmag and bgtol ───────────────────
 section("T10 color_calibrate — PCC/SPCC command strings")
 
-from astro_agent.tools.linear.t10_color_calibrate import (
+from muphrid.tools.linear.t10_color_calibrate import (
     _build_pcc_cmd,
     _build_spcc_cmd,
     SpccOptions,
@@ -376,7 +376,7 @@ check("T10 SPCC mono: -rfilter= present",
       "-rfilter=" in spcc_mono_cmd, got=spcc_mono_cmd)
 
 # SPCC narrowband
-from astro_agent.tools.linear.t10_color_calibrate import SpccNarrowbandOptions
+from muphrid.tools.linear.t10_color_calibrate import SpccNarrowbandOptions
 opts_nb = SpccOptions(
     narrowband=SpccNarrowbandOptions(r_wavelength=656.3, r_bandwidth=7.0, g_wavelength=500.7, g_bandwidth=3.0, b_wavelength=486.1, b_bandwidth=3.0),
 )
@@ -389,7 +389,7 @@ check("T10 SPCC narrowband: -rwl= present",
 # ── T12 noise_reduction — denoise command flags ───────────────────────────────
 section("T12 noise_reduction — denoise command flags")
 
-from astro_agent.tools.linear.t12_noise_reduction import SirilDenoiseOptions
+from muphrid.tools.linear.t12_noise_reduction import SirilDenoiseOptions
 
 # Simulate the denoise command building
 def _build_denoise_cmd(opts: SirilDenoiseOptions) -> str:
@@ -439,7 +439,7 @@ check("T12 independent_channels=True → -indep added",
 # ── T13 deconvolution — makepsf + rl command strings ─────────────────────────
 section("T13 deconvolution — makepsf and rl command strings")
 
-from astro_agent.tools.linear.t13_deconvolution import (
+from muphrid.tools.linear.t13_deconvolution import (
     ManualPsfOptions,
     StarsPsfOptions,
     BlindPsfOptions,
@@ -522,7 +522,7 @@ check("T13 wiener -loadpsf= present",
 # ── T17 local_contrast_enhance — epf command ─────────────────────────────────
 section("T17 local_contrast_enhance — epf command string")
 
-from astro_agent.tools.nonlinear.t17_local_contrast import EpfOptions
+from muphrid.tools.nonlinear.t17_local_contrast import EpfOptions
 
 # Bilateral filter (default) — uses -si= and -ss=
 o = EpfOptions(guided=False, diameter=5, intensity_sigma=0.02, spatial_sigma=0.02, mod=0.8)

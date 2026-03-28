@@ -34,7 +34,7 @@ def main():
 
     # ── Step 1: Ingest ──
     print(f"\n--- INGEST ---")
-    from astro_agent.tools.preprocess.t01_ingest import ingest_dataset
+    from muphrid.tools.preprocess.t01_ingest import ingest_dataset
     ingest_result = ingest_dataset.invoke({
         "root_directory": str(dataset_path),
         "thread_id": "test-pipeline",
@@ -54,7 +54,7 @@ def main():
     print(f"  ✓ Ingest OK")
 
     # Build state
-    from astro_agent.graph.state import make_empty_state
+    from muphrid.graph.state import make_empty_state
     session = {
         "target_name": args.target,
         "bortle": args.bortle,
@@ -68,7 +68,7 @@ def main():
 
     # ── Step 2: Convert sequence ──
     print(f"\n--- CONVERT SEQUENCE ---")
-    from astro_agent.tools.preprocess.t02b_convert_sequence import _convert_to_sequence
+    from muphrid.tools.preprocess.t02b_convert_sequence import _convert_to_sequence
     try:
         conv_result = _convert_to_sequence(
             working_dir=working_dir,
@@ -87,7 +87,7 @@ def main():
 
     # ── Step 3: Calibrate ──
     print(f"\n--- CALIBRATE ---")
-    from astro_agent.tools._siril import run_siril_script
+    from muphrid.tools._siril import run_siril_script
 
     sensor_type = meta.get("sensor_type", "bayer")
     is_xtrans = sensor_type == "xtrans"
@@ -152,7 +152,7 @@ def main():
 
     # ── Step 6: Analyze ──
     print(f"\n--- ANALYZE IMAGE ---")
-    from astro_agent.tools.utility.t20_analyze import (
+    from muphrid.tools.utility.t20_analyze import (
         _load_fits_float32, _trim_zero_borders, _background_estimate,
         _robust_stats, _detect_stars_full,
     )

@@ -1,6 +1,6 @@
 # Long-Term Memory System: Research & Design
 
-This document covers the research behind AstroAgent's long-term memory system — what
+This document covers the research behind Muphrid's long-term memory system — what
 existing solutions were studied, what lessons were extracted, and how those lessons
 shaped the implementation. It serves as both a reference for the design decisions
 and a survey of the agent memory landscape as of early 2026.
@@ -35,7 +35,7 @@ and a survey of the agent memory landscape as of early 2026.
 
 ## The Problem
 
-AstroAgent processes raw telescope data into final astrophotography images through a
+Muphrid processes raw telescope data into final astrophotography images through a
 multi-phase pipeline (calibration, registration, stacking, linear processing, stretching,
 non-linear processing, export). Each run takes hours. The agent uses 29 tools across 5
 phase gates, with human-in-the-loop (HITL) checkpoints for subjective decisions.
@@ -518,7 +518,7 @@ SHA256(text + model) cache key with LRU eviction.
              └─────────────────┼───────────────────┘
                                ▼
                     ┌─────────────────────────┐
-                    │   ~/.astro_agent/       │
+                    │   ~/.muphrid/       │
                     │     memory.db           │
                     │  SQLite + sqlite-vec    │
                     │  + FTS5                 │
@@ -640,21 +640,21 @@ The following are designed into the schema but not implemented in v1:
 
 | File | Purpose |
 |------|---------|
-| `astro_agent/memory/__init__.py` | Package init with architecture overview |
-| `astro_agent/memory/store.py` | `MemoryStore` — SQLite + sqlite-vec + FTS5, RRF hybrid search, temporal validity |
-| `astro_agent/memory/embeddings.py` | `OllamaEmbedder` — Qwen3-Embedding via Ollama with SHA256 cache |
-| `astro_agent/memory/extraction.py` | `extract_hitl_memory()` — LLM extraction with Pydantic schemas |
-| `astro_agent/tools/utility/t33_memory_search.py` | Agent-facing `memory_search` tool |
+| `muphrid/memory/__init__.py` | Package init with architecture overview |
+| `muphrid/memory/store.py` | `MemoryStore` — SQLite + sqlite-vec + FTS5, RRF hybrid search, temporal validity |
+| `muphrid/memory/embeddings.py` | `OllamaEmbedder` — Qwen3-Embedding via Ollama with SHA256 cache |
+| `muphrid/memory/extraction.py` | `extract_hitl_memory()` — LLM extraction with Pydantic schemas |
+| `muphrid/tools/utility/t33_memory_search.py` | Agent-facing `memory_search` tool |
 
 ### Modified files
 
 | File | Change |
 |------|--------|
-| `astro_agent/config.py` | Added `memory_enabled`, `memory_db_path`, `memory_embedding_model` to Settings |
-| `astro_agent/graph/hitl.py` | Added `set_memory_enabled()` / `is_memory_enabled()` runtime flag |
-| `astro_agent/graph/registry.py` | Added `register_memory_tool()` for conditional tool registration |
-| `astro_agent/graph/nodes.py` | Added `_extract_hitl_memories()` — fires after every HITL approval |
-| `astro_agent/graph/prompts.py` | Added Long-Term Memory guidance section to system prompt |
-| `astro_agent/gradio_app.py` | Added memory checkbox in HITL Config tab |
-| `astro_agent/cli.py` | Added `--memory` flag |
+| `muphrid/config.py` | Added `memory_enabled`, `memory_db_path`, `memory_embedding_model` to Settings |
+| `muphrid/graph/hitl.py` | Added `set_memory_enabled()` / `is_memory_enabled()` runtime flag |
+| `muphrid/graph/registry.py` | Added `register_memory_tool()` for conditional tool registration |
+| `muphrid/graph/nodes.py` | Added `_extract_hitl_memories()` — fires after every HITL approval |
+| `muphrid/graph/prompts.py` | Added Long-Term Memory guidance section to system prompt |
+| `muphrid/gradio_app.py` | Added memory checkbox in HITL Config tab |
+| `muphrid/cli.py` | Added `--memory` flag |
 | `pyproject.toml` | Added `sqlite-vec` and `ollama` dependencies |

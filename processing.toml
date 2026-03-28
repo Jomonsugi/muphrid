@@ -70,7 +70,7 @@ prune_phase_analysis = true
 
 [memory]
 enabled = false
-db_path = "~/.astro_agent/memory.db"
+db_path = "~/.muphrid/memory.db"
 
 # Embedding provider: "ollama" (external service, large models) or "fastembed" (in-process, ONNX)
 # This is a one-time choice — changing provider or model requires rebuilding the vector index.
@@ -98,4 +98,4 @@ embedding_model = "qwen3-embedding"
 
 [tracing]
 enabled = false
-project = "astro-agent"
+project = "muphrid"

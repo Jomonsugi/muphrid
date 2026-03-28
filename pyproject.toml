@@ -1,5 +1,5 @@
 [project]
-name = "astro-agent"
+name = "muphrid"
 version = "0.1.0"
 description = "LLM agent for autonomous astrophotography post-processing"
 readme = "README.md"
@@ -34,7 +34,7 @@ dependencies = [
 ]
 
 [project.scripts]
-astro-agent = "astro_agent.cli:app"
+muphrid = "muphrid.cli:app"
 
 [build-system]
 requires = ["hatchling"]

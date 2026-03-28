@@ -43,7 +43,7 @@ def fail(msg: str) -> None:
 print("\n── 1. Tool imports ──────────────────────────────────────────────────────")
 
 try:
-    from astro_agent.tools.nonlinear.t14_stretch import (
+    from muphrid.tools.nonlinear.t14_stretch import (
         stretch_image, GHSOptions, AsinhOptions, AutostretchOptions,
         _build_ghs_cmd, _build_asinh_cmd, _build_autostretch_cmd,
     )
@@ -52,7 +52,7 @@ except Exception as e:
     fail(f"T14 import failed: {e}")
 
 try:
-    from astro_agent.tools.nonlinear.t15_star_removal import (
+    from muphrid.tools.nonlinear.t15_star_removal import (
         star_removal, StarRemovalInput,
     )
     ok("T15 star_removal imports")
@@ -60,7 +60,7 @@ except Exception as e:
     fail(f"T15 import failed: {e}")
 
 try:
-    from astro_agent.tools.nonlinear.t16_curves import (
+    from muphrid.tools.nonlinear.t16_curves import (
         curves_adjust, MTFOptions, GHTCurvesOptions,
         _build_mtf_cmd, _build_ght_curves_cmd,
     )
@@ -69,7 +69,7 @@ except Exception as e:
     fail(f"T16 import failed: {e}")
 
 try:
-    from astro_agent.tools.nonlinear.t17_local_contrast import (
+    from muphrid.tools.nonlinear.t17_local_contrast import (
         local_contrast_enhance, WaveletOptions, ClaheOptions, UnsharpOptions,
     )
     ok("T17 local_contrast_enhance imports")
@@ -77,7 +77,7 @@ except Exception as e:
     fail(f"T17 import failed: {e}")
 
 try:
-    from astro_agent.tools.nonlinear.t18_saturation import (
+    from muphrid.tools.nonlinear.t18_saturation import (
         saturation_adjust, GHTSatOptions, HUE_RANGE_DESCRIPTIONS,
     )
     ok("T18 saturation_adjust imports")
@@ -85,7 +85,7 @@ except Exception as e:
     fail(f"T18 import failed: {e}")
 
 try:
-    from astro_agent.tools.nonlinear.t19_star_restoration import (
+    from muphrid.tools.nonlinear.t19_star_restoration import (
         star_restoration, BlendOptions, SynthstarOptions,
     )
     ok("T19 star_restoration imports")
@@ -171,7 +171,7 @@ except Exception as e:
 print("\n── 4. T15 StarNet binary ─────────────────────────────────────────────────")
 
 try:
-    from astro_agent.config import load_settings
+    from muphrid.config import load_settings
     settings = load_settings()
     starnet_path = Path(settings.starnet_bin)
     weights_path = Path(settings.starnet_weights)
@@ -308,7 +308,7 @@ print("\n── 9. T11 rmgreen / T13 makepsf fixes ─────────�
 
 try:
     import inspect
-    from astro_agent.tools.linear.t11_green_noise import remove_green_noise
+    from muphrid.tools.linear.t11_green_noise import remove_green_noise
     src = inspect.getsource(remove_green_noise.func)
     assert "rmgreen" in src
     assert "nopreserve" in src
@@ -318,7 +318,7 @@ except Exception as e:
     fail(f"T11 rmgreen fix check failed: {e}")
 
 try:
-    from astro_agent.tools.linear.t13_deconvolution import deconvolution
+    from muphrid.tools.linear.t13_deconvolution import deconvolution
     src = inspect.getsource(deconvolution.func)
     assert '"makepsf stars"' in src or "'makepsf stars'" in src, "makepsf stars not found in source"
     assert "makepsf -auto" not in src, "old makepsf -auto still present"
@@ -332,7 +332,7 @@ except Exception as e:
 print("\n── 10. check_dependencies() ─────────────────────────────────────────────")
 
 try:
-    from astro_agent.config import check_dependencies
+    from muphrid.config import check_dependencies
     check_dependencies(settings)
     ok("check_dependencies() passed")
 except Exception as e:

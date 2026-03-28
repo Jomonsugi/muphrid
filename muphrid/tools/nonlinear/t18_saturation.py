@@ -1,0 +1,237 @@
+"""
+T18 — saturation_adjust
+
+Enhance or reduce color saturation, with optional targeting of specific hue
+ranges and background noise protection.
+
+Backend: Siril CLI — `satu` (saturation with background protection and hue
+targeting) or `ght -sat` (GHT applied to the HSL saturation channel for
+midtone-focused saturation boost).
+
+Apply to the starless image to prevent star color bloat. Use background_factor
+to protect noise in the dark sky from being color-amplified. For emission
+nebulae, target specific hue indices separately (Ha = 0, OIII = 3).
+
+Apply in small increments — multiple passes with moderate amounts produce
+better results than one large boost.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Annotated
+
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
+from pydantic import BaseModel, Field
+
+from muphrid.graph.state import AstroState
+from muphrid.tools._siril import fits_nlayers, run_siril_script
+
+
+# Hue range index reference (documented for agent and user)
+# 0 = pink-orange (Hα emission, pinkish reds)
+# 1 = orange-yellow
+# 2 = yellow-cyan
+# 3 = cyan (OIII emission, blue-green)
+# 4 = cyan-magenta
+# 5 = magenta-pink
+# 6 = all channels (default)
+
+HUE_RANGE_DESCRIPTIONS = {
+    0: "pink-orange (Hα emission reds)",
+    1: "orange-yellow",
+    2: "yellow-cyan",
+    3: "cyan (OIII emission blue-green)",
+    4: "cyan-magenta",
+    5: "magenta-pink",
+    6: "all hue ranges (global)",
+}
+
+
+class GHTSatOptions(BaseModel):
+    stretch_amount: float = Field(
+        description=(
+            "D: stretch strength applied to the saturation channel (0–10). "
+            "Use small values (0.3–1.5) for post-stretch saturation boost. "
+            "Higher values risk over-saturation and neon artefacts."
+        ),
+    )
+    local_intensity: float = Field(
+        default=0.0,
+        description=(
+            "B: focus the saturation boost around the symmetry point. "
+            "0 = standard exponential. Higher (5–10) = targets mid-saturation "
+            "pixels, protects already-saturated colors."
+        ),
+    )
+    symmetry_point: float = Field(
+        default=0.5,
+        description=(
+            "SP: saturation value (0–1) at which the boost is most intense. "
+            "0.5 targets mid-saturation pixels — good default. "
+            "Lower SP for images with mostly unsaturated colors."
+        ),
+    )
+    clip_mode: str = Field(
+        default="rgbblend",
+        description=(
+            "How out-of-range values are handled. "
+            "'clip', 'rescale', 'rgbblend' (default), 'globalrescale'."
+        ),
+    )
+
+
+class SaturationAdjustInput(BaseModel):
+    method: str = Field(
+        description=(
+            "Choose based on target type — there is no universal default:\n"
+            "  global: uniform saturation across all hues. Correct for broadband "
+            "galaxy and star cluster images where all channels should be boosted equally.\n"
+            "  hue_targeted: boost a specific hue range only (set hue_target). "
+            "Required for emission nebulae — use hue_target=0 for Hα, hue_target=3 "
+            "for OIII. Global boost on emission nebulae amplifies background color noise.\n"
+            "  ght_saturation: GHT on the HSL saturation channel — targets "
+            "mid-saturation pixels, protects already-saturated stars. Good when the "
+            "background is marginally saturated and global would over-amplify it."
+        ),
+    )
+    amount: float = Field(
+        description=(
+            "Saturation adjustment multiplier. Must be chosen from the current "
+            "image's saturation state — there is no universally safe value.\n"
+            "> 0: increase saturation. < 0: decrease. 0: no change.\n"
+            "Typical range: 0.3–1.0. Apply in steps of 0.3–0.5 and iterate. "
+            "Check analyze_image saturation statistics before choosing. "
+            "For a first pass on a well-calibrated stack: 0.3–0.5. "
+            "For a noisy or high-ISO image: 0.2–0.3 maximum."
+        ),
+    )
+    background_factor: float = Field(
+        default=1.5,
+        description=(
+            "Background protection threshold factor. "
+            "Pixels below (median + background_factor * sigma) are not saturated. "
+            "Protects background noise from color amplification. "
+            "1.5 is a good default. 0 = disable protection (not recommended). "
+            "Increase to 2.0–3.0 for noisy images."
+        ),
+    )
+    hue_target: int | None = Field(
+        default=None,
+        description=(
+            "Hue range index for targeted saturation (only used in hue_targeted mode). "
+            "0=pink-orange (Hα), 1=orange-yellow, 2=yellow-cyan, "
+            "3=cyan (OIII), 4=cyan-magenta, 5=magenta-pink, 6=all (same as global)."
+        ),
+    )
+    ght_sat_options: GHTSatOptions | None = Field(
+        default=None,
+        description="GHT saturation parameters. Required when method=ght_saturation.",
+    )
+
+
+# ── LangChain tool ─────────────────────────────────────────────────────────────
+
+@tool(args_schema=SaturationAdjustInput)
+def saturation_adjust(
+    method: str,
+    amount: float,
+    background_factor: float = 1.5,
+    hue_target: int | None = None,
+    ght_sat_options: GHTSatOptions | None = None,
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
+    """
+    Adjust color saturation of the non-linear image.
+
+    Emission nebula targeting:
+    - For Hα (reds): method=hue_targeted, hue_target=0
+    - For OIII (blue-green): method=hue_targeted, hue_target=3
+
+    GHT saturation (ght_saturation) is recommended over global for images
+    where the sky background is already marginally saturated — it targets
+    mid-saturation pixels and avoids over-saturating already vivid colors.
+
+    Always use background_factor > 0 to protect sky background noise from
+    being color-boosted into a colorful noise pattern.
+    """
+    working_dir = state["dataset"]["working_dir"]
+    image_path = state["paths"]["current_image"]
+
+    img_path = Path(image_path)
+    if not img_path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    if fits_nlayers(img_path) < 3:
+        raise ValueError(
+            f"saturation_adjust requires a color (3-channel RGB) image, but "
+            f"{img_path.name} is monochrome. "
+            "Saturation adjustment has no effect on mono images. "
+            "Trace back to T15 star_removal — if the starless image is mono, "
+            "StarNet received a mono or 8-bit input. Ensure T14 stretch output "
+            "is RGB and that T15 uses savetif16 for the TIF conversion."
+        )
+
+    if method == "ght_saturation" and ght_sat_options is None:
+        raise ValueError(
+            "ght_sat_options.stretch_amount is required for method=ght_saturation."
+        )
+
+    stem = img_path.stem
+    output_stem = f"{stem}_satu"
+
+    if method == "ght_saturation":
+        opts = ght_sat_options  # type: ignore[assignment]
+        cmd = f"ght -sat -D={opts.stretch_amount}"
+        if opts.local_intensity != 0.0:
+            cmd += f" -B={opts.local_intensity}"
+        if opts.symmetry_point != 0.5:
+            cmd += f" -SP={opts.symmetry_point}"
+        if opts.clip_mode != "rgbblend":
+            cmd += f" -clipmode={opts.clip_mode}"
+    elif method == "hue_targeted" and hue_target is not None:
+        cmd = f"satu {amount} {background_factor} {hue_target}"
+    else:
+        cmd = f"satu {amount} {background_factor}"
+
+    commands = [
+        f"load {stem}",
+        cmd,
+        f"save {output_stem}",
+    ]
+    run_siril_script(commands, working_dir=working_dir, timeout=60)
+
+    output_path = Path(working_dir) / f"{output_stem}.fit"
+    if not output_path.exists():
+        output_path = Path(working_dir) / f"{output_stem}.fits"
+    if not output_path.exists():
+        raise FileNotFoundError(f"saturation_adjust did not produce: {output_path}")
+
+    summary: dict = {
+        "output_path": str(output_path),
+        "method": method,
+        "amount": amount,
+        "background_factor": background_factor,
+        "siril_command": cmd,
+    }
+    if method == "hue_targeted" and hue_target is not None:
+        summary["hue_target"] = hue_target
+        summary["hue_target_description"] = HUE_RANGE_DESCRIPTIONS.get(hue_target, "unknown")
+    if method == "ght_saturation" and ght_sat_options is not None:
+        summary["ght_sat_parameters"] = {
+            "stretch_amount": ght_sat_options.stretch_amount,
+            "local_intensity": ght_sat_options.local_intensity,
+            "symmetry_point": ght_sat_options.symmetry_point,
+            "clip_mode": ght_sat_options.clip_mode,
+        }
+
+    return Command(update={
+        "paths": {**state["paths"], "current_image": str(output_path)},
+        "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
+    })

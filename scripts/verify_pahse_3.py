@@ -42,7 +42,7 @@ def fail(msg: str) -> None:
 print("\n── 1. Tool imports ──────────────────────────────────────────────────────")
 
 try:
-    from astro_agent.tools.linear.t09_gradient import (
+    from muphrid.tools.linear.t09_gradient import (
         remove_gradient,
         GraXpertBGEOptions,
         SirilSubskyOptions,
@@ -53,18 +53,18 @@ except Exception as e:
     fail(f"T09 import failed: {e}")
 
 try:
-    from astro_agent.tools.linear.t10_color_calibrate import (
+    from muphrid.tools.linear.t10_color_calibrate import (
         color_calibrate,
         ColorCalibrateInput,
         resolve_pixel_size,
     )
-    from astro_agent.equipment import load_equipment
+    from muphrid.equipment import load_equipment
     ok("T10 color_calibrate imports")
 except Exception as e:
     fail(f"T10 import failed: {e}")
 
 try:
-    from astro_agent.tools.linear.t11_green_noise import (
+    from muphrid.tools.linear.t11_green_noise import (
         remove_green_noise,
         RemoveGreenNoiseInput,
     )
@@ -73,7 +73,7 @@ except Exception as e:
     fail(f"T11 import failed: {e}")
 
 try:
-    from astro_agent.tools.linear.t12_noise_reduction import (
+    from muphrid.tools.linear.t12_noise_reduction import (
         noise_reduction,
         SirilDenoiseOptions,
         GraXpertDenoiseOptions,
@@ -84,7 +84,7 @@ except Exception as e:
     fail(f"T12 import failed: {e}")
 
 try:
-    from astro_agent.tools.linear.t13_deconvolution import (
+    from muphrid.tools.linear.t13_deconvolution import (
         deconvolution,
         RLOptions,
         WienerOptions,
@@ -249,7 +249,7 @@ except Exception as e:
 print("\n── 7. check_dependencies() ──────────────────────────────────────────────")
 
 try:
-    from astro_agent.config import check_dependencies, load_settings
+    from muphrid.config import check_dependencies, load_settings
     settings = load_settings()
     check_dependencies(settings)
     ok("check_dependencies() passed — all binaries and weights found")
