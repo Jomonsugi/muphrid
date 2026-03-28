@@ -1,0 +1,101 @@
+# Processing pipeline configuration
+#
+# Project-level settings for model selection, safety limits, behavior,
+# memory, and tracing. This file is version-controllable (not secrets).
+#
+# Secrets (API keys) and machine-specific paths (binary locations) stay
+# in .env or shell environment (~/.zshrc).
+#
+# Values here can be overridden via environment variables (same key names
+# as before, e.g. LLM_MODEL, RECURSION_LIMIT). The Gradio app overrides
+# these at runtime via the UI.
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Per-model defaults (temperature, thinking, provider) are configured in
+# _MODEL_DEFAULTS in config.py. This just selects which model to use.
+
+[model]
+default = "moonshotai/Kimi-K2.5"
+
+# ── Safety limits ─────────────────────────────────────────────────────────────
+# These prevent runaway tool loops and excessive resource usage.
+
+[limits]
+# Max LangGraph node transitions per stream() call (~4 per tool call)
+# 50 ≈ 12 tool calls, 100 ≈ 25 tool calls, 200 ≈ 50 tool calls
+recursion_limit = 100
+
+# Global default for per-phase tool call limits (0 = disabled)
+max_tools_per_phase = 30
+
+# Hard fail if agent calls the same tool N times in a row (0 = disabled)
+max_consecutive_same_tool = 3
+
+# Max consecutive text-only responses before failing
+max_autonomous_nudges = 2
+
+# ── Per-phase tool limits ─────────────────────────────────────────────────────
+# Override the global default for specific phases. 0 = use global default.
+#
+# Preprocessing phases have strict tool gating (few tools per phase), so these
+# are safety nets against loops, not workflow tuning. Post-preprocessing phases
+# (linear, stretch, nonlinear) legitimately need higher limits for iteration.
+
+[limits.per_phase]
+ingest = 5           # safety net — only resolve_target + advance_phase
+calibration = 10     # 3 masters + convert + calibrate + possible retries
+registration = 5     # safety net — single tool (siril_register)
+analysis = 5         # safety net — single tool (analyze_frames)
+stacking = 10        # select + stack + crop + iteration loop
+linear = 20          # gradient, color, denoise, decon + iteration
+stretch = 25         # variant creation + analysis per variant
+nonlinear = 25       # fluid experimentation with checkpoints
+export = 5           # safety net — single tool (export_final)
+
+# ── Behavior ──────────────────────────────────────────────────────────────────
+
+[behavior]
+# Delete previous run folders (runs/*) when starting a new session.
+# Each run writes ALL outputs to runs/<thread_id>/ — raw files are never touched.
+cleanup_previous_runs = true
+
+# Remove analyze_image/analyze_frames outputs from completed phases to save
+# context window. The model's reasoning captures the conclusions; raw JSON is
+# dead weight after a phase ends. Full data stays in state.
+prune_phase_analysis = true
+
+# ── Long-term memory ──────────────────────────────────────────────────────────
+# Off by default. Enable when the agent is producing quality results and you
+# want it to learn from HITL sessions.
+
+[memory]
+enabled = false
+db_path = "~/.astro_agent/memory.db"
+
+# Embedding provider: "ollama" (external service, large models) or "fastembed" (in-process, ONNX)
+# This is a one-time choice — changing provider or model requires rebuilding the vector index.
+embedding_provider = "ollama"
+
+# Embedding model name. Must be valid for the chosen provider.
+# Changing the model requires rebuilding the vector index.
+#
+# Ollama models (run `ollama list` to see available):
+#   - qwen3-embedding (4096 dims, 8B params, best quality, requires ~5GB)
+#
+# FastEmbed models (downloaded automatically on first use):
+#   - snowflake/snowflake-arctic-embed-l (1024 dims, best quality for fastembed, ~1GB)
+#   - BAAI/bge-small-en-v1.5 (384 dims, lightweight, ~67MB)
+#   - nomic-ai/nomic-embed-text-v1.5 (768 dims, good balance, ~137MB)
+#
+embedding_model = "qwen3-embedding"
+
+# Set to true ONCE after changing embedding_provider or embedding_model.
+# This drops and rebuilds the vector index. Remove after one successful run.
+# rebuild_embeddings = false
+
+# ── LangSmith tracing ────────────────────────────────────────────────────────
+# Requires LANGCHAIN_API_KEY in shell environment or .env.
+
+[tracing]
+enabled = false
+project = "astro-agent"

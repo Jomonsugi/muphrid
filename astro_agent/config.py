@@ -30,19 +30,55 @@ class DependencyError(RuntimeError):
     """Raised when a required external binary or library is missing or outdated."""
 
 
+# ── processing.toml loader ────────────────────────────────────────────────────
+
+_PROCESSING_CFG: dict = {}
+
+
+def _load_processing_config() -> dict:
+    """Load processing.toml if it exists. Called once at module load."""
+    global _PROCESSING_CFG
+    if _PROCESSING_CFG:
+        return _PROCESSING_CFG
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore[no-reuse-def]
+
+    cfg_path = Path(__file__).resolve().parent.parent / "processing.toml"
+    if cfg_path.exists():
+        with open(cfg_path, "rb") as f:
+            _PROCESSING_CFG = tomllib.load(f)
+    return _PROCESSING_CFG
+
+
+_load_processing_config()
+
+
+def _pcfg(section: str, key: str, default=None):
+    """Read a value from processing.toml with dotted section path."""
+    parts = section.split(".")
+    d = _PROCESSING_CFG
+    for p in parts:
+        d = d.get(p, {})
+    return d.get(key, default)
+
+
 # ── Environment helpers ────────────────────────────────────────────────────────
 
 def _require(key: str) -> str:
+    """Require from env (secrets + machine paths only)."""
     value = os.environ.get(key, "").strip()
     if not value:
         raise ConfigError(
             f"Required environment variable '{key}' is not set. "
-            f"Copy .env.example → .env and fill in the missing value."
+            f"Set it in .env or your shell environment (~/.zshrc)."
         )
     return value
 
 
 def _optional(key: str, default: str = "") -> str:
+    """Read from env, falling back to default."""
     return os.environ.get(key, default).strip()
 
 
@@ -76,7 +112,9 @@ class Settings:
     # Long-term memory
     memory_enabled: bool
     memory_db_path: str
+    memory_embedding_provider: str  # "ollama" | "fastembed"
     memory_embedding_model: str
+    memory_rebuild_embeddings: bool  # one-shot flag for model migration
 
 
 # ── Per-model defaults ─────────────────────────────────────────────────────────
@@ -87,44 +125,57 @@ _MODEL_DEFAULTS: dict[str, dict] = {
     # Kimi K2.5: thinking mode enabled by default, fixed temp 1.0
     # Instant mode: temp 0.6. Any other temp value errors.
     "moonshotai/Kimi-K2.5": {
+        "provider": "together",
         "temperature": None,        # don't send — model uses fixed 1.0 (thinking) or 0.6 (instant)
         "thinking": True,
         "thinking_budget": 0,       # not applicable for Kimi
     },
     # Claude Sonnet: extended thinking requires temp 1.0
     "claude-sonnet-4-6": {
+        "provider": "anthropic",
         "temperature": 1.0,         # required for extended thinking
         "thinking": True,
         "thinking_budget": 10000,
     },
-    # DeepSeek V3: no thinking mode, temp 0 for deterministic tool calling
-    "deepseek-ai/DeepSeek-V3": {
+    # DeepSeek V3.1: no thinking mode, temp 0 for deterministic tool calling
+    "deepseek-ai/DeepSeek-V3.1": {
+        "provider": "together",
         "temperature": 0.0,
         "thinking": False,
         "thinking_budget": 0,
     },
 }
 
-_FALLBACK_DEFAULTS = {
-    "temperature": 0.0,
-    "thinking": False,
-    "thinking_budget": 0,
-}
-
-
 def _get_model_defaults(model: str) -> dict:
-    """Return the correct defaults for a given model."""
-    # Check exact match first, then prefix match
+    """Return the correct defaults for a given model.
+
+    Raises ConfigError if the model is not in _MODEL_DEFAULTS.
+    Users must add their model to the config — no silent fallbacks.
+    """
     if model in _MODEL_DEFAULTS:
         return _MODEL_DEFAULTS[model]
     for key, defaults in _MODEL_DEFAULTS.items():
         if key in model or model in key:
             return defaults
-    return _FALLBACK_DEFAULTS
+    raise ConfigError(
+        f"Model '{model}' is not configured in _MODEL_DEFAULTS. "
+        f"Add it to astro_agent/config.py with provider, temperature, "
+        f"thinking, and thinking_budget settings. "
+        f"Available models: {', '.join(_MODEL_DEFAULTS.keys())}"
+    )
 
 
 def load_settings() -> Settings:
-    provider = _optional("LLM_PROVIDER", "together").lower()
+    # Priority: os.environ (if set) > processing.toml > hardcoded default
+    # This lets env vars override TOML for backwards compat and CI/testing.
+
+    # Model: env var overrides processing.toml
+    model = _optional("LLM_MODEL", "") or _pcfg("model", "default", "moonshotai/Kimi-K2.5")
+
+    # Provider derived from model config
+    model_defaults = _get_model_defaults(model)
+    provider_override = _optional("LLM_PROVIDER", "")
+    provider = provider_override.lower() if provider_override else model_defaults["provider"]
 
     if provider == "together":
         together_key = _require("TOGETHER_API_KEY")
@@ -135,25 +186,27 @@ def load_settings() -> Settings:
     elif provider == "openai":
         together_key = _optional("TOGETHER_API_KEY")
         anthropic_key = _optional("ANTHROPIC_API_KEY")
-        _require("OPENAI_API_KEY")  # validate it exists; stored in env for openai SDK
+        _require("OPENAI_API_KEY")
     else:
         raise ConfigError(
-            f"LLM_PROVIDER '{provider}' is not valid. "
+            f"LLM_PROVIDER '{provider}' (from model '{model}') is not valid. "
             "Choose: together | anthropic | openai"
         )
 
-    model = _optional("LLM_MODEL", "moonshotai/Kimi-K2.5")
-
-    # Per-model defaults: temperature and thinking mode
-    # Kimi K2.5: fixed temp 1.0 in thinking mode, 0.6 instant. Don't override.
-    # Sonnet: extended thinking requires temp 1.0. Without thinking, 0 is best.
-    # DeepSeek V3: no thinking mode, temp 0 for deterministic tool calling.
-    model_defaults = _get_model_defaults(model)
+    # Per-model defaults for temperature and thinking mode
     temp_str = _optional("LLM_TEMPERATURE", "")
     temperature = float(temp_str) if temp_str else model_defaults["temperature"]
     thinking_str = _optional("LLM_THINKING", "")
     thinking = thinking_str.lower() == "true" if thinking_str else model_defaults["thinking"]
     thinking_budget = int(_optional("LLM_THINKING_BUDGET", str(model_defaults["thinking_budget"])))
+
+    # Tracing
+    tracing_env = _optional("LANGCHAIN_TRACING_V2", "")
+    tracing = tracing_env.lower() == "true" if tracing_env else _pcfg("tracing", "enabled", False)
+
+    # Memory
+    memory_env = _optional("MEMORY_ENABLED", "")
+    memory_enabled = memory_env.lower() == "true" if memory_env else _pcfg("memory", "enabled", False)
 
     return Settings(
         llm_provider=provider,
@@ -168,13 +221,21 @@ def load_settings() -> Settings:
         starnet_bin=_require("STARNET_BIN"),
         starnet_weights=_require("STARNET_WEIGHTS"),
         pixel_size_um=float(v) if (v := _optional("PIXEL_SIZE_UM")) else None,
-        langchain_tracing=_optional("LANGCHAIN_TRACING_V2", "false").lower() == "true",
+        langchain_tracing=tracing,
         langchain_api_key=_optional("LANGCHAIN_API_KEY"),
-        langchain_project=_optional("LANGCHAIN_PROJECT", "astro-agent"),
-        # Long-term memory (off by default — enable when agent quality is stable)
-        memory_enabled=_optional("MEMORY_ENABLED", "false").lower() == "true",
-        memory_db_path=_optional("MEMORY_DB_PATH", str(Path.home() / ".astro_agent" / "memory.db")),
-        memory_embedding_model=_optional("MEMORY_EMBEDDING_MODEL", "qwen3-embedding"),
+        langchain_project=_optional("LANGCHAIN_PROJECT", "") or _pcfg("tracing", "project", "astro-agent"),
+        memory_enabled=memory_enabled,
+        memory_db_path=_optional("MEMORY_DB_PATH", "") or _pcfg("memory", "db_path", str(Path.home() / ".astro_agent" / "memory.db")),
+        memory_embedding_provider=(
+            _optional("MEMORY_EMBEDDING_PROVIDER", "")
+            or _pcfg("memory", "embedding_provider", "ollama")
+        ),
+        memory_embedding_model=_optional("MEMORY_EMBEDDING_MODEL", "") or _pcfg("memory", "embedding_model", "qwen3-embedding"),
+        memory_rebuild_embeddings=(
+            _optional("MEMORY_REBUILD_EMBEDDINGS", "").lower() == "true"
+            if _optional("MEMORY_REBUILD_EMBEDDINGS", "")
+            else _pcfg("memory", "rebuild_embeddings", False)
+        ),
     )
 
 
@@ -235,7 +296,10 @@ def configure_siril_for_equipment() -> str:
     with open(equipment_path, "rb") as f:
         equipment = tomllib.load(f)
 
-    sensor_type = equipment.get("camera", {}).get("sensor_type", "").lower()
+    # UI override takes priority over equipment.toml
+    sensor_type = os.environ.get("SENSOR_TYPE_OVERRIDE", "").lower()
+    if not sensor_type:
+        sensor_type = equipment.get("camera", {}).get("sensor_type", "").lower()
     # sensor_type may be empty when equipment.toml is minimal (e.g. ZWO FITS
     # where sensor_type is detected from file headers, not equipment.toml).
     # Default to 1 xtrans pass (correct for Bayer and mono).

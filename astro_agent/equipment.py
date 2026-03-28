@@ -2,17 +2,20 @@
 Equipment configuration loader.
 
 Reads equipment.toml from the project root and provides equipment data to
-any tool that needs it. This replaces the hardcoded camera lookup table
-that was in T10.
+any tool that needs it. These values are hints — if the data provides a
+more accurate value (FITS headers, plate solve), the data wins.
 
 Resolution order for pixel_size_um:
-  1. Explicit argument passed to the tool
-  2. equipment.toml [camera] pixel_size_um
-  3. PIXEL_SIZE_UM environment variable (backward compat)
+  1. Explicit argument passed to the tool (e.g. from FITS headers)
+  2. PIXEL_SIZE_UM environment variable (from Gradio UI override)
+  3. equipment.toml [camera] pixel_size_um
+  → Hard fail if none provides a value
 
 Resolution order for focal_length_mm:
-  1. Explicit argument passed to the tool
-  2. equipment.toml [optics] focal_length_mm
+  1. Explicit argument passed to the tool (e.g. from plate solve)
+  2. FOCAL_LENGTH_MM environment variable (from Gradio UI override)
+  3. equipment.toml [optics] focal_length_mm
+  → Returns None if unavailable (hard fail at point of use)
 """
 
 from __future__ import annotations
@@ -73,18 +76,13 @@ def get_location() -> dict[str, Any]:
 def resolve_pixel_size(explicit_value: float | None = None) -> float:
     """
     Resolve pixel size in microns.
-      1. Explicit value (from tool argument)
-      2. equipment.toml [camera] pixel_size_um
-      3. PIXEL_SIZE_UM env var
+      1. Explicit value (from tool argument / FITS headers — data wins)
+      2. PIXEL_SIZE_UM env var (from Gradio UI)
+      3. equipment.toml [camera] pixel_size_um
     Raises ValueError if none can provide a value.
     """
     if explicit_value is not None and explicit_value > 0:
         return explicit_value
-
-    camera = get_camera()
-    config_val = camera.get("pixel_size_um")
-    if config_val is not None and config_val > 0:
-        return float(config_val)
 
     env_val = os.environ.get("PIXEL_SIZE_UM", "").strip()
     if env_val:
@@ -93,23 +91,35 @@ def resolve_pixel_size(explicit_value: float | None = None) -> float:
         except ValueError:
             pass
 
+    camera = get_camera()
+    config_val = camera.get("pixel_size_um")
+    if config_val is not None and config_val > 0:
+        return float(config_val)
+
     raise ValueError(
-        "Cannot resolve pixel_size_um. Options:\n"
-        "  1. Pass pixel_size_um explicitly to the tool.\n"
-        "  2. Set pixel_size_um in equipment.toml [camera].\n"
-        "  3. Set PIXEL_SIZE_UM in .env."
+        "Pixel size could not be determined from file metadata and was not "
+        "provided. Please set it in the Equipment tab (Gradio) or in "
+        "equipment.toml [camera] pixel_size_um."
     )
 
 
 def resolve_focal_length(explicit_value: float | None = None) -> float | None:
     """
     Resolve focal length in mm.
-      1. Explicit value (from tool argument)
-      2. equipment.toml [optics] focal_length_mm
-    Returns None if unavailable (some tools require it, others don't).
+      1. Explicit value (from tool argument / plate solve — data wins)
+      2. FOCAL_LENGTH_MM env var (from Gradio UI)
+      3. equipment.toml [optics] focal_length_mm
+    Returns None if unavailable (hard fail at point of use in tools).
     """
     if explicit_value is not None and explicit_value > 0:
         return explicit_value
+
+    env_val = os.environ.get("FOCAL_LENGTH_MM", "").strip()
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            pass
 
     optics = get_optics()
     config_val = optics.get("focal_length_mm")

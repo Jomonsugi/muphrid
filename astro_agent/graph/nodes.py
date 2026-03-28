@@ -699,54 +699,84 @@ def _find_active_hitl_tool(messages: list) -> tuple[str | None, str | None]:
 
 def hitl_check(state: AstroState) -> dict[str, Any]:
     """
-    Policy enforcement node — fires interrupt() when appropriate.
+    Two-pass HITL checkpoint node.
 
-    Two entry paths:
-    1. After action node: checks if the tool just executed is in hitl_config.toml
-    2. After agent chat response during active HITL: re-fires interrupt() so
-       the human can continue the conversation (ask more questions, approve, etc.)
+    Pass 1 (tool just executed): Detects HITL-triggering tool, sets active_hitl,
+    injects a prompt telling the agent to analyze and present results. Does NOT
+    interrupt — lets the agent see the tool result and produce analysis first.
+
+    Pass 2 (agent has analyzed): Fires interrupt() with the agent's analysis,
+    images, and context. Human reviews, gives feedback, or approves.
+
+    Re-run (agent re-executed HITL tool during active HITL after feedback):
+    Passes through so agent can analyze the new result, then fires interrupt
+    on the next text response.
     """
     messages = state.get("messages", [])
+    active_hitl = state.get("active_hitl", False)
     hitl_key, tool_name = resolve_hitl_checkpoint(messages)
+    last = messages[-1] if messages else None
 
+    # ── No HITL tool found in recent messages ────────────────────────
     if hitl_key is None:
-        if not state.get("active_hitl", False):
-            # No HITL mapping and no active conversation — pass through
-            return {}
-        # Active HITL but the agent just called a non-HITL tool (e.g.
-        # analyze_image to gather data for its response). Let it pass
-        # through so the agent sees the result and can reason about it.
-        # The interrupt will re-fire when the agent responds with text
-        # (via route_after_agent → hitl_check when active_hitl=True and
-        # no tool_calls).
-        last = messages[-1] if messages else None
+        if not active_hitl:
+            return {}  # no HITL mapping, no active conversation — pass through
+
+        # Active HITL: agent called a non-HITL tool (analyze_image, present_images)
+        # Let it pass through so the agent sees the result.
         if isinstance(last, ToolMessage) and last.name not in TOOL_TO_HITL:
             return {}
 
-        # Agent responded with text (no tool call) — re-fire interrupt
-        # so the human can see the response and continue the conversation.
+        # Agent responded with text — find the original HITL trigger
         hitl_key, tool_name = _find_active_hitl_tool(messages)
         if hitl_key is None:
             return {"active_hitl": False}
 
-    # HITL disabled for this tool (or autonomous mode) — pass through
+    # ── HITL disabled for this tool (or autonomous mode) ─────────────
     if not is_enabled(hitl_key):
         return {}
 
-    # Fire HITL interrupt
+    # ── HITL tool just executed — pass through for agent analysis ────
+    # The agent hasn't seen the result yet. Let it analyze before we
+    # fire the interrupt. This applies both to initial triggers AND
+    # re-runs during active HITL (agent adjusted params after feedback).
+    if isinstance(last, ToolMessage) and last.name in TOOL_TO_HITL:
+        if not active_hitl:
+            # Initial trigger — inject analysis prompt
+            logger.info(f"HITL triggered for {tool_name} — routing to agent for analysis")
+            return {
+                "active_hitl": True,
+                "messages": [HumanMessage(
+                    content=(
+                        f"HITL review triggered for {tool_name}. A human is now "
+                        f"reviewing your work on this step.\n\n"
+                        f"Analyze the result — what do the metrics show? What changed?\n"
+                        f"Call present_images to show the current image.\n"
+                        f"Share your assessment: what worked, what trade-offs you see.\n"
+                        f"The human will give feedback or approve.\n\n"
+                        f"If they give feedback, interpret it in terms of tool parameters, "
+                        f"re-run the tool, and present the updated result with a comparison "
+                        f"of what changed."
+                    ),
+                    additional_kwargs={"is_hitl_prompt": True},
+                )],
+            }
+        else:
+            # Re-run during active HITL — let agent analyze new result
+            logger.info(f"HITL tool {tool_name} re-executed — letting agent analyze new result")
+            return {}
+
+    # ── Agent has analyzed — fire interrupt ──────────────────────────
     cfg = tool_cfg(hitl_key)
     image_paths = images_from_tool(messages, tool_name)
 
-    # Extract agent's latest text for multi-turn HITL display
+    # Extract agent's analysis text (latest AIMessage)
     _agent_text = ""
-    if state.get("active_hitl", False) and messages:
-        for msg in reversed(messages):
-            if isinstance(msg, AIMessage):
-                _agent_text = text_content(msg.content)
-                break
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            _agent_text = text_content(msg.content)
+            break
 
-    # Payload carries raw FITS paths — the presenter (Gradio, CLI)
-    # handles conversion to displayable formats.
     payload = HITLPayload(
         type=cfg["type"],
         title=cfg["title"],
@@ -757,8 +787,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     )
 
     # VLM during HITL: inject base64 preview images so the agent can see
-    # what it's discussing. Collects images from the HITL-triggering tool
-    # and any present_images calls during the conversation.
+    # what it's discussing with the human.
     vlm_messages: list = []
     if vlm_hitl():
         working_dir = state.get("dataset", {}).get("working_dir", "")
@@ -777,15 +806,11 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     response_text = str(response)
 
     if is_affirmative(response_text):
-        # Human approved — HITL conversation is over.
-        # Always inject a HumanMessage so the message list doesn't end with an
-        # AIMessage — Anthropic rejects conversations that end with assistant text.
         from astro_agent.graph.hitl import extract_approval_note
         note = extract_approval_note(response_text)
         approval_text = note if note else "Approved. Continue to the next step."
 
-        # Long-term memory extraction (v1: HITL-only, Lesson #1 + #9)
-        # Programmatic save — harness owns write timing, LLM decides what to extract
+        # Long-term memory extraction (v1: HITL-only)
         _extract_hitl_memories(state, messages, tool_name, note)
 
         return {
@@ -793,8 +818,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
             "messages": vlm_messages + [HumanMessage(content=approval_text)],
         }
 
-    # Human gave feedback or chat — keep active_hitl=True so the agent
-    # stays in the HITL loop even if it responds without tool calls.
+    # Human gave feedback — keep in HITL loop
     return {
         "messages": vlm_messages + [HumanMessage(content=response_text)],
         "active_hitl": True,
@@ -909,12 +933,14 @@ def _extract_hitl_memories(state: AstroState, messages: list, tool_name: str, ap
 
 
 # ── agent_chat ────────────────────────────────────────────────────────────────
-# When the agent responds with text (no tool calls) and is not in an active
-# HITL conversation, it means the agent wants to communicate — ask a question,
-# explain a situation, report a blocker, etc. This node handles that:
+# This node handles text-only agent responses (no tool calls) outside of
+# active HITL. Since route_after_agent sends active_hitl=True responses to
+# hitl_check instead, agent_chat is ONLY reached when the agent is working
+# autonomously and responds with text instead of calling a tool.
 #
-#   HITL mode:      fire interrupt() so the human can read and respond
-#   Autonomous mode: inject a nudge message telling the agent to act or advance
+# The agent should always be calling tools between HITL checkpoints.
+# Text-only responses mean the model is hesitating, narrating, or stuck.
+# Always nudge it to act.
 
 _AUTONOMOUS_NUDGE = (
     "Either call a tool to continue processing, or call advance_phase "
@@ -925,74 +951,51 @@ _AUTONOMOUS_NUDGE = (
 
 def agent_chat(state: AstroState) -> dict[str, Any]:
     """
-    Handle text-only agent responses.
+    Handle text-only agent responses outside of active HITL.
 
-    In HITL mode: fire interrupt() so the human can respond.
-    In autonomous mode: inject a nudge message and route back to agent.
+    Always nudges the agent to call a tool. Human interaction only happens
+    through hitl_check interrupts at configured checkpoints.
     """
     messages = state.get("messages", [])
     phase = state.get("phase", ProcessingPhase.INGEST)
 
-    # Extract the agent's text for the interrupt payload
+    # Extract the agent's text for logging
     agent_text = ""
     if messages:
         last = messages[-1]
         if isinstance(last, AIMessage):
             agent_text = text_content(last.content)
 
-    # If the human is actively chatting (active_hitl=True), no nudge limit —
-    # they're driving the conversation. Otherwise, count consecutive text-only
-    # AI responses to catch loops where the agent refuses to call tools.
-    if not state.get("active_hitl", False):
-        import os
-        max_nudges = int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "2"))
-        consecutive_text_only = 0
-        for msg in reversed(messages):
-            if isinstance(msg, AIMessage) and not msg.tool_calls:
-                consecutive_text_only += 1
-            elif isinstance(msg, HumanMessage) and msg.additional_kwargs.get("is_nudge"):
-                continue  # skip our own nudge injections
-            else:
-                break  # HITL feedback, tool results, etc. reset the counter
+    # Count consecutive text-only responses to catch loops
+    import os
+    max_nudges = int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "2"))
+    consecutive_text_only = 0
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and not msg.tool_calls:
+            consecutive_text_only += 1
+        elif isinstance(msg, HumanMessage) and msg.additional_kwargs.get("is_nudge"):
+            continue  # skip our own nudge injections
+        else:
+            break  # tool results, HITL feedback, etc. reset the counter
 
-        if consecutive_text_only >= max_nudges:
-            raise NudgeLimitError(
-                f"Agent produced {consecutive_text_only} consecutive text-only responses "
-                f"without calling any tool. Current phase: {phase.value.upper()}. "
-                f"The agent must call tools to make progress or call advance_phase "
-                f"to move to the next phase. "
-                f"Set MAX_AUTONOMOUS_NUDGES in .env to adjust (current: {max_nudges})."
-            )
+    if consecutive_text_only >= max_nudges:
+        raise NudgeLimitError(
+            f"Agent produced {consecutive_text_only} consecutive text-only responses "
+            f"without calling any tool. Current phase: {phase.value.upper()}. "
+            f"The agent must call tools to make progress or call advance_phase "
+            f"to move to the next phase. "
+            f"Set MAX_AUTONOMOUS_NUDGES in .env to adjust (current: {max_nudges})."
+        )
 
-    # Empty text with no active HITL = model pausing between tool calls.
-    # Nudge it forward instead of interrupting the human with nothing.
-    if not agent_text.strip() and not state.get("active_hitl", False):
-        logger.info(f"agent_chat: empty response, nudging agent (phase={phase.value})")
-        return {"messages": [HumanMessage(
-            content=_AUTONOMOUS_NUDGE,
-            additional_kwargs={"is_nudge": True},
-        )]}
-
-    if is_autonomous():
-        logger.info(f"agent_chat (autonomous): nudging agent to act or advance (phase={phase.value})")
-        return {"messages": [HumanMessage(
-            content=_AUTONOMOUS_NUDGE,
-            additional_kwargs={"is_nudge": True},
-        )]}
-
-    # HITL mode — let the human read the agent's message and respond
-    logger.info(f"agent_chat (HITL): firing interrupt for human response (phase={phase.value})")
-    response = interrupt({
-        "type": "agent_chat",
-        "title": f"Agent message ({phase.value} phase)",
-        "agent_text": agent_text,
-        "phase": phase.value,
-    })
-
-    response_text = str(response)
-    logger.info(f"agent_chat: human responded: {response_text!r}")
-
-    return {"messages": [HumanMessage(content=response_text)]}
+    # Always nudge — agent should be calling tools, not narrating
+    logger.info(
+        f"agent_chat: nudging agent (phase={phase.value}) "
+        f"| agent said: {agent_text[:200]}"
+    )
+    return {"messages": [HumanMessage(
+        content=_AUTONOMOUS_NUDGE,
+        additional_kwargs={"is_nudge": True},
+    )]}
 
 
 # ── Routing functions ─────────────────────────────────────────────────────────

@@ -11,10 +11,9 @@ The store is a single SQLite file at ~/.astro_agent/memory.db. It holds
 four memory types (sessions, observations, failures, preferences) plus
 a vector index (sqlite-vec), full-text index (FTS5), and embedding cache.
 
-Graceful degradation:
-  - If sqlite-vec is unavailable: FTS5-only search
-  - If FTS5 is unavailable: LIKE-based search
-  - If both unavailable: sequential scan (still works, just slower)
+The embedding system is fail-loud: if memory is enabled, the embedder
+is guaranteed to be initialized and working. There are no silent fallback
+paths — hybrid search (vector + FTS5 + RRF) is always available.
 """
 
 from __future__ import annotations
@@ -162,21 +161,28 @@ class MemoryStore:
                 embedding BLOB,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS memory_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """)
 
-        # Vector index (sqlite-vec)
-        if self._has_vec:
-            try:
-                conn.execute("""
-                    CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(
-                        source_table TEXT NOT NULL,
-                        source_id INTEGER NOT NULL,
-                        embedding FLOAT[4096]
-                    )
-                """)
-            except Exception as e:
-                logger.warning(f"Failed to create memory_vec table: {e}")
-                self._has_vec = False
+        # Vector index (sqlite-vec) — dimension comes from the embedder
+        if self._has_vec and self._embedder:
+            dim = self._embedder.dimension
+            if dim:
+                try:
+                    conn.execute(f"""
+                        CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(
+                            source_table TEXT NOT NULL,
+                            source_id INTEGER NOT NULL,
+                            embedding FLOAT[{dim}]
+                        )
+                    """)
+                except Exception as e:
+                    logger.warning(f"Failed to create memory_vec table: {e}")
+                    self._has_vec = False
 
         # Full-text search index (FTS5)
         if self._has_fts:
@@ -199,6 +205,88 @@ class MemoryStore:
         if self._conn:
             self._conn.close()
             self._conn = None
+
+    # ── Model tracking + migration ───────────────────────────────────────
+
+    def _get_meta(self, key: str) -> str | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT value FROM memory_meta WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def _set_meta(self, key: str, value: str):
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        conn.commit()
+
+    def check_embedding_model(
+        self, current_model: str, current_dim: int | None, rebuild: bool = False,
+    ) -> None:
+        """Check if stored model matches current config.
+
+        On first run, records the model/dimension. On subsequent runs, detects
+        mismatch and either blocks (raising EmbeddingInitError) or rebuilds
+        the vector index.
+        """
+        from astro_agent.memory.embeddings import EmbeddingInitError
+
+        stored_model = self._get_meta("embedding_model")
+
+        if stored_model is None:
+            # First run — record the model
+            self._set_meta("embedding_model", current_model)
+            if current_dim:
+                self._set_meta("embedding_dimension", str(current_dim))
+            return
+
+        if stored_model == current_model:
+            return
+
+        # Model mismatch
+        if not rebuild:
+            raise EmbeddingInitError(
+                f"Embedding model changed: '{stored_model}' → '{current_model}'.\n"
+                f"This requires rebuilding the vector index (all existing embeddings "
+                f"will be regenerated from the stored text).\n\n"
+                f"CLI: re-run with --rebuild-embeddings\n"
+                f"Config: set rebuild_embeddings = true in [memory], "
+                f"then remove it after one successful run."
+            )
+
+        # Rebuild: drop + recreate vec table, update meta, backfill
+        logger.warning(
+            f"Embedding model changed: '{stored_model}' → '{current_model}'. "
+            f"Rebuilding vector index..."
+        )
+        self._rebuild_vec_index(current_dim)
+        self._set_meta("embedding_model", current_model)
+        if current_dim:
+            self._set_meta("embedding_dimension", str(current_dim))
+
+    def _rebuild_vec_index(self, dim: int | None):
+        """Drop and recreate the vector index with a new dimension."""
+        conn = self._get_conn()
+        try:
+            conn.execute("DROP TABLE IF EXISTS memory_vec")
+            if dim and self._has_vec:
+                conn.execute(f"""
+                    CREATE VIRTUAL TABLE memory_vec USING vec0(
+                        source_table TEXT NOT NULL,
+                        source_id INTEGER NOT NULL,
+                        embedding FLOAT[{dim}]
+                    )
+                """)
+            conn.commit()
+            logger.info(f"Vector index rebuilt with dimension {dim}")
+            # Backfill will run automatically since all rows are now missing
+            self._backfill_embeddings()
+        except Exception as e:
+            logger.warning(f"Vector index rebuild failed: {e}")
+            self._has_vec = False
 
     # ── Write operations ─────────────────────────────────────────────────
 
@@ -363,8 +451,8 @@ class MemoryStore:
     def _backfill_embeddings(self):
         """Embed any memories that are missing from the vector index.
 
-        Runs once at startup when an embedder is available. Covers memories
-        saved while Ollama was down or before it was installed.
+        Runs once at startup. Also runs after a model change triggers
+        a vector index rebuild.
         """
         if not self._has_vec or not self._embedder:
             return
@@ -450,40 +538,34 @@ class MemoryStore:
         conn = self._get_conn()
         tables = self._resolve_tables(memory_type)
 
-        # Collect candidates from each retrieval method
+        # Hybrid search: vector + FTS5
+        # With fail-loud init, both indexes are guaranteed available.
         vec_results = []
         fts_results = []
 
-        # Vector search (semantic similarity)
-        if self._has_vec and self._embedder:
-            try:
-                query_embedding = self._embedder.embed(query)
-                if query_embedding is not None:
-                    vec_results = self._vector_search(
-                        query_embedding, tables, limit=50,
-                        target_type=target_type, phase=phase, source=source,
-                    )
-            except Exception as e:
-                logger.warning(f"Vector search failed, falling back to FTS: {e}")
-
-        # FTS5 keyword search (lexical)
-        if self._has_fts:
-            try:
-                fts_results = self._fts_search(
-                    query, tables, limit=50,
-                    target_type=target_type, phase=phase, source=source,
-                )
-            except Exception as e:
-                logger.warning(f"FTS search failed: {e}")
-
-        # Fallback: LIKE search if neither index is available
-        if not vec_results and not fts_results:
-            return self._fallback_search(
-                query, tables, limit=limit,
+        query_embedding = self._embedder.embed(query)
+        if query_embedding is not None:
+            vec_results = self._vector_search(
+                query_embedding, tables, limit=50,
                 target_type=target_type, phase=phase, source=source,
             )
 
+        fts_results = self._fts_search(
+            query, tables, limit=50,
+            target_type=target_type, phase=phase, source=source,
+        )
+
+        logger.debug(
+            f"Memory search: {len(vec_results)} vector + {len(fts_results)} FTS5 candidates"
+        )
+
         # RRF fusion (k=60, standard constant)
+        # Future consideration: Distribution-Based Score Fusion (DBSF) could
+        # replace RRF here. DBSF normalizes raw scores from each branch using
+        # mean/stddev, preserving *how strongly* something matched rather than
+        # just its rank position. Both vec0 (distance) and FTS5 (bm25()) return
+        # usable raw scores. Guard with a fallback to RRF when either branch
+        # returns <10 results, as DBSF statistics become unstable at low counts.
         rrf_scores: dict[str, float] = {}
         rrf_items: dict[str, dict] = {}
 
@@ -528,24 +610,27 @@ class MemoryStore:
         limit: int = 50,
         **filters,
     ) -> list[dict]:
-        """Search the vector index for semantically similar memories."""
+        """Search the vector index for semantically similar memories.
+
+        Filters by source_table at the SQL level so sqlite-vec skips
+        irrelevant rows rather than retrieving them for Python-side discard.
+        """
         conn = self._get_conn()
         results = []
 
+        placeholders = ",".join("?" for _ in tables)
         rows = conn.execute(
-            """SELECT source_table, source_id, distance
+            f"""SELECT source_table, source_id, distance
                FROM memory_vec
                WHERE embedding MATCH ?
+               AND source_table IN ({placeholders})
                ORDER BY distance
                LIMIT ?""",
-            (_serialize_embedding(query_embedding), limit),
+            (_serialize_embedding(query_embedding), *tables, limit),
         ).fetchall()
 
         for row in rows:
-            table = row["source_table"]
-            if table not in tables:
-                continue
-            item = self._load_memory(table, row["source_id"], **filters)
+            item = self._load_memory(row["source_table"], row["source_id"], **filters)
             if item:
                 item["distance"] = row["distance"]
                 results.append(item)
@@ -559,57 +644,31 @@ class MemoryStore:
         limit: int = 50,
         **filters,
     ) -> list[dict]:
-        """Search the FTS5 index for keyword matches."""
+        """Search the FTS5 index for keyword matches, ranked by BM25."""
         conn = self._get_conn()
         results = []
 
         # Escape FTS5 special characters
         safe_query = query.replace('"', '""')
 
+        placeholders = ",".join("?" for _ in tables)
         rows = conn.execute(
-            """SELECT source_table, source_id, rank
+            f"""SELECT source_table, source_id, bm25(memory_fts) AS rank
                FROM memory_fts
                WHERE memory_fts MATCH ?
+               AND source_table IN ({placeholders})
                ORDER BY rank
                LIMIT ?""",
-            (f'"{safe_query}"', limit),
+            (f'"{safe_query}"', *tables, limit),
         ).fetchall()
 
         for row in rows:
-            table = row["source_table"]
-            if table not in tables:
-                continue
-            item = self._load_memory(table, int(row["source_id"]), **filters)
+            item = self._load_memory(row["source_table"], int(row["source_id"]), **filters)
             if item:
                 item["fts_rank"] = row["rank"]
                 results.append(item)
 
         return results
-
-    def _fallback_search(
-        self,
-        query: str,
-        tables: list[str],
-        limit: int = 10,
-        **filters,
-    ) -> list[dict]:
-        """LIKE-based fallback when no indexes are available."""
-        conn = self._get_conn()
-        results = []
-        keywords = query.lower().split()
-
-        for table in tables:
-            rows = conn.execute(
-                f"SELECT id FROM {table} WHERE valid_until IS NULL ORDER BY created_at DESC LIMIT 100"
-            ).fetchall()
-            for row in rows:
-                item = self._load_memory(table, row["id"], **filters)
-                if item:
-                    content_lower = item.get("content", "").lower()
-                    if any(kw in content_lower for kw in keywords):
-                        results.append(item)
-
-        return results[:limit]
 
     def _load_memory(
         self,

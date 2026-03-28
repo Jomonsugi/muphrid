@@ -1,6 +1,8 @@
 # HITL (Human-in-the-Loop) Configuration
 #
 # Defines which pipeline steps pause for human review.
+# Every phase-specific tool can be toggled for HITL — the human chooses
+# where and when to get involved.
 #
 # autonomous = true    skip all HITL interrupts for unattended runs
 # enabled = false      skip HITL for a specific tool only
@@ -8,21 +10,45 @@
 # type = "data_review"    show metrics/stats, no image display required
 # type = "image_review"   show current image(s), chat-based feedback
 #
-# The agent decides what to try and what parameters to use based on the
-# current image state, conversation history, and long-term memory.
-# If the human asks for comparison options ("show me two more"), the agent
-# produces them and the UI displays them — this is not enforced here.
+# CLI reads this file directly. The Gradio app shows these as defaults
+# and overrides them at runtime via checkboxes.
 
 autonomous = false
 vlm_hitl = false         # when true, agent sees all images (base64) during HITL conversations
 vlm_autonomous = false   # when true, agent can visually inspect images outside of HITL via present_images
 
-# ── Preprocessing ──────────────────────────────────────────────────────────────
+# ── Calibration ───────────────────────────────────────────────────────────────
 
 [hitl.T02_masters]
 enabled = false
 type    = "data_review"
 title   = "T02 Master Frame Diagnostics"
+
+[hitl.T02b_convert]
+enabled = false
+type    = "data_review"
+title   = "T02b Sequence Conversion"
+
+[hitl.T03_calibrate]
+enabled = false
+type    = "data_review"
+title   = "T03 Calibration"
+
+# ── Registration ──────────────────────────────────────────────────────────────
+
+[hitl.T04_register]
+enabled = false
+type    = "data_review"
+title   = "T04 Registration"
+
+# ── Analysis ──────────────────────────────────────────────────────────────────
+
+[hitl.T05_analyze]
+enabled = false
+type    = "data_review"
+title   = "T05 Frame Analysis"
+
+# ── Stacking ──────────────────────────────────────────────────────────────────
 
 [hitl.T06_select]
 enabled = false
@@ -34,7 +60,12 @@ enabled = false
 type    = "data_review"
 title   = "T07 Stack Results"
 
-# ── Linear processing ──────────────────────────────────────────────────────────
+[hitl.T08_crop]
+enabled = false
+type    = "data_review"
+title   = "T08 Auto Crop"
+
+# ── Linear processing ────────────────────────────────────────────────────────
 
 [hitl.T09_gradient]
 enabled = true
@@ -44,26 +75,31 @@ title   = "T09 Gradient Removal"
 [hitl.T10_color]
 enabled = false
 type    = "data_review"
-title   = "T10 Color Calibration Results"
+title   = "T10 Color Calibration"
+
+[hitl.T11_green]
+enabled = false
+type    = "data_review"
+title   = "T11 Green Noise Removal"
 
 [hitl.T12_denoise]
 enabled = false
 type    = "data_review"
-title   = "T12 Noise Reduction Results"
+title   = "T12 Noise Reduction"
 
 [hitl.T13_decon]
 enabled = false
 type    = "image_review"
 title   = "T13 Deconvolution"
 
-# ── Stretch ────────────────────────────────────────────────────────────────────
+# ── Stretch ───────────────────────────────────────────────────────────────────
 
 [hitl.T14_stretch]
 enabled = true
 type    = "image_review"
 title   = "T14 Stretch"
 
-# ── Non-linear processing ──────────────────────────────────────────────────────
+# ── Non-linear processing ────────────────────────────────────────────────────
 
 [hitl.T15_star_removal]
 enabled = false
@@ -90,7 +126,15 @@ enabled = true
 type    = "image_review"
 title   = "T19 Star Restoration"
 
-# ── Multiscale sharpening ──────────────────────────────────────────────────────
+[hitl.T25_mask]
+enabled = false
+type    = "image_review"
+title   = "T25 Mask Creation"
+
+[hitl.T26_reduce_stars]
+enabled = false
+type    = "image_review"
+title   = "T26 Star Reduction"
 
 [hitl.T27_multiscale]
 enabled = false

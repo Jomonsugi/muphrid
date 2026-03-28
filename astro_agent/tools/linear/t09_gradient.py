@@ -1,3 +1,19 @@
+# AstroAgent - LLM agent for autonomous astrophotography post-processing
+# Copyright (C) 2026 Micah Shanks
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 T09 — remove_gradient
 
@@ -66,6 +82,18 @@ class GraXpertBGEOptions(BaseModel):
 
 class RemoveGradientInput(BaseModel):
     graxpert_options: GraXpertBGEOptions = Field(default_factory=GraXpertBGEOptions)
+    chain: bool = Field(
+        default=False,
+        description=(
+            "If False (default), processes the original pre-gradient image, "
+            "producing an independent variant. Each call with different parameters "
+            "creates a fresh result for comparison. "
+            "If True, processes the current image, which may already have gradient "
+            "removal applied. This enables multi-pass workflows where different "
+            "correction types are applied sequentially (e.g. subtraction for light "
+            "pollution followed by division for vignetting residual)."
+        ),
+    )
 
 
 # ── GraXpert backend ───────────────────────────────────────────────────────────
@@ -76,8 +104,16 @@ def _normalize_correction_type(raw: str) -> str:
     return mapping.get(raw.lower(), raw.capitalize())
 
 
+def _auto_suffix(options: GraXpertBGEOptions, chain: bool) -> str:
+    """Generate a descriptive suffix from parameters."""
+    correction = options.correction_type.lower()[:3]  # "sub" or "div"
+    smoothing = f"s{int(options.smoothing * 100):03d}"  # "s060", "s080"
+    if chain:
+        return f"chain_{correction}_{smoothing}"
+    return f"bge_{correction}_{smoothing}"
 
-def _probe_output_path(base_stem: Path, parent: Path) -> Path | None:
+
+def _probe_output_path(base_stem: str, parent: Path) -> Path | None:
     """GraXpert appends its own extension — probe common possibilities."""
     candidates = [
         parent / f"{base_stem}.fits",
@@ -94,6 +130,7 @@ def _probe_output_path(base_stem: Path, parent: Path) -> Path | None:
 def _run_graxpert_bge(
     image_path: Path,
     options: GraXpertBGEOptions,
+    output_stem: str,
 ) -> tuple[Path, Path | None]:
     """
     Call GraXpert directly via subprocess for AI-based background extraction.
@@ -106,15 +143,14 @@ def _run_graxpert_bge(
     correction = _normalize_correction_type(options.correction_type)
 
     # Pass output path WITHOUT extension — GraXpert appends .fits itself
-    output_stem = image_path.parent / f"{image_path.stem}_bge"
+    output_target = image_path.parent / output_stem
 
-    # Omit -ai_version so GraXpert uses the latest available model automatically.
     cmd: list[str] = [
         graxpert_bin,
         str(image_path),
         "-cli",
         "-cmd", "background-extraction",
-        "-output", str(output_stem),
+        "-output", str(output_target),
         "-correction", correction,
         "-smoothing", str(options.smoothing),
     ]
@@ -129,15 +165,15 @@ def _run_graxpert_bge(
             f"{result.stderr or result.stdout}"
         )
 
-    output_path = _probe_output_path(f"{image_path.stem}_bge", image_path.parent)
+    output_path = _probe_output_path(output_stem, image_path.parent)
     if output_path is None:
         raise FileNotFoundError(
             f"GraXpert did not produce expected output matching "
-            f"{image_path.stem}_bge.* in {image_path.parent}\n"
+            f"{output_stem}.* in {image_path.parent}\n"
             f"stdout: {result.stdout}"
         )
 
-    bg_model_path = _probe_output_path(f"{image_path.stem}_bge_background", image_path.parent)
+    bg_model_path = _probe_output_path(f"{output_stem}_background", image_path.parent)
     return output_path, bg_model_path
 
 
@@ -146,12 +182,24 @@ def _run_graxpert_bge(
 @tool(args_schema=RemoveGradientInput)
 def remove_gradient(
     graxpert_options: GraXpertBGEOptions | None = None,
+    chain: bool = False,
     tool_call_id: Annotated[str, InjectedToolCallId] = None,
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
     """
     Remove large-scale background gradients from a linear FITS image using
     GraXpert AI background extraction.
+
+    Each call produces an independent variant from the original pre-gradient
+    image. Variant names are auto-generated from parameters (correction type +
+    smoothing). The result includes the variant name and file path.
+
+    To compare variants, call present_images with the paths from each result.
+
+    If chain=True, the tool processes the current image, which may already have
+    gradient removal applied. This enables multi-pass workflows where different
+    correction types are applied sequentially (e.g. subtraction then division).
+    Chained variants are labeled as such in the output.
 
     GraXpert requires no manual sample placement and handles multi-source,
     irregular gradients that polynomial methods cannot model — light pollution
@@ -162,26 +210,52 @@ def remove_gradient(
     - Division: multiplicative gradients from residual vignetting after flats.
 """
     working_dir = state["dataset"]["working_dir"]
-    image_path = state["paths"]["current_image"]
 
     if graxpert_options is None:
         graxpert_options = GraXpertBGEOptions()
 
-    original_image_path = image_path
+    # Determine source image
+    if chain:
+        # Intentional chaining — process the current (possibly already corrected) image
+        image_path = state["paths"]["current_image"]
+        original_image_path = state["paths"].get("pre_gradient_image") or image_path
+    else:
+        # Default: always start from the original pre-gradient image
+        original_image_path = (
+            state["paths"].get("pre_gradient_image")
+            or state["paths"]["current_image"]
+        )
+        image_path = original_image_path
+
     img_path = Path(image_path)
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    processed_path, bg_model_path = _run_graxpert_bge(img_path, graxpert_options)
+    # Auto-generate variant name from parameters
+    suffix = _auto_suffix(graxpert_options, chain)
+    # Use original image stem for naming (not the chained intermediate)
+    original_stem = Path(original_image_path).stem
+    output_stem = f"{original_stem}_{suffix}"
+
+    processed_path, bg_model_path = _run_graxpert_bge(img_path, graxpert_options, output_stem)
+
+    # Build descriptive label
+    correction_label = graxpert_options.correction_type
+    smoothing_label = graxpert_options.smoothing
+    source_label = "chained" if chain else "original"
+    variant_label = f"{correction_label}, smoothing {smoothing_label} (from {source_label})"
 
     summary = {
         "output_path": str(processed_path),
+        "variant_label": variant_label,
+        "source": source_label,
         "pre_gradient_image": str(original_image_path),
         "background_model_path": str(bg_model_path) if bg_model_path else None,
         "settings": {
             "correction_type": graxpert_options.correction_type,
             "smoothing": graxpert_options.smoothing,
             "save_background_model": graxpert_options.save_background_model,
+            "chain": chain,
         },
     }
 

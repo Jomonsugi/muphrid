@@ -1,21 +1,32 @@
 """
-Embedding generation via Ollama with SHA256 cache.
+Multi-backend embedding system with SHA256 cache.
+
+Supports two providers:
+  - Ollama: external service, large models (e.g. qwen3-embedding, 4096 dims)
+  - FastEmbed: in-process ONNX inference, no external service needed
+
+Provider and model are configured in processing.toml — this is a one-time
+choice because switching invalidates the entire vector index.
 
 Design informed by:
   - OpenClaw: SHA256(text + model) cache key, LRU eviction at 50K entries
-  - Lesson #12: embedding cache critical since Qwen3-Embedding-8B is compute-heavy
-
-Lazy initialization — no Ollama connection until the first embed() call.
-Graceful degradation: if Ollama is unavailable, embed() returns None and
-the memory store falls back to FTS5-only search.
+  - Lesson #12: embedding cache critical since large models are compute-heavy
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import shutil
 import struct
-from typing import Any
+import subprocess
+import time
+import urllib.request
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from astro_agent.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -23,100 +34,254 @@ logger = logging.getLogger(__name__)
 _MAX_CACHE_SIZE = 50_000
 
 
+# ── Exception ────────────────────────────────────────────────────────────────
+
+
+class EmbeddingInitError(RuntimeError):
+    """Raised when the embedding system cannot initialize.
+
+    Messages are human-readable and include actionable fix instructions.
+    """
+
+
+# ── Ollama auto-start ────────────────────────────────────────────────────────
+
+
+def _ensure_ollama_running(timeout: float = 15.0) -> None:
+    """Start Ollama if it isn't already serving. Raises EmbeddingInitError on failure."""
+    # Quick check: is it already running?
+    try:
+        urllib.request.urlopen("http://localhost:11434", timeout=2)
+        return
+    except Exception:
+        pass
+
+    # Not running — try to start it
+    ollama_bin = shutil.which("ollama")
+    if not ollama_bin:
+        raise EmbeddingInitError(
+            "Ollama binary not found on PATH.\n\n"
+            "Either install Ollama (https://ollama.com) or switch to FastEmbed:\n"
+            "  In processing.toml [memory]: embedding_provider = \"fastembed\""
+        )
+
+    logger.info("Ollama not running — starting 'ollama serve' in background...")
+    subprocess.Popen(
+        [ollama_bin, "serve"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Wait for it to come up
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen("http://localhost:11434", timeout=2)
+            logger.info("Ollama is now running")
+            return
+        except Exception:
+            time.sleep(0.5)
+
+    raise EmbeddingInitError(
+        f"Ollama did not start within {timeout}s.\n\n"
+        "Try starting it manually: ollama serve\n"
+        "Or switch to FastEmbed in processing.toml [memory]: "
+        "embedding_provider = \"fastembed\""
+    )
+
+
+# ── Backend: Ollama ──────────────────────────────────────��───────────────────
+
+
 class OllamaEmbedder:
-    """
-    Generate embeddings via Ollama's local API with persistent SHA256 cache.
+    """Generate embeddings via Ollama's local API.
 
-    The cache lives in the same memory.db (embedding_cache table) so it
-    persists across sessions without a separate file.
+    Raises EmbeddingInitError if Ollama is unavailable or the model can't be loaded.
     """
 
-    def __init__(self, model: str = "qwen3-embedding", db_conn=None):
+    def __init__(self, model: str = "qwen3-embedding"):
         self._model = model
-        self._db_conn = db_conn
-        self._client = None  # lazy init
-        self._initialized = False
-        self._available = True
+        self._client = None
         self._dimension: int | None = None
+        self._init_client()
 
     def _init_client(self):
-        """Lazy-initialize the Ollama client on first use."""
-        if self._initialized:
-            return
-        self._initialized = True
+        """Connect to Ollama and verify the model works."""
+        _ensure_ollama_running()
         try:
             import ollama
-            self._client = ollama.Client()
-            # Verify the model is available with a test embedding
-            test = self._client.embed(model=self._model, input="test")
-            if test and test.get("embeddings"):
-                self._dimension = len(test["embeddings"][0])
-                logger.info(
-                    f"Ollama embedder ready: model={self._model}, "
-                    f"dimension={self._dimension}"
-                )
-            else:
-                raise RuntimeError("Empty embedding response from Ollama")
         except ImportError:
-            logger.warning(
-                "ollama package not installed. Memory vector search disabled. "
+            raise EmbeddingInitError(
+                "ollama Python package not installed.\n\n"
                 "Install with: uv add ollama"
             )
-            self._available = False
+        self._client = ollama.Client()
+        try:
+            test = self._client.embed(model=self._model, input="test")
         except Exception as e:
-            logger.warning(
-                f"Ollama not available for embeddings: {e}. "
-                f"Ensure Ollama is running (ollama serve) and the model is pulled "
-                f"(ollama pull {self._model}). Memory will use FTS5-only search."
+            raise EmbeddingInitError(
+                f"Ollama model '{self._model}' is not available: {e}\n\n"
+                f"Pull it with: ollama pull {self._model}\n"
+                f"Or choose a different model in processing.toml [memory] embedding_model"
             )
-            self._available = False
+        if test and test.get("embeddings"):
+            self._dimension = len(test["embeddings"][0])
+            logger.info(
+                f"Ollama embedder ready: model={self._model}, "
+                f"dimension={self._dimension}"
+            )
+        else:
+            raise EmbeddingInitError(
+                f"Ollama returned empty embeddings for model '{self._model}'."
+            )
+
+    @property
+    def model_id(self) -> str:
+        return self._model
 
     @property
     def dimension(self) -> int | None:
-        """Return the embedding dimension, or None if not yet initialized."""
-        if not self._initialized:
-            self._init_client()
         return self._dimension
 
     def embed(self, text: str) -> list[float] | None:
-        """
-        Generate an embedding for text, using cache when available.
-
-        Returns None if Ollama is unavailable — the memory store gracefully
-        degrades to FTS5-only search.
-        """
-        if not self._initialized:
-            self._init_client()
-        if not self._available:
+        """Generate an embedding. Returns None on transient failure."""
+        try:
+            result = self._client.embed(model=self._model, input=text)
+            if result and result.get("embeddings"):
+                return result["embeddings"][0]
+            return None
+        except Exception as e:
+            logger.warning(f"Ollama embedding failed: {e}")
             return None
 
-        # Check cache first
+    def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
+        return [self.embed(text) for text in texts]
+
+
+# ── Backend: FastEmbed ───────────────────────────────────────────────────────
+
+
+class FastEmbedEmbedder:
+    """In-process embeddings via fastembed (ONNX). No external service needed.
+
+    Raises EmbeddingInitError if fastembed is not installed or the model fails to load.
+    """
+
+    def __init__(self, model: str = "snowflake/snowflake-arctic-embed-l"):
+        self._model = model
+        self._fe_model = None
+        self._dimension: int | None = None
+        self._init_model()
+
+    def _init_model(self):
+        """Load the ONNX model (downloads on first use)."""
+        try:
+            from fastembed import TextEmbedding
+        except ImportError:
+            raise EmbeddingInitError(
+                "fastembed package not installed.\n\n"
+                "Install with: uv add fastembed"
+            )
+        try:
+            self._fe_model = TextEmbedding(model_name=self._model)
+        except Exception as e:
+            raise EmbeddingInitError(
+                f"FastEmbed model '{self._model}' failed to load: {e}\n\n"
+                f"Available models can be listed with:\n"
+                f"  python -c \"from fastembed import TextEmbedding; "
+                f"print([m['model'] for m in TextEmbedding.list_supported_models()])\"\n\n"
+                f"Or choose a different model in processing.toml [memory] embedding_model"
+            )
+        # Discover dimension with a test embedding
+        try:
+            test_results = list(self._fe_model.embed(["test"]))
+            if test_results:
+                self._dimension = len(test_results[0])
+                logger.info(
+                    f"FastEmbed embedder ready: model={self._model}, "
+                    f"dimension={self._dimension}"
+                )
+            else:
+                raise EmbeddingInitError(
+                    f"FastEmbed returned empty embeddings for model '{self._model}'."
+                )
+        except EmbeddingInitError:
+            raise
+        except Exception as e:
+            raise EmbeddingInitError(
+                f"FastEmbed test embedding failed for '{self._model}': {e}"
+            )
+
+    @property
+    def model_id(self) -> str:
+        return self._model
+
+    @property
+    def dimension(self) -> int | None:
+        return self._dimension
+
+    def embed(self, text: str) -> list[float] | None:
+        """Generate an embedding. Returns None on transient failure."""
+        try:
+            results = list(self._fe_model.embed([text]))
+            if results:
+                return results[0].tolist()
+            return None
+        except Exception as e:
+            logger.warning(f"FastEmbed embedding failed: {e}")
+            return None
+
+    def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
+        try:
+            results = list(self._fe_model.embed(texts))
+            return [r.tolist() for r in results]
+        except Exception as e:
+            logger.warning(f"FastEmbed batch embedding failed: {e}")
+            return [self.embed(text) for text in texts]
+
+
+# ── Cache wrapper ────────────────────────────────────────────────────────────
+
+
+class CachedEmbedder:
+    """Decorator that adds SHA256 SQLite caching to any embedder.
+
+    Cache key: SHA256(text + "|" + model_id). Switching models naturally
+    invalidates stale entries. LRU eviction at _MAX_CACHE_SIZE entries.
+    """
+
+    def __init__(self, inner: OllamaEmbedder | FastEmbedEmbedder, db_conn=None):
+        self._inner = inner
+        self._db_conn = db_conn
+
+    @property
+    def model_id(self) -> str:
+        return self._inner.model_id
+
+    @property
+    def dimension(self) -> int | None:
+        return self._inner.dimension
+
+    def embed(self, text: str) -> list[float] | None:
+        """Generate an embedding, checking cache first."""
         cache_key = self._cache_key(text)
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
 
-        # Generate embedding
-        try:
-            result = self._client.embed(model=self._model, input=text)
-            if result and result.get("embeddings"):
-                embedding = result["embeddings"][0]
-                self._cache_put(cache_key, embedding)
-                return embedding
-            return None
-        except Exception as e:
-            logger.warning(f"Embedding generation failed: {e}")
-            return None
+        embedding = self._inner.embed(text)
+        if embedding is not None:
+            self._cache_put(cache_key, embedding)
+        return embedding
 
     def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
-        """Generate embeddings for multiple texts."""
         return [self.embed(text) for text in texts]
 
-    # ── Cache operations ─────────────────────────────────────────────────
+    # ── Cache operations ───────────────────────────���─────────────────────
 
     def _cache_key(self, text: str) -> str:
         """SHA256(text + model) as cache key."""
-        raw = f"{text}|{self._model}"
+        raw = f"{text}|{self._inner.model_id}"
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def _cache_get(self, key: str) -> list[float] | None:
@@ -139,7 +304,6 @@ class OllamaEmbedder:
         if not self._db_conn:
             return
         try:
-            from datetime import datetime, timezone
             now = datetime.now(timezone.utc).isoformat()
             blob = _serialize_embedding(embedding)
             self._db_conn.execute(
@@ -164,6 +328,71 @@ class OllamaEmbedder:
                 logger.info(f"Embedding cache evicted {count - _MAX_CACHE_SIZE} old entries")
         except Exception as e:
             logger.warning(f"Embedding cache write failed: {e}")
+
+
+# ── Factory ──────────────────────────────────────────────────────────────────
+
+
+def create_embedder(provider: str, model: str) -> OllamaEmbedder | FastEmbedEmbedder:
+    """Create the appropriate embedder backend.
+
+    Raises EmbeddingInitError if the provider is unknown or initialization fails.
+    """
+    if provider == "ollama":
+        return OllamaEmbedder(model=model)
+    elif provider == "fastembed":
+        return FastEmbedEmbedder(model=model)
+    else:
+        raise EmbeddingInitError(
+            f"Unknown embedding provider: '{provider}'.\n\n"
+            f"Valid providers: 'ollama', 'fastembed'\n"
+            f"Set in processing.toml [memory] embedding_provider"
+        )
+
+
+# ── Centralized init ────────────────────────────────────────────────────────
+
+
+def init_memory_system(settings: Settings, rebuild_embeddings: bool = False) -> None:
+    """Initialize the complete memory system: embedder + store + tool registration.
+
+    This is the single entry point for both CLI and Gradio. It replaces the
+    duplicated init blocks that previously existed in both.
+
+    Raises EmbeddingInitError if:
+      - The embedding backend cannot start
+      - The configured model/provider changed and rebuild_embeddings is False
+    """
+    from astro_agent.graph.hitl import set_memory_enabled
+    from astro_agent.graph.registry import register_memory_tool
+    from astro_agent.memory.store import MemoryStore
+    from astro_agent.tools.utility.t33_memory_search import set_memory_store
+
+    # Create the raw embedder (validates provider + model, connects to service)
+    inner = create_embedder(settings.memory_embedding_provider, settings.memory_embedding_model)
+
+    # Create the store (sets up DB, detects extensions)
+    store = MemoryStore(db_path=settings.memory_db_path, embedder=inner)
+
+    # Check for model mismatch before wiring everything up
+    store.check_embedding_model(
+        current_model=settings.memory_embedding_model,
+        current_dim=inner.dimension,
+        rebuild=rebuild_embeddings,
+    )
+
+    # Wrap with cache using the store's DB connection
+    cached = CachedEmbedder(inner, db_conn=store._get_conn())
+    store._embedder = cached
+
+    # Wire up the memory tool
+    set_memory_store(store)
+    set_memory_enabled(True)
+    register_memory_tool()
+    logger.info(
+        f"Long-term memory initialized: provider={settings.memory_embedding_provider}, "
+        f"model={settings.memory_embedding_model}, dimension={inner.dimension}"
+    )
 
 
 # ── Serialization helpers ────────────────────────────────────────────────────

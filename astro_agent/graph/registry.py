@@ -86,14 +86,27 @@ def register_memory_tool():
             UTILITY_TOOLS.append(memory_search)
 
 
-PREPROCESS_TOOLS = [
-    # ingest_dataset intentionally excluded — runs once during session init
-    # (CLI/app) before the graph starts. Dataset is already in state.
+# Preprocessing: strict per-phase gating. Each step physically depends on the
+# output of the previous — no cross-phase backtracking. Within-phase iteration
+# is valid (e.g. rebuild a master, re-register with different params, re-select
+# + restack). Research confirms this is how PixInsight, Siril, and expert
+# astrophotographers work.
+
+CALIBRATION_TOOLS = [
     build_masters,
     convert_sequence,
     calibrate,
+]
+
+REGISTRATION_TOOLS = [
     siril_register,
+]
+
+ANALYSIS_TOOLS = [
     analyze_frames,
+]
+
+STACKING_TOOLS = [
     select_frames,
     siril_stack,
     auto_crop,
@@ -133,19 +146,16 @@ EXPORT_TOOLS = [
 # ── Phase → tool list mapping ────────────────────────────────────────────────
 
 _PHASE_TO_GATE: dict[ProcessingPhase, list] = {
-    # Gate 1: PREPROCESS (covers INGEST through STACKING)
-    ProcessingPhase.INGEST:       PREPROCESS_TOOLS,
-    ProcessingPhase.CALIBRATION:  PREPROCESS_TOOLS,
-    ProcessingPhase.REGISTRATION: PREPROCESS_TOOLS,
-    ProcessingPhase.ANALYSIS:     PREPROCESS_TOOLS,
-    ProcessingPhase.STACKING:     PREPROCESS_TOOLS,
-    # Gate 2: LINEAR
+    # Preprocessing: strict per-phase gating (sequential physical dependencies)
+    ProcessingPhase.INGEST:       [],                # resolve_target via UTILITY_TOOLS
+    ProcessingPhase.CALIBRATION:  CALIBRATION_TOOLS,
+    ProcessingPhase.REGISTRATION: REGISTRATION_TOOLS,
+    ProcessingPhase.ANALYSIS:     ANALYSIS_TOOLS,
+    ProcessingPhase.STACKING:     STACKING_TOOLS,
+    # Post-preprocessing: fluid iteration, backtracking, creativity
     ProcessingPhase.LINEAR:       LINEAR_TOOLS,
-    # Gate 3: STRETCH
     ProcessingPhase.STRETCH:      STRETCH_TOOLS,
-    # Gate 4: NONLINEAR
     ProcessingPhase.NONLINEAR:    NONLINEAR_TOOLS,
-    # Gate 5: EXPORT
     ProcessingPhase.EXPORT:       EXPORT_TOOLS,
     # Terminal
     ProcessingPhase.COMPLETE:     [],
@@ -180,7 +190,8 @@ def _fix_injected_annotations() -> None:
     get_type_hints() before _injected_args_keys is ever accessed (it's a
     cached_property — first access wins).
     """
-    all_groups = [PREPROCESS_TOOLS, LINEAR_TOOLS, STRETCH_TOOLS,
+    all_groups = [CALIBRATION_TOOLS, REGISTRATION_TOOLS, ANALYSIS_TOOLS,
+                  STACKING_TOOLS, LINEAR_TOOLS, STRETCH_TOOLS,
                   NONLINEAR_TOOLS, EXPORT_TOOLS, UTILITY_TOOLS]
     seen: set[str] = set()
     for group in all_groups:
@@ -204,7 +215,8 @@ def all_tools() -> list:
     """Return every registered tool. Used for ToolNode initialization."""
     seen = set()
     tools = []
-    for group in [PREPROCESS_TOOLS, LINEAR_TOOLS, STRETCH_TOOLS,
+    for group in [CALIBRATION_TOOLS, REGISTRATION_TOOLS, ANALYSIS_TOOLS,
+                  STACKING_TOOLS, LINEAR_TOOLS, STRETCH_TOOLS,
                   NONLINEAR_TOOLS, EXPORT_TOOLS, UTILITY_TOOLS]:
         for t in group:
             if t.name not in seen:

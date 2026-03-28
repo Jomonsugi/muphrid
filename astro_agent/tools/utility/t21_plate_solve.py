@@ -298,6 +298,18 @@ def plate_solve(
     except ValueError:
         pass
 
+    # Resolve focal length: explicit arg → env var (UI) → equipment.toml
+    if not focal_length_mm or focal_length_mm <= 0:
+        from astro_agent.equipment import resolve_focal_length
+        focal_length_mm = resolve_focal_length()
+        if focal_length_mm is None:
+            raise RuntimeError(
+                "Cannot plate solve: focal length unknown. An approximate focal "
+                "length is needed to constrain the plate solve search.\n"
+                "Please set focal length in the Equipment tab or in "
+                "equipment.toml [optics] focal_length_mm."
+            )
+
     # Resolve position hint: explicit coords > target_name SIMBAD lookup
     resolved_coords = approximate_coords
     if resolved_coords is None and target_name:
@@ -354,6 +366,14 @@ def plate_solve(
             "input_pixel_size_um": resolved_px_um,
             "resolved_coords_hint": resolved_coords,
         }
+
+        # Discrepancy reporting: inform if measured value differs from user input
+        if measured_fl and focal_length_mm and abs(measured_fl - focal_length_mm) > 1.0:
+            summary["focal_length_note"] = (
+                f"Plate-solve measured {measured_fl:.1f}mm, which differs from the "
+                f"provided {focal_length_mm:.1f}mm. The measured value is more accurate. "
+                f"Consider updating the Equipment tab for future runs."
+            )
 
         return Command(update={
             "metadata": {

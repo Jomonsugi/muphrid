@@ -75,9 +75,12 @@ def tool_cfg(tool_id: str) -> dict:
 
 
 def is_enabled(tool_id: str) -> bool:
-    """Check both the autonomous master flag and the per-tool enabled flag."""
+    """Check autonomous flag, runtime overrides, then toml config."""
     if is_autonomous():
         return False
+    # App runtime overrides take priority over toml config
+    if tool_id in _RUNTIME_HITL_OVERRIDES:
+        return _RUNTIME_HITL_OVERRIDES[tool_id]
     return tool_cfg(tool_id).get("enabled", False)
 
 
@@ -104,16 +107,27 @@ def vlm_autonomous() -> bool:
 #
 # After action_node executes a tool, hitl_check looks up the tool name here.
 # If the tool has a mapping AND is_enabled() returns True, interrupt() fires.
-# Tools not in this mapping (e.g. analyze_image, auto_crop) never trigger HITL.
+# ALL phase-specific tools are mapped — the human can choose to get involved
+# at any step. Utility tools (analyze_image, etc.) are not mapped because
+# they are diagnostic, not transformative.
 
 TOOL_TO_HITL: dict[str, str] = {
-    # Preprocessing
+    # Calibration
     "build_masters":          "T02_masters",
+    "convert_sequence":       "T02b_convert",
+    "calibrate":              "T03_calibrate",
+    # Registration
+    "siril_register":         "T04_register",
+    # Analysis
+    "analyze_frames":         "T05_analyze",
+    # Stacking
     "select_frames":          "T06_select",
     "siril_stack":            "T07_stack",
+    "auto_crop":              "T08_crop",
     # Linear
     "remove_gradient":        "T09_gradient",
     "color_calibrate":        "T10_color",
+    "remove_green_noise":     "T11_green",
     "noise_reduction":        "T12_denoise",
     "deconvolution":          "T13_decon",
     # Stretch
@@ -124,8 +138,20 @@ TOOL_TO_HITL: dict[str, str] = {
     "local_contrast_enhance": "T17_local_contrast",
     "saturation_adjust":      "T18_saturation",
     "star_restoration":       "T19_star_restoration",
+    "create_mask":            "T25_mask",
+    "reduce_stars":           "T26_reduce_stars",
     "multiscale_process":     "T27_multiscale",
 }
+
+
+# ── Runtime HITL overrides (app sets these, CLI uses toml config) ────────────
+
+_RUNTIME_HITL_OVERRIDES: dict[str, bool] = {}
+
+
+def set_hitl_tool_enabled(hitl_key: str, enabled: bool) -> None:
+    """Called by the app to override per-tool HITL state at runtime."""
+    _RUNTIME_HITL_OVERRIDES[hitl_key] = enabled
 
 
 def resolve_hitl_checkpoint(messages: list) -> tuple[str | None, str | None]:

@@ -362,11 +362,24 @@ def _cleanup_previous_runs(runs_dir: Path, current_thread_id: str) -> list[str]:
         return []
 
     import shutil
+    import time
     removed: list[str] = []
     for item in sorted(runs_dir.iterdir()):
         if item.is_dir() and item.name != current_thread_id:
-            shutil.rmtree(item)
-            removed.append(item.name)
+            for attempt in range(3):
+                try:
+                    shutil.rmtree(item)
+                    removed.append(item.name)
+                    break
+                except OSError:
+                    # macOS .DS_Store / Spotlight indexing can interfere — wait and retry
+                    time.sleep(0.5)
+            else:
+                raise OSError(
+                    f"Could not remove previous run directory after 3 attempts: {item}\n"
+                    f"A file may be open or locked. Close any applications accessing "
+                    f"this directory and try again."
+                )
 
     return removed
 

@@ -101,26 +101,27 @@ def _load_equipment_defaults() -> dict:
     return {}
 
 
-def _load_env_defaults() -> dict:
-    """Read .env-sourced defaults from os.environ."""
+def _load_processing_defaults() -> dict:
+    """Read defaults from processing.toml, with env var overrides for backwards compat."""
+    from astro_agent.config import _pcfg
+    per_phase = _pcfg("limits", "per_phase") or {}
     return {
-        "llm_model": os.environ.get("LLM_MODEL", "moonshotai/Kimi-K2.5"),
-        "llm_provider": os.environ.get("LLM_PROVIDER", "together"),
-        "recursion_limit": int(os.environ.get("RECURSION_LIMIT", "100")),
-        "max_tools_per_phase": int(os.environ.get("MAX_TOOLS_PER_PHASE", "30")),
-        "max_consecutive_same_tool": int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "3")),
-        "max_autonomous_nudges": int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "2")),
-        "max_tools_ingest": int(os.environ.get("MAX_TOOLS_INGEST", "10")),
-        "max_tools_calibration": int(os.environ.get("MAX_TOOLS_CALIBRATION", "10")),
-        "max_tools_registration": int(os.environ.get("MAX_TOOLS_REGISTRATION", "10")),
-        "max_tools_analysis": int(os.environ.get("MAX_TOOLS_ANALYSIS", "10")),
-        "max_tools_stacking": int(os.environ.get("MAX_TOOLS_STACKING", "10")),
-        "max_tools_linear": int(os.environ.get("MAX_TOOLS_LINEAR", "20")),
-        "max_tools_stretch": int(os.environ.get("MAX_TOOLS_STRETCH", "25")),
-        "max_tools_nonlinear": int(os.environ.get("MAX_TOOLS_NONLINEAR", "25")),
-        "max_tools_export": int(os.environ.get("MAX_TOOLS_EXPORT", "5")),
-        "cleanup_previous_runs": os.environ.get("CLEANUP_PREVIOUS_RUNS", "true").lower() == "true",
-        "prune_phase_analysis": os.environ.get("PRUNE_PHASE_ANALYSIS", "true").lower() == "true",
+        "llm_model": os.environ.get("LLM_MODEL", "") or _pcfg("model", "default", "moonshotai/Kimi-K2.5"),
+        "recursion_limit": int(os.environ.get("RECURSION_LIMIT", "") or _pcfg("limits", "recursion_limit", 100)),
+        "max_tools_per_phase": int(os.environ.get("MAX_TOOLS_PER_PHASE", "") or _pcfg("limits", "max_tools_per_phase", 30)),
+        "max_consecutive_same_tool": int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "") or _pcfg("limits", "max_consecutive_same_tool", 3)),
+        "max_autonomous_nudges": int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "") or _pcfg("limits", "max_autonomous_nudges", 2)),
+        "max_tools_ingest": int(os.environ.get("MAX_TOOLS_INGEST", "") or per_phase.get("ingest", 5)),
+        "max_tools_calibration": int(os.environ.get("MAX_TOOLS_CALIBRATION", "") or per_phase.get("calibration", 10)),
+        "max_tools_registration": int(os.environ.get("MAX_TOOLS_REGISTRATION", "") or per_phase.get("registration", 5)),
+        "max_tools_analysis": int(os.environ.get("MAX_TOOLS_ANALYSIS", "") or per_phase.get("analysis", 5)),
+        "max_tools_stacking": int(os.environ.get("MAX_TOOLS_STACKING", "") or per_phase.get("stacking", 10)),
+        "max_tools_linear": int(os.environ.get("MAX_TOOLS_LINEAR", "") or per_phase.get("linear", 20)),
+        "max_tools_stretch": int(os.environ.get("MAX_TOOLS_STRETCH", "") or per_phase.get("stretch", 25)),
+        "max_tools_nonlinear": int(os.environ.get("MAX_TOOLS_NONLINEAR", "") or per_phase.get("nonlinear", 25)),
+        "max_tools_export": int(os.environ.get("MAX_TOOLS_EXPORT", "") or per_phase.get("export", 5)),
+        "cleanup_previous_runs": _pcfg("behavior", "cleanup_previous_runs", True),
+        "prune_phase_analysis": _pcfg("behavior", "prune_phase_analysis", True),
     }
 
 
@@ -135,11 +136,22 @@ def _make_thread_id(target: str) -> str:
 _GRAPH = None
 
 
+_DEPENDENCY_ERROR: str | None = None
+
+
 async def _init_async_resources():
     """Build the LangGraph with AsyncSqliteSaver. Called once on app.load()."""
-    global _GRAPH
+    global _GRAPH, _DEPENDENCY_ERROR
     if _GRAPH is not None:
         return
+
+    # Check external dependencies (Siril, GraXpert, StarNet, ExifTool) early
+    # so users see actionable errors on launch, not mid-pipeline.
+    try:
+        check_dependencies(load_settings())
+    except Exception as e:
+        _DEPENDENCY_ERROR = str(e)
+        logger.error(f"Dependency check failed: {e}")
 
     serde = JsonPlusSerializer(
         allowed_msgpack_modules=[("astro_agent.graph.state", "ProcessingPhase")]
@@ -198,21 +210,27 @@ def _parse_stream_chunks(
     gallery_images: list[tuple],
     working_dir: str,
     is_linear: bool,
-) -> dict | None:
+    active_hitl: bool = False,
+) -> tuple[dict | None, bool]:
     """
     Parse a single stream chunk (stream_mode="updates") and update the UI lists.
 
-    Returns the interrupt payload if this chunk contains one, else None.
+    Returns (interrupt_payload_or_None, updated_active_hitl).
+    Routes agent text to chat during HITL, activity log during autonomous.
     Defensive: handles None values, non-dict updates, unexpected chunk formats.
     """
     if "__interrupt__" in chunk:
-        return chunk["__interrupt__"][0].value
+        return chunk["__interrupt__"][0].value, active_hitl
 
     for node_name, update in chunk.items():
         if node_name == "__interrupt__":
             continue
         if not isinstance(update, dict):
             continue
+
+        # Track active_hitl from state updates
+        if "active_hitl" in update:
+            active_hitl = update["active_hitl"]
 
         messages = update.get("messages", [])
         for msg in messages:
@@ -227,10 +245,19 @@ def _parse_stream_chunks(
                         })
                 agent_text = text_content(msg.content)
                 if agent_text.strip():
-                    chat_messages.append({
-                        "role": "assistant",
-                        "content": agent_text,
-                    })
+                    if active_hitl:
+                        # During HITL: agent text goes to CHAT (human is reading)
+                        chat_messages.append({
+                            "role": "assistant",
+                            "content": agent_text,
+                        })
+                    else:
+                        # Autonomous: agent text goes to ACTIVITY LOG
+                        activity_log.append({
+                            "role": "assistant",
+                            "content": agent_text[:200] + "..." if len(agent_text) > 200 else agent_text,
+                            "metadata": {"title": "Agent reasoning"},
+                        })
 
             elif isinstance(msg, ToolMessage):
                 result_text = text_content(msg.content)
@@ -245,6 +272,8 @@ def _parse_stream_chunks(
                             paths = [img["path"] for img in images]
                             labels = [img.get("label", f"Image {i+1}") for i, img in enumerate(images)]
                             preview_paths = _convert_fits_to_preview(paths, working_dir, is_linear)
+                            if gallery_images is None:
+                                gallery_images = []
                             gallery_images.clear()
                             for path, label in zip(preview_paths, labels):
                                 if Path(path).exists():
@@ -265,7 +294,13 @@ def _parse_stream_chunks(
                 })
 
             elif isinstance(msg, HumanMessage):
-                pass  # HITL approval/feedback — don't echo
+                # Don't echo HITL prompts, nudges, or auto-approval messages
+                kwargs = msg.additional_kwargs or {}
+                if kwargs.get("is_hitl_prompt") or kwargs.get("is_nudge"):
+                    pass
+                elif text_content(msg.content).startswith("Approved"):
+                    pass
+                # else: could show human messages during HITL conversation if needed
 
         new_phase = update.get("phase")
         if new_phase is not None:
@@ -275,7 +310,7 @@ def _parse_stream_chunks(
                 "content": f"--- Phase: **{phase_name.upper()}** ---",
             })
 
-    return None
+    return None, active_hitl
 
 
 # ── Core streaming handler (async generator) ────────────────────────────────
@@ -293,14 +328,16 @@ async def _stream_graph(
 ):
     """
     Core async streaming loop. Yields (chat, activity, gallery) tuples.
+    Routes agent text to chat (HITL) or activity log (autonomous).
     Handles interrupt payloads for HITL display.
     """
     interrupt_payload = None
+    active_hitl = False
 
     async for chunk in graph.astream(stream_input, config=config, stream_mode="updates"):
-        result = _parse_stream_chunks(
+        result, active_hitl = _parse_stream_chunks(
             chunk, chat_messages, activity_log, gallery_images,
-            working_dir, is_linear,
+            working_dir, is_linear, active_hitl,
         )
         if result is not None:
             interrupt_payload = result
@@ -309,29 +346,35 @@ async def _stream_graph(
 
     # After stream ends, handle any interrupt payload for UI display
     if interrupt_payload is not None:
-        interrupt_type = interrupt_payload.get("type", "unknown")
         title = interrupt_payload.get("title", "Review")
         agent_text = interrupt_payload.get("agent_text", "")
         images = interrupt_payload.get("images", [])
 
-        if interrupt_type == "image_review" and images and working_dir:
+        # Populate gallery with images (if available)
+        if images and working_dir:
             preview_paths = _convert_fits_to_preview(images, working_dir, is_linear)
+            if gallery_images is None:
+                gallery_images = []
             gallery_images.clear()
             for i, p in enumerate(preview_paths):
                 if Path(p).exists():
                     gallery_images.append((p, f"Variant {i + 1}"))
 
-        if interrupt_type == "agent_chat":
-            if agent_text:
-                chat_messages.append({
-                    "role": "assistant",
-                    "content": agent_text,
-                })
-        else:
-            chat_messages.append({
-                "role": "assistant",
-                "content": f"**HITL: {title}**\n\n{agent_text}" if agent_text else f"**HITL: {title}** — Awaiting your review.",
-            })
+        # Show HITL review prompt in chat
+        chat_messages.append({
+            "role": "assistant",
+            "content": (
+                f"**{title}**\n\n"
+                f"{agent_text}\n\n"
+                f"---\n"
+                f"*Review the results above. Send feedback, ask questions, "
+                f"request variants, or click Approve to continue.*"
+            ) if agent_text else (
+                f"**{title}** — Awaiting your review.\n\n"
+                f"---\n"
+                f"*Send feedback or click Approve to continue.*"
+            ),
+        })
 
         yield chat_messages, activity_log, gallery_images
 
@@ -361,6 +404,15 @@ async def start_session(
         yield chat_messages, activity_log, gallery_images, state
         return
 
+    # Block session start if dependencies are missing (checked at app startup)
+    if _DEPENDENCY_ERROR:
+        chat_messages.append({
+            "role": "assistant",
+            "content": f"**Cannot start — missing dependencies.**\n\n{_DEPENDENCY_ERROR}",
+        })
+        yield chat_messages, activity_log, gallery_images, state
+        return
+
     # Parse remove_stars dropdown value
     if remove_stars == "yes":
         rs = True
@@ -374,6 +426,14 @@ async def start_session(
     yield chat_messages, activity_log, gallery_images, state
 
     try:
+        # Apply equipment overrides from UI to os.environ
+        if pixel_size and pixel_size > 0:
+            os.environ["PIXEL_SIZE_UM"] = str(pixel_size)
+        if sensor_type:
+            os.environ["SENSOR_TYPE_OVERRIDE"] = sensor_type
+        if focal_length and focal_length > 0:
+            os.environ["FOCAL_LENGTH_MM"] = str(focal_length)
+
         # Ingest dataset
         ingest_result = ingest_dataset.invoke({
             "root_directory": dataset_path,
@@ -434,11 +494,29 @@ async def start_session(
             ),
         })
 
+        # Save settings snapshot and register session for resume diff detection
+        _save_settings_snapshot(working_dir)
+        _register_session(thread_id, working_dir)
+
+        # Log model and provider at pipeline start
+        model = os.environ.get("LLM_MODEL", "unknown")
+        provider = os.environ.get("LLM_PROVIDER", "unknown")
+        logger.info(f"Pipeline starting: model={model}, provider={provider}, thread={thread_id}")
+
         yield chat_messages, activity_log, gallery_images, state
 
-        # Initialize memory if enabled
+        # Initialize memory if enabled — fail loud, don't start with degraded search
         if is_memory_enabled():
-            _init_memory()
+            err = _init_memory()
+            if err:
+                chat_messages.append({
+                    "role": "assistant",
+                    "content": (
+                        f"**Memory initialization failed — session cannot start.**\n\n{err}"
+                    ),
+                })
+                yield chat_messages, activity_log, gallery_images, state
+                return
 
         # Stream the graph
         async for chat_msgs, act_log, gal_imgs in _stream_graph(
@@ -462,6 +540,10 @@ async def send_message(
     state: dict,
 ):
     """Handle user message during HITL — resume graph with feedback."""
+    # Gradio 6 Gallery.preprocess(None) returns None for empty gallery
+    if gallery_images is None:
+        gallery_images = []
+
     if not user_text.strip():
         yield chat_messages, activity_log, gallery_images, state, ""
         return
@@ -498,6 +580,8 @@ async def approve_action(
     state: dict,
 ):
     """Handle approve button — resume graph with APPROVE_SENTINEL."""
+    if gallery_images is None:
+        gallery_images = []
     config = state.get("config")
     working_dir = state.get("working_dir", "")
     is_linear = state.get("is_linear", True)
@@ -531,6 +615,8 @@ async def resume_session(
     state: dict,
 ):
     """Resume a session from an existing checkpoint."""
+    if gallery_images is None:
+        gallery_images = []
     if not resume_id.strip():
         chat_messages.append({"role": "assistant", "content": "Please enter a thread ID to resume."})
         yield chat_messages, activity_log, gallery_images, state
@@ -564,78 +650,232 @@ async def resume_session(
         yield chat_messages, activity_log, gallery_images, state
 
 
+async def _check_resume_diffs(
+    resume_id: str,
+    chat_messages: list[dict],
+    activity_log: list[dict],
+    gallery_images: list[tuple],
+    state: dict,
+):
+    """
+    Check for settings diffs before resuming. If diffs found, show warning
+    and make Confirm Resume button visible. If no diffs, proceed with resume.
+
+    Yields: (chat, activity, gallery, state, confirm_btn_update)
+    """
+    if gallery_images is None:
+        gallery_images = []
+    confirm_hidden = gr.update(visible=False)
+    confirm_visible = gr.update(visible=True)
+
+    if not resume_id.strip():
+        chat_messages.append({"role": "assistant", "content": "Please enter a thread ID to resume."})
+        yield chat_messages, activity_log, gallery_images, state, confirm_hidden
+        return
+
+    # Look up the original session's settings
+    working_dir = _lookup_session_dir(resume_id)
+    if working_dir:
+        original = _load_settings_snapshot(working_dir)
+    else:
+        original = None
+
+    if original:
+        current = _build_settings_snapshot()
+        diffs = _diff_settings(original, current)
+
+        if diffs:
+            diff_text = "\n".join(diffs)
+            chat_messages.append({
+                "role": "assistant",
+                "content": (
+                    f"**Settings changed** since session `{resume_id}` started:\n\n"
+                    f"{diff_text}\n\n"
+                    f"Click **Confirm Resume** to proceed with the new settings, "
+                    f"or update the tabs and click **Resume** to re-check."
+                ),
+            })
+            yield chat_messages, activity_log, gallery_images, state, confirm_visible
+            return
+
+    # No diffs (or no snapshot found) — proceed directly
+    async for result in resume_session(resume_id, chat_messages, activity_log, gallery_images, state):
+        yield *result, confirm_hidden
+
+
 # ── Settings helpers ─────────────────────────────────────────────────────────
 
 
 def _apply_ui_settings(
     recursion_limit, max_tools_phase, max_consecutive, max_nudges,
-    phase_ingest, phase_calibration, phase_registration,
-    phase_analysis, phase_stacking, phase_linear,
-    phase_stretch, phase_nonlinear, phase_export,
+    phase_linear, phase_stretch, phase_nonlinear,
     cleanup_runs, prune_analysis,
-    llm_model, llm_provider,
+    llm_model,
 ):
     """Apply all UI settings to os.environ. Called before start_session via .then() chaining."""
     os.environ["LLM_MODEL"] = llm_model
-    os.environ["LLM_PROVIDER"] = llm_provider
+    from astro_agent.config import _get_model_defaults
+    os.environ["LLM_PROVIDER"] = _get_model_defaults(llm_model)["provider"]
     os.environ["RECURSION_LIMIT"] = str(int(recursion_limit))
     os.environ["MAX_TOOLS_PER_PHASE"] = str(int(max_tools_phase))
     os.environ["MAX_CONSECUTIVE_SAME_TOOL"] = str(int(max_consecutive))
     os.environ["MAX_AUTONOMOUS_NUDGES"] = str(int(max_nudges))
-    os.environ["MAX_TOOLS_INGEST"] = str(int(phase_ingest))
-    os.environ["MAX_TOOLS_CALIBRATION"] = str(int(phase_calibration))
-    os.environ["MAX_TOOLS_REGISTRATION"] = str(int(phase_registration))
-    os.environ["MAX_TOOLS_ANALYSIS"] = str(int(phase_analysis))
-    os.environ["MAX_TOOLS_STACKING"] = str(int(phase_stacking))
+    # Per-phase overrides — only the phases exposed in the UI
     os.environ["MAX_TOOLS_LINEAR"] = str(int(phase_linear))
     os.environ["MAX_TOOLS_STRETCH"] = str(int(phase_stretch))
     os.environ["MAX_TOOLS_NONLINEAR"] = str(int(phase_nonlinear))
-    os.environ["MAX_TOOLS_EXPORT"] = str(int(phase_export))
+    # Preprocessing phases use global default (from processing.toml)
     os.environ["CLEANUP_PREVIOUS_RUNS"] = "true" if cleanup_runs else "false"
     os.environ["PRUNE_PHASE_ANALYSIS"] = "true" if prune_analysis else "false"
 
 
-def _init_memory():
-    """Initialize long-term memory store. Called when memory is enabled."""
-    try:
-        from astro_agent.memory.embeddings import OllamaEmbedder
-        from astro_agent.memory.store import MemoryStore
-        from astro_agent.tools.utility.t33_memory_search import set_memory_store
-        from astro_agent.graph.registry import register_memory_tool
+def _init_memory() -> str | None:
+    """Initialize long-term memory store. Returns error message or None on success."""
+    from astro_agent.memory.embeddings import EmbeddingInitError, init_memory_system
 
+    try:
         settings = load_settings()
-        embedder = OllamaEmbedder(model=settings.memory_embedding_model)
-        store = MemoryStore(db_path=settings.memory_db_path, embedder=embedder)
-        embedder._db_conn = store._get_conn()
-        set_memory_store(store)
-        register_memory_tool()
-        logger.info("Long-term memory initialized")
-    except Exception as e:
-        logger.warning(f"Long-term memory init failed (non-fatal): {e}")
+        init_memory_system(settings, rebuild_embeddings=settings.memory_rebuild_embeddings)
+        return None
+    except EmbeddingInitError as e:
         set_memory_enabled(False)
+        logger.error(f"Memory initialization failed: {e}")
+        return str(e)
 
 
 def _on_memory_toggle(enabled: bool):
     """Handle memory checkbox toggle."""
     set_memory_enabled(enabled)
     if enabled:
-        _init_memory()
+        err = _init_memory()
+        if err:
+            import gradio as gr
+            gr.Warning(f"Memory init failed: {err}")
 
 
 def _format_model_info(model_name: str) -> str:
     """Display model defaults dynamically from _MODEL_DEFAULTS config."""
-    from astro_agent.config import _get_model_defaults, _FALLBACK_DEFAULTS
-    defaults = _get_model_defaults(model_name)
-    if defaults is _FALLBACK_DEFAULTS:
-        return f"**{model_name}**: No preset defaults. Using fallback (temp=0, thinking=off)."
+    from astro_agent.config import _get_model_defaults, ConfigError
+    try:
+        defaults = _get_model_defaults(model_name)
+    except ConfigError:
+        return f"**{model_name}**: Not configured. Add it to `_MODEL_DEFAULTS` in `config.py`."
+    provider = defaults["provider"]
     temp = defaults["temperature"]
     temp_str = str(temp) if temp is not None else "fixed by model"
     thinking = "enabled" if defaults["thinking"] else "disabled"
     budget = defaults.get("thinking_budget", 0)
-    lines = [f"**{model_name}** defaults: temperature={temp_str}, thinking={thinking}"]
+    lines = [f"**{model_name}** — provider: {provider}, temperature: {temp_str}, thinking: {thinking}"]
     if budget > 0:
         lines.append(f"Thinking budget: {budget} tokens")
     return "  \n".join(lines)
+
+
+# ── Session settings snapshot & diff ──────────────────────────────────────────
+
+_SESSIONS_INDEX = Path.home() / ".astro_agent" / "sessions.json"
+
+
+def _build_settings_snapshot() -> dict:
+    """Capture current runtime settings into a dict for later diff comparison."""
+    from astro_agent.graph.hitl import (
+        is_autonomous, is_memory_enabled, vlm_hitl, vlm_autonomous,
+        TOOL_TO_HITL, is_enabled,
+    )
+    return {
+        "model": os.environ.get("LLM_MODEL", ""),
+        "autonomous": is_autonomous(),
+        "memory": is_memory_enabled(),
+        "vlm_hitl": vlm_hitl(),
+        "vlm_autonomous": vlm_autonomous(),
+        "recursion_limit": int(os.environ.get("RECURSION_LIMIT", "100")),
+        "max_tools_per_phase": int(os.environ.get("MAX_TOOLS_PER_PHASE", "30")),
+        "max_consecutive_same_tool": int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "3")),
+        "max_autonomous_nudges": int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "2")),
+        "max_tools_ingest": int(os.environ.get("MAX_TOOLS_INGEST", "5")),
+        "max_tools_calibration": int(os.environ.get("MAX_TOOLS_CALIBRATION", "10")),
+        "max_tools_registration": int(os.environ.get("MAX_TOOLS_REGISTRATION", "5")),
+        "max_tools_analysis": int(os.environ.get("MAX_TOOLS_ANALYSIS", "5")),
+        "max_tools_stacking": int(os.environ.get("MAX_TOOLS_STACKING", "10")),
+        "max_tools_linear": int(os.environ.get("MAX_TOOLS_LINEAR", "20")),
+        "max_tools_stretch": int(os.environ.get("MAX_TOOLS_STRETCH", "25")),
+        "max_tools_nonlinear": int(os.environ.get("MAX_TOOLS_NONLINEAR", "25")),
+        "max_tools_export": int(os.environ.get("MAX_TOOLS_EXPORT", "5")),
+        "cleanup_previous_runs": os.environ.get("CLEANUP_PREVIOUS_RUNS", "true").lower() == "true",
+        "prune_phase_analysis": os.environ.get("PRUNE_PHASE_ANALYSIS", "true").lower() == "true",
+        "hitl": {
+            hitl_key: is_enabled(hitl_key)
+            for hitl_key in TOOL_TO_HITL.values()
+        },
+    }
+
+
+def _diff_settings(old: dict, new: dict) -> list[str]:
+    """Compare two settings snapshots. Returns human-readable diff strings."""
+    diffs = []
+    # Top-level keys
+    for key in old:
+        if key == "hitl":
+            continue
+        if old.get(key) != new.get(key):
+            old_val = old.get(key)
+            new_val = new.get(key)
+            label = key.replace("_", " ").title()
+            diffs.append(f"- **{label}**: `{old_val}` → `{new_val}`")
+    # HITL per-tool
+    old_hitl = old.get("hitl", {})
+    new_hitl = new.get("hitl", {})
+    for tool_key in sorted(set(list(old_hitl.keys()) + list(new_hitl.keys()))):
+        old_v = old_hitl.get(tool_key, False)
+        new_v = new_hitl.get(tool_key, False)
+        if old_v != new_v:
+            status_old = "enabled" if old_v else "disabled"
+            status_new = "enabled" if new_v else "disabled"
+            diffs.append(f"- **HITL {tool_key}**: {status_old} → {status_new}")
+    return diffs
+
+
+def _register_session(thread_id: str, working_dir: str):
+    """Record thread_id → working_dir mapping for resume lookup."""
+    _SESSIONS_INDEX.parent.mkdir(parents=True, exist_ok=True)
+    index = {}
+    if _SESSIONS_INDEX.exists():
+        try:
+            index = json.loads(_SESSIONS_INDEX.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    index[thread_id] = working_dir
+    _SESSIONS_INDEX.write_text(json.dumps(index, indent=2))
+
+
+def _lookup_session_dir(thread_id: str) -> str | None:
+    """Look up working_dir for a thread_id from the sessions index."""
+    if not _SESSIONS_INDEX.exists():
+        return None
+    try:
+        index = json.loads(_SESSIONS_INDEX.read_text())
+        return index.get(thread_id)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_settings_snapshot(working_dir: str):
+    """Write current settings to settings.json in the run directory."""
+    snapshot = _build_settings_snapshot()
+    settings_path = Path(working_dir) / "settings.json"
+    settings_path.write_text(json.dumps(snapshot, indent=2))
+    logger.info(f"Settings snapshot saved to {settings_path}")
+
+
+def _load_settings_snapshot(working_dir: str) -> dict | None:
+    """Read settings.json from a run directory."""
+    settings_path = Path(working_dir) / "settings.json"
+    if not settings_path.exists():
+        return None
+    try:
+        return json.loads(settings_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 # ── Layout ───────────────────────────────────────────────────────────────────
@@ -644,17 +884,10 @@ def _format_model_info(model_name: str) -> str:
 def build_app() -> gr.Blocks:
     hitl_defaults = _load_hitl_defaults()
     equip_defaults = _load_equipment_defaults()
-    env_defaults = _load_env_defaults()
+    env_defaults = _load_processing_defaults()
     hitl_tools = hitl_defaults.get("hitl", {})
 
-    with gr.Blocks(
-        title="AstroAgent",
-        css="""
-            .gradio-container { max-width: 100% !important; padding: 0 0.5rem !important; margin: 0 !important; }
-            .main { max-width: 100% !important; }
-            .contain { max-width: 100% !important; }
-        """,
-    ) as app:
+    with gr.Blocks(title="AstroAgent") as app:
         session_state = gr.State({
             "thread_id": None,
             "config": None,
@@ -666,38 +899,6 @@ def build_app() -> gr.Blocks:
 
         # ── Processing tab ───────────────────────────────────────────
         with gr.Tab("Processing"):
-            with gr.Row(equal_height=True):
-                with gr.Column(scale=1):
-                    chatbot = gr.Chatbot(
-                        label="AstroAgent",
-                        height=600,
-                        buttons=["copy", "copy_all"],
-                    )
-                    msg_input = gr.Textbox(
-                        placeholder="Reply...",
-                        lines=1,
-                        max_lines=20,
-                        show_label=False,
-                        container=False,
-                        autoscroll=True,
-                    )
-                    approve_btn = gr.Button("Approve", variant="primary", size="sm")
-
-                with gr.Column(scale=1):
-                    gallery = gr.Gallery(
-                        label="Image Review",
-                        columns=2,
-                        height=400,
-                        allow_preview=True,
-                        buttons=["download"],
-                        interactive=False,
-                    )
-                    activity = gr.Chatbot(
-                        label="Activity Log",
-                        height=300,
-                        buttons=[],
-                    )
-
             with gr.Row():
                 with gr.Accordion("Start New Session", open=True):
                     with gr.Row():
@@ -738,6 +939,42 @@ def build_app() -> gr.Blocks:
                             scale=3,
                         )
                         resume_btn = gr.Button("Resume", scale=1)
+                        confirm_resume_btn = gr.Button(
+                            "Confirm Resume", variant="stop", visible=False, scale=1,
+                        )
+
+            with gr.Row(equal_height=True):
+                with gr.Column(scale=1):
+                    chatbot = gr.Chatbot(
+                        label="AstroAgent",
+                        height=600,
+                        buttons=["copy", "copy_all"],
+                    )
+                    msg_input = gr.Textbox(
+                        placeholder="Reply...",
+                        lines=1,
+                        max_lines=20,
+                        show_label=False,
+                        container=False,
+                        autoscroll=True,
+                    )
+                    approve_btn = gr.Button("Approve", variant="primary", size="sm")
+
+                with gr.Column(scale=1):
+                    gallery = gr.Gallery(
+                        label="Image Review",
+                        columns=2,
+                        height=400,
+                        allow_preview=True,
+                        buttons=["download"],
+                        object_fit="contain",
+                        interactive=False,
+                    )
+                    activity = gr.Chatbot(
+                        label="Activity Log",
+                        height=300,
+                        buttons=[],
+                    )
 
         # ── Session Notes tab ────────────────────────────────────────
         with gr.Tab("Session Notes"):
@@ -773,7 +1010,7 @@ def build_app() -> gr.Blocks:
             focal_length = gr.Number(
                 label="Focal length (mm)",
                 value=equip_defaults.get("optics", {}).get("focal_length_mm"),
-                info="EXIF has nominal value; plate-solve-measured is more accurate",
+                info="Approximate value for plate solving. Measured value from plate solve takes precedence.",
             )
 
         # ── HITL Config tab ──────────────────────────────────────────
@@ -790,11 +1027,11 @@ def build_app() -> gr.Blocks:
             )
             vlm_hitl = gr.Checkbox(
                 label="VLM during HITL (agent sees images during human review)",
-                value=False,
+                value=hitl_defaults.get("vlm_hitl", False),
             )
             vlm_present = gr.Checkbox(
                 label="VLM autonomous (agent can visually inspect images outside of HITL)",
-                value=False,
+                value=hitl_defaults.get("vlm_autonomous", False),
             )
             gr.Markdown("### Long-Term Memory")
             gr.Markdown(
@@ -807,38 +1044,54 @@ def build_app() -> gr.Blocks:
                 value=os.environ.get("MEMORY_ENABLED", "false").lower() == "true",
             )
             gr.Markdown("### Per-tool HITL checkpoints")
-            gr.Markdown("**Preprocessing**")
-            hitl_t02 = gr.Checkbox(label="T02 Master Frame Diagnostics", value=hitl_tools.get("T02_masters", {}).get("enabled", False))
-            hitl_t06 = gr.Checkbox(label="T06 Frame Selection", value=hitl_tools.get("T06_select", {}).get("enabled", False))
-            hitl_t07 = gr.Checkbox(label="T07 Stack Results", value=hitl_tools.get("T07_stack", {}).get("enabled", False))
+            gr.Markdown("Choose where to get involved. Every tool can be toggled independently.")
+
+            # Build all HITL checkboxes from the config, grouped by phase
+            _hitl_checkboxes = {}
+
+            def _hitl_cb(key, label, default=False):
+                cb = gr.Checkbox(label=label, value=hitl_tools.get(key, {}).get("enabled", default))
+                _hitl_checkboxes[key] = cb
+                return cb
+
+            gr.Markdown("**Calibration**")
+            _hitl_cb("T02_masters", "T02 Master Frame Diagnostics")
+            _hitl_cb("T02b_convert", "T02b Sequence Conversion")
+            _hitl_cb("T03_calibrate", "T03 Calibration")
+            gr.Markdown("**Registration**")
+            _hitl_cb("T04_register", "T04 Registration")
+            gr.Markdown("**Analysis**")
+            _hitl_cb("T05_analyze", "T05 Frame Analysis")
+            gr.Markdown("**Stacking**")
+            _hitl_cb("T06_select", "T06 Frame Selection")
+            _hitl_cb("T07_stack", "T07 Stack Results")
+            _hitl_cb("T08_crop", "T08 Auto Crop")
             gr.Markdown("**Linear**")
-            hitl_t09 = gr.Checkbox(label="T09 Gradient Removal", value=hitl_tools.get("T09_gradient", {}).get("enabled", True))
-            hitl_t10 = gr.Checkbox(label="T10 Color Calibration", value=hitl_tools.get("T10_color", {}).get("enabled", False))
-            hitl_t12 = gr.Checkbox(label="T12 Noise Reduction", value=hitl_tools.get("T12_denoise", {}).get("enabled", False))
-            hitl_t13 = gr.Checkbox(label="T13 Deconvolution", value=hitl_tools.get("T13_decon", {}).get("enabled", False))
+            _hitl_cb("T09_gradient", "T09 Gradient Removal", default=True)
+            _hitl_cb("T10_color", "T10 Color Calibration")
+            _hitl_cb("T11_green", "T11 Green Noise Removal")
+            _hitl_cb("T12_denoise", "T12 Noise Reduction")
+            _hitl_cb("T13_decon", "T13 Deconvolution")
             gr.Markdown("**Stretch**")
-            hitl_t14 = gr.Checkbox(label="T14 Stretch", value=hitl_tools.get("T14_stretch", {}).get("enabled", True))
+            _hitl_cb("T14_stretch", "T14 Stretch", default=True)
             gr.Markdown("**Non-linear**")
-            hitl_t15 = gr.Checkbox(label="T15 Star Removal", value=hitl_tools.get("T15_star_removal", {}).get("enabled", False))
-            hitl_t16 = gr.Checkbox(label="T16 Curves", value=hitl_tools.get("T16_curves", {}).get("enabled", True))
-            hitl_t17 = gr.Checkbox(label="T17 Local Contrast", value=hitl_tools.get("T17_local_contrast", {}).get("enabled", False))
-            hitl_t18 = gr.Checkbox(label="T18 Saturation", value=hitl_tools.get("T18_saturation", {}).get("enabled", False))
-            hitl_t19 = gr.Checkbox(label="T19 Star Restoration", value=hitl_tools.get("T19_star_restoration", {}).get("enabled", True))
-            hitl_t27 = gr.Checkbox(label="T27 Multiscale Sharpening", value=hitl_tools.get("T27_multiscale", {}).get("enabled", False))
+            _hitl_cb("T15_star_removal", "T15 Star Removal")
+            _hitl_cb("T16_curves", "T16 Curves", default=True)
+            _hitl_cb("T17_local_contrast", "T17 Local Contrast")
+            _hitl_cb("T18_saturation", "T18 Saturation")
+            _hitl_cb("T19_star_restoration", "T19 Star Restoration", default=True)
+            _hitl_cb("T25_mask", "T25 Mask Creation")
+            _hitl_cb("T26_reduce_stars", "T26 Star Reduction")
+            _hitl_cb("T27_multiscale", "T27 Multiscale Sharpening")
 
         # ── Model & Limits tab ───────────────────────────────────────
         with gr.Tab("Model & Limits"):
             gr.Markdown("### Model")
             llm_model = gr.Dropdown(
                 label="LLM Model",
-                choices=["moonshotai/Kimi-K2.5", "deepseek-ai/DeepSeek-V3", "claude-sonnet-4-6"],
+                choices=["moonshotai/Kimi-K2.5", "deepseek-ai/DeepSeek-V3.1", "claude-sonnet-4-6"],
                 value=env_defaults["llm_model"],
                 allow_custom_value=True,
-            )
-            llm_provider = gr.Dropdown(
-                label="Provider",
-                choices=["together", "anthropic", "openai"],
-                value=env_defaults["llm_provider"],
             )
             model_info = gr.Markdown(_format_model_info(env_defaults["llm_model"]))
 
@@ -870,20 +1123,16 @@ def build_app() -> gr.Blocks:
                     info="Max consecutive text-only responses before failing.",
                 )
 
-            gr.Markdown("### Per-Phase Tool Limits")
-            gr.Markdown("Override the global default for specific phases. 0 = use global default.")
+            gr.Markdown("### Per-Phase Overrides")
+            gr.Markdown(
+                "Override the global default for phases that need more headroom. "
+                "Preprocessing phases use the global default (tool gating limits their scope). "
+                "Fine-grained control in `processing.toml`."
+            )
             with gr.Row():
-                phase_ingest = gr.Number(label="Ingest", value=env_defaults["max_tools_ingest"], precision=0)
-                phase_calibration = gr.Number(label="Calibration", value=env_defaults["max_tools_calibration"], precision=0)
-                phase_registration = gr.Number(label="Registration", value=env_defaults["max_tools_registration"], precision=0)
-            with gr.Row():
-                phase_analysis = gr.Number(label="Analysis", value=env_defaults["max_tools_analysis"], precision=0)
-                phase_stacking = gr.Number(label="Stacking", value=env_defaults["max_tools_stacking"], precision=0)
                 phase_linear = gr.Number(label="Linear", value=env_defaults["max_tools_linear"], precision=0)
-            with gr.Row():
                 phase_stretch = gr.Number(label="Stretch", value=env_defaults["max_tools_stretch"], precision=0)
                 phase_nonlinear = gr.Number(label="Non-linear", value=env_defaults["max_tools_nonlinear"], precision=0)
-                phase_export = gr.Number(label="Export", value=env_defaults["max_tools_export"], precision=0)
 
             gr.Markdown("### Behavior")
             cleanup_runs = gr.Checkbox(
@@ -906,16 +1155,22 @@ def build_app() -> gr.Blocks:
         memory_enabled.change(fn=_on_memory_toggle, inputs=[memory_enabled])
         llm_model.change(fn=_format_model_info, inputs=[llm_model], outputs=[model_info])
 
+        # Wire all HITL checkboxes — each calls set_hitl_tool_enabled on change
+        from astro_agent.graph.hitl import set_hitl_tool_enabled
+        for hitl_key, cb in _hitl_checkboxes.items():
+            cb.change(
+                fn=lambda v, k=hitl_key: set_hitl_tool_enabled(k, v),
+                inputs=[cb],
+            )
+
         # Start session: apply settings first, then stream
         start_btn.click(
             fn=_apply_ui_settings,
             inputs=[
                 recursion_limit, max_tools_phase, max_consecutive, max_nudges,
-                phase_ingest, phase_calibration, phase_registration,
-                phase_analysis, phase_stacking, phase_linear,
-                phase_stretch, phase_nonlinear, phase_export,
+                phase_linear, phase_stretch, phase_nonlinear,
                 cleanup_runs, prune_analysis,
-                llm_model, llm_provider,
+                llm_model,
             ],
         ).then(
             fn=start_session,
@@ -941,16 +1196,27 @@ def build_app() -> gr.Blocks:
             outputs=[chatbot, activity, gallery, session_state],
         )
 
+        # Resume: apply settings, check diffs, warn if changed
+        _apply_inputs = [
+            recursion_limit, max_tools_phase, max_consecutive, max_nudges,
+            phase_linear, phase_stretch, phase_nonlinear,
+            cleanup_runs, prune_analysis,
+            llm_model,
+        ]
+
         resume_btn.click(
             fn=_apply_ui_settings,
-            inputs=[
-                recursion_limit, max_tools_phase, max_consecutive, max_nudges,
-                phase_ingest, phase_calibration, phase_registration,
-                phase_analysis, phase_stacking, phase_linear,
-                phase_stretch, phase_nonlinear, phase_export,
-                cleanup_runs, prune_analysis,
-                llm_model, llm_provider,
-            ],
+            inputs=_apply_inputs,
+        ).then(
+            fn=_check_resume_diffs,
+            inputs=[resume_id, chatbot, activity, gallery, session_state],
+            outputs=[chatbot, activity, gallery, session_state, confirm_resume_btn],
+        )
+
+        # Confirm Resume: apply settings, skip diff check, proceed directly
+        confirm_resume_btn.click(
+            fn=_apply_ui_settings,
+            inputs=_apply_inputs,
         ).then(
             fn=resume_session,
             inputs=[resume_id, chatbot, activity, gallery, session_state],
@@ -967,13 +1233,22 @@ def build_app() -> gr.Blocks:
 
 
 def main():
+    os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
     app = build_app()
     app.queue()
-    app.launch(theme=gr.themes.Soft(primary_hue="blue"))
+    app.launch(
+        theme=gr.themes.Soft(primary_hue="blue"),
+        allowed_paths=["/"],  # datasets can be anywhere on disk
+        css="""
+            .gradio-container { max-width: 100% !important; padding: 0 0.5rem !important; margin: 0 !important; }
+            .main { max-width: 100% !important; }
+            .contain { max-width: 100% !important; }
+        """,
+    )
 
 
 if __name__ == "__main__":

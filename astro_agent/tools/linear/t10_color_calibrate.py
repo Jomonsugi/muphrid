@@ -524,11 +524,17 @@ def color_calibrate(
     except ValueError as e:
         raise RuntimeError(
             f"Cannot color calibrate: pixel size unknown. {e}\n"
-            "Set pixel_size_um explicitly or add [camera] pixel_size_um to equipment.toml."
+            "Please set pixel size in the Equipment tab or in equipment.toml [camera] pixel_size_um."
         ) from e
 
-    # Resolve focal length: explicit arg → equipment.toml → None (Siril uses header/prefs)
+    # Resolve focal length: explicit arg → env var (UI) → equipment.toml → None
     resolved_fl = _resolve_fl(focal_length_mm if focal_length_mm and focal_length_mm > 0 else None)
+    if resolved_fl is None:
+        raise RuntimeError(
+            "Cannot color calibrate: focal length unknown. Plate solving requires "
+            "an approximate focal length to constrain the search.\n"
+            "Please set focal length in the Equipment tab or in equipment.toml [optics] focal_length_mm."
+        )
 
     # Resolve position hint: explicit coords > target_name SIMBAD lookup
     resolved_coords = target_coords
@@ -586,6 +592,15 @@ def color_calibrate(
         "resolved_coords": resolved_coords,
         "limitmag": limitmag,
     }
+
+    # Discrepancy reporting: inform if measured focal length differs from user input
+    measured_fl = wcs_info.get("measured_focal_length_mm")
+    if measured_fl and resolved_fl and abs(measured_fl - resolved_fl) > 1.0:
+        summary["focal_length_note"] = (
+            f"Plate-solve measured {measured_fl:.1f}mm, which differs from the "
+            f"provided {resolved_fl:.1f}mm. The measured value is more accurate. "
+            f"Consider updating the Equipment tab for future runs."
+        )
 
     return Command(update={
         "paths": {**state["paths"], "current_image": str(output_path)},

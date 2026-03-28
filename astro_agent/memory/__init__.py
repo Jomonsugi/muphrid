@@ -15,7 +15,11 @@ Architecture (informed by OpenClaw, langmem, Mem0, Zep/Graphiti, Hindsight):
   - Confidence scoring: schema-ready for v2 reinforcement logic
   - Source tagging: "hitl" (v1), "phase_gate" (v2 future), extensible
 
+Embedding backends: Ollama (external service, large models) or FastEmbed
+(in-process ONNX, no external service). Configured in processing.toml.
+Init is fail-loud — if the embedder can't start, the session is blocked.
+
 Feature flag: MEMORY_ENABLED (default: false). When off, no memory
-tools are registered, no extraction fires, and no Ollama connection
+tools are registered, no extraction fires, and no embedding connection
 is attempted. Zero overhead.
 """

@@ -274,8 +274,14 @@ def stretch_image(
 
     Transforms linear (un-stretched) data into perceptual brightness space,
     making faint signal visible. All variants stretch from the same linear
-    master — they are independent, not chained. Use distinct output_suffix
-    values to produce multiple variants for comparison.
+    master — they are independent, not chained.
+
+    Each call produces a variant with an auto-generated name from the method
+    and parameters (e.g. ghs_d25_b0_sp009). The result includes the variant
+    name and file path. To compare variants, call present_images with the
+    paths from each result.
+
+    Use select_stretch_variant to choose the best variant as the active image.
 
     Methods:
     - ghs: most control — five parameters shape the transfer function.
@@ -350,6 +356,21 @@ def stretch_image(
         )
 
     stem = img_path.stem
+
+    # Auto-generate suffix from parameters if not provided
+    if not output_suffix or output_suffix == "stretch":
+        if method == "ghs" and ghs_options is not None:
+            d = int(ghs_options.stretch_amount * 10) if ghs_options.stretch_amount else 0
+            b = int(ghs_options.local_intensity) if ghs_options.local_intensity else 0
+            sp = int(ghs_options.symmetry_point * 1000) if ghs_options.symmetry_point else 0
+            output_suffix = f"ghs_d{d}_b{b}_sp{sp:03d}"
+        elif method == "asinh":
+            sf = int(asinh_options.stretch_factor * 10) if asinh_options.stretch_factor else 0
+            output_suffix = f"asinh_sf{sf}"
+        elif method == "autostretch":
+            bg = int(autostretch_options.target_background * 100) if autostretch_options.target_background else 25
+            output_suffix = f"auto_bg{bg:03d}"
+
     output_stem = f"{stem}_{output_suffix}"
 
     if method == "ghs":

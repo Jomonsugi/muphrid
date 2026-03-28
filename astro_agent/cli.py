@@ -55,6 +55,7 @@ def process(
     resume: str = typer.Option("", help="Thread ID to resume from checkpoint."),
     autonomous: bool = typer.Option(False, "--autonomous", help="Skip all HITL interrupts."),
     memory: bool = typer.Option(False, "--memory", help="Enable long-term memory (learns from HITL sessions)."),
+    rebuild_embeddings: bool = typer.Option(False, "--rebuild-embeddings", help="Rebuild vector index after model/provider change."),
     db: str = typer.Option("checkpoints.db", help="Path to SQLite checkpoint database."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
@@ -71,24 +72,16 @@ def process(
 
     # Initialize long-term memory if enabled
     if memory:
-        from astro_agent.graph.hitl import set_memory_enabled
-        set_memory_enabled(True)
-        try:
-            from astro_agent.memory.embeddings import OllamaEmbedder
-            from astro_agent.memory.store import MemoryStore
-            from astro_agent.tools.utility.t33_memory_search import set_memory_store
-            from astro_agent.graph.registry import register_memory_tool
+        from astro_agent.memory.embeddings import EmbeddingInitError, init_memory_system
 
+        try:
             settings_pre = load_settings()
-            embedder = OllamaEmbedder(model=settings_pre.memory_embedding_model)
-            store = MemoryStore(db_path=settings_pre.memory_db_path, embedder=embedder)
-            embedder._db_conn = store._get_conn()
-            set_memory_store(store)
-            register_memory_tool()
+            rebuild = rebuild_embeddings or settings_pre.memory_rebuild_embeddings
+            init_memory_system(settings_pre, rebuild_embeddings=rebuild)
             logger.info("Long-term memory enabled")
-        except Exception as e:
-            logger.warning(f"Long-term memory init failed (non-fatal): {e}")
-            set_memory_enabled(False)
+        except EmbeddingInitError as e:
+            typer.echo(f"Error: Memory initialization failed.\n\n{e}", err=True)
+            raise typer.Exit(code=1)
 
     # Validate dependencies
     settings = load_settings()
