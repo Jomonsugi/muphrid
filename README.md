@@ -1,6 +1,8 @@
-# Muphrid
+# ✨ Muphrid
 
-Muphrid Astro Agent — LLM-powered autonomous astrophotography post-processing. Point it at a dataset of
+*Named after Eta Boötis — "the solitary one of the lancer" 🏹 — a bright star near Arcturus in the constellation Boötes.*
+
+🔭 LLM-powered autonomous astrophotography post-processing. Point it at a dataset of
 raw frames, tell it the target and sky conditions, and it handles calibration,
 stacking, stretching, and enhancement — pausing at key decision points (stretch,
 curves, star restoration) for your review.
