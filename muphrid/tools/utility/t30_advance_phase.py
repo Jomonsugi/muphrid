@@ -354,6 +354,11 @@ def advance_phase(
 
     return Command(update={
         "phase": next_phase,
+        # Variant pool is per-HITL-gate. Phase advance clears it so the next
+        # phase starts with an empty pool. The approved variant has already
+        # been promoted to current_image (either by hitl_check on variant
+        # approval, or by the tool itself in autonomous mode).
+        "variant_pool": [],
         "messages": [ToolMessage(
             content=json.dumps(result, indent=2),
             tool_call_id=tool_call_id,

@@ -213,6 +213,40 @@ class ReportEntry(TypedDict):
     timestamp:      str          # ISO 8601
 
 
+class Variant(TypedDict):
+    """
+    One concrete result the agent has produced for the current HITL gate.
+
+    A variant is created automatically when a HITL-mapped tool finishes
+    executing successfully — the action node snapshots the tool's output
+    and a slice of relevant metrics, and appends an entry to state.variant_pool.
+
+    Pool semantics:
+      - Pool is per-HITL-gate. It accumulates as the agent iterates within a
+        phase and is cleared when the human (or autonomous mode) commits one.
+      - Files are written under runs/<thread_id>/variants/<id>.fits and
+        survive the active session. They are not touched by prune logic.
+      - The agent reads the pool indirectly: each HITL-tool ToolMessage is
+        enriched with a formatted pool summary so the agent has a stable,
+        indexed view of its own attempts without re-reading prior messages.
+      - On approval, the chosen variant's file is promoted to current_image
+        and the pool is cleared. Promotion happens in hitl_check, not in a
+        tool, so the agent's tool trajectory is unchanged.
+
+    See variant_pool design discussion for the full rationale.
+    """
+    id:           str           # stable id, e.g. "T09_v3"
+    phase:        str           # ProcessingPhase value when the variant was created
+    tool_name:    str           # the tool that produced it (e.g. "remove_gradient")
+    label:        str           # auto-generated human-readable label
+    params:       dict          # exact args passed to the tool
+    file_path:    str           # FITS path of the snapshotted result
+    preview_path: str | None    # JPG preview path if one exists
+    metrics:      dict          # snapshot of relevant metrics at capture time
+    created_at:   str           # ISO 8601
+    rationale:    str | None    # populated only after this variant is committed
+
+
 # ── Session context (human-provided at startup) ────────────────────────────────
 
 class SessionContext(TypedDict):
@@ -280,12 +314,13 @@ class HITLPayload(TypedDict):
     hitl_check calls interrupt(HITLPayload) and never does I/O.
     The caller reads this payload and handles all presentation.
     """
-    type:           str           # "data_review", "image_review", or "agent_chat"
-    title:          str           # human-readable title (from hitl_config.toml)
-    tool_name:      str           # the tool that triggered this checkpoint
-    images:         list[str]     # image paths produced by the tool (for image_review)
-    context:        list          # recent messages for continuity (last N)
-    agent_text:     str           # agent's response text (for multi-turn HITL display)
+    type:           str             # "data_review", "image_review", or "agent_chat"
+    title:          str             # human-readable title (from hitl_config.toml)
+    tool_name:      str             # the tool that triggered this checkpoint
+    images:         list[str]       # image paths produced by the tool (for image_review)
+    context:        list            # recent messages for continuity (last N)
+    agent_text:     str             # agent's response text (for multi-turn HITL display)
+    variant_pool:   list[Variant]   # variants captured during this HITL gate (for variant panel UI)
 
 
 # ── Top-level graph state ──────────────────────────────────────────────────────
@@ -316,6 +351,12 @@ class AstroState(TypedDict):
     # (not agent_chat) even when it responds without tool calls, so the
     # human can chat freely before approving or requesting revision.
     active_hitl: bool
+
+    # Variant pool — concrete results produced for the current HITL gate.
+    # Built passively as a side effect of HITL-mapped tool execution in the
+    # action node. Cleared on phase advance and on variant commit. Default
+    # LangGraph "replace" semantics: nodes return the full new list.
+    variant_pool: list[Variant]
 
 
 # ── Factory ────────────────────────────────────────────────────────────────────
@@ -392,6 +433,7 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
         messages=[],
         user_feedback={},
         active_hitl=False,
+        variant_pool=[],
     )
 
 

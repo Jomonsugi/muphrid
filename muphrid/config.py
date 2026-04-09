@@ -204,6 +204,16 @@ def load_settings() -> Settings:
     tracing_env = _optional("LANGCHAIN_TRACING_V2", "")
     tracing = tracing_env.lower() == "true" if tracing_env else _pcfg("tracing", "enabled", False)
 
+    # LangSmith reads LANGCHAIN_PROJECT directly from os.environ to route
+    # traces. If the user hasn't set it explicitly (in shell or .env), export
+    # the value from processing.toml so traces land in the configured project
+    # instead of the SDK's "default" fallback. Existing env var wins as the
+    # override.
+    if tracing and not _optional("LANGCHAIN_PROJECT"):
+        project = _pcfg("tracing", "project", "muphrid")
+        if project:
+            os.environ["LANGCHAIN_PROJECT"] = project
+
     # Memory
     memory_env = _optional("MEMORY_ENABLED", "")
     memory_enabled = memory_env.lower() == "true" if memory_env else _pcfg("memory", "enabled", False)

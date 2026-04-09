@@ -13,6 +13,7 @@ whether to pause — it just calls tools and gets intercepted.
 from __future__ import annotations
 
 import json
+import os
 import tomllib
 
 from muphrid.graph.content import text_content
@@ -37,6 +38,7 @@ _CFG = _load_config()
 _RUNTIME_AUTONOMOUS: bool = False
 _RUNTIME_VLM_HITL: bool | None = None
 _RUNTIME_VLM_AUTONOMOUS: bool | None = None
+_RUNTIME_VLM_RETENTION_MAX: int | None = None
 _RUNTIME_MEMORY_ENABLED: bool = False
 
 
@@ -56,6 +58,12 @@ def set_vlm_autonomous(value: bool) -> None:
     """Called by the app to override the toml vlm_autonomous flag."""
     global _RUNTIME_VLM_AUTONOMOUS
     _RUNTIME_VLM_AUTONOMOUS = value
+
+
+def set_vlm_retention_max(value: int) -> None:
+    """Called by the app to override the toml vlm_retention_max_images value."""
+    global _RUNTIME_VLM_RETENTION_MAX
+    _RUNTIME_VLM_RETENTION_MAX = int(value)
 
 
 def set_memory_enabled(value: bool) -> None:
@@ -101,6 +109,34 @@ def vlm_autonomous() -> bool:
     if _RUNTIME_VLM_AUTONOMOUS is not None:
         return _RUNTIME_VLM_AUTONOMOUS
     return _CFG.get("vlm_autonomous", False)
+
+
+def vlm_window_cap() -> int:
+    """
+    Hard total cap on images retained in the agent's view per agent_node call.
+
+    Applies when vlm_autonomous is on; vlm_hitl alone uses gate-only
+    visibility (no persistence outside the active gate).
+
+    HITL gate images count against this cap like any other multimodal
+    HumanMessage. The single exception is "gate overflow": when the active
+    HITL gate alone contains more images than the cap, the gate is shown in
+    full (so the user can reference any variant they see in Gradio) and no
+    remaining budget is granted to older non-gate images. Effective ceiling:
+
+        max(cap, |images in current HITL gate|)
+
+    Resolution order: runtime override (Gradio) → env var → toml → default 8.
+    """
+    if _RUNTIME_VLM_RETENTION_MAX is not None:
+        return _RUNTIME_VLM_RETENTION_MAX
+    env = os.environ.get("VLM_RETENTION_MAX_IMAGES")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    return int(_CFG.get("vlm_retention_max_images", 8))
 
 
 # ── Tool name → HITL config key mapping ──────────────────────────────────────
@@ -176,24 +212,85 @@ def resolve_hitl_checkpoint(messages: list) -> tuple[str | None, str | None]:
 
 # ── Affirmative detection ─────────────────────────────────────────────────────
 # HITL responses are structured, not free-text parsed. The UI (CLI, Gradio,
-# etc.) presents an explicit approve/revise choice and sends this sentinel
-# when the user approves. Any other string is treated as revision feedback.
+# etc.) presents an explicit approve/revise choice and sends a sentinel string
+# on approval. Any other string is treated as revision feedback.
+#
+# Two flavors of approval sentinel:
+#
+#   APPROVE_SENTINEL — bare approval ("approve current state, advance phase").
+#     Used by clients that don't render the variant pool (e.g. CLI). Optionally
+#     followed by a free-text note.
+#
+#   APPROVE_VARIANT_SENTINEL — explicit variant approval, payload is JSON with
+#     {"id": "<variant_id>", "rationale": "<optional text>"}. Sent by the
+#     Gradio UI when the human clicks a specific variant's Approve button.
+#     The variant_id is unambiguous; the rationale is whatever was in the
+#     textbox at click time, recorded as the human's stated reason.
 
 APPROVE_SENTINEL = "__APPROVE__"
+APPROVE_VARIANT_SENTINEL = "__APPROVE_VARIANT__"
 
 
 def is_affirmative(response: str) -> bool:
-    """Check if the response starts with the approval sentinel."""
-    return response.strip().startswith(APPROVE_SENTINEL)
+    """Check if the response is any kind of approval (bare or variant-specific)."""
+    text = response.strip()
+    return text.startswith(APPROVE_SENTINEL) or text.startswith(APPROVE_VARIANT_SENTINEL)
+
+
+def is_variant_approval(response: str) -> bool:
+    """Check if the response is a variant-specific approval."""
+    return response.strip().startswith(APPROVE_VARIANT_SENTINEL)
 
 
 def extract_approval_note(response: str) -> str:
-    """Extract the human's note from an approve-with-note response, or empty string."""
+    """
+    Extract the human's note from a bare approve-with-note response.
+    Returns empty string for variant approvals (use parse_variant_approval
+    for those).
+    """
     text = response.strip()
+    if text.startswith(APPROVE_VARIANT_SENTINEL):
+        return ""
     if text.startswith(APPROVE_SENTINEL):
-        note = text[len(APPROVE_SENTINEL):].strip()
-        return note
+        return text[len(APPROVE_SENTINEL):].strip()
     return ""
+
+
+def parse_variant_approval(response: str) -> tuple[str | None, str]:
+    """
+    Parse a variant approval sentinel into (variant_id, rationale).
+
+    Format: __APPROVE_VARIANT__{"id": "T09_v3", "rationale": "..."}
+
+    Returns (None, "") if the payload is malformed — the caller should
+    treat this as revision feedback rather than approval.
+    """
+    text = response.strip()
+    if not text.startswith(APPROVE_VARIANT_SENTINEL):
+        return None, ""
+    payload = text[len(APPROVE_VARIANT_SENTINEL):].strip()
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None, ""
+    if not isinstance(data, dict):
+        return None, ""
+    variant_id = data.get("id")
+    if not isinstance(variant_id, str) or not variant_id:
+        return None, ""
+    rationale = data.get("rationale", "")
+    if not isinstance(rationale, str):
+        rationale = ""
+    return variant_id, rationale
+
+
+def build_variant_approval(variant_id: str, rationale: str = "") -> str:
+    """
+    Build the approval sentinel string for a variant. Used by UI clients.
+    Always pairs with parse_variant_approval on the receiving side.
+    """
+    payload = json.dumps({"id": variant_id, "rationale": rationale})
+    return f"{APPROVE_VARIANT_SENTINEL}{payload}"
 
 
 # ── Image extraction from message history ─────────────────────────────────────

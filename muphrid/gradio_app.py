@@ -50,12 +50,14 @@ from langgraph.types import Command
 from muphrid.config import check_dependencies, load_settings, make_llm
 from muphrid.graph.graph import build_graph
 from muphrid.graph.hitl import (
-    APPROVE_SENTINEL,
+    build_variant_approval,
     set_autonomous,
     set_vlm_hitl,
     set_vlm_autonomous,
+    set_vlm_retention_max,
     set_memory_enabled,
     is_memory_enabled,
+    vlm_window_cap,
 )
 from muphrid.graph.content import text_content
 from muphrid.graph.memory import make_memory_store
@@ -111,6 +113,7 @@ def _load_processing_defaults() -> dict:
         "max_tools_per_phase": int(os.environ.get("MAX_TOOLS_PER_PHASE", "") or _pcfg("limits", "max_tools_per_phase", 30)),
         "max_consecutive_same_tool": int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "") or _pcfg("limits", "max_consecutive_same_tool", 3)),
         "max_autonomous_nudges": int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "") or _pcfg("limits", "max_autonomous_nudges", 2)),
+        "max_silent_hitl_tools": int(os.environ.get("MAX_SILENT_HITL_TOOLS", "") or _pcfg("limits", "max_silent_hitl_tools", 3)),
         "max_tools_ingest": int(os.environ.get("MAX_TOOLS_INGEST", "") or per_phase.get("ingest", 5)),
         "max_tools_calibration": int(os.environ.get("MAX_TOOLS_CALIBRATION", "") or per_phase.get("calibration", 10)),
         "max_tools_registration": int(os.environ.get("MAX_TOOLS_REGISTRATION", "") or per_phase.get("registration", 5)),
@@ -246,11 +249,9 @@ def _parse_stream_chunks(
                 agent_text = text_content(msg.content)
                 if agent_text.strip():
                     if active_hitl:
-                        # During HITL: agent text goes to CHAT (human is reading)
-                        chat_messages.append({
-                            "role": "assistant",
-                            "content": agent_text,
-                        })
+                        # During HITL: skip — the post-stream HITL panel renders
+                        # this same text with the tool title and review footer.
+                        pass
                     else:
                         # Autonomous: agent text goes to ACTIVITY LOG
                         activity_log.append({
@@ -283,6 +284,30 @@ def _parse_stream_chunks(
                                     "role": "assistant",
                                     "content": f"**{title}**\n\n{description}" if title else description,
                                 })
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+                # Announce export paths in chat as soon as export_final completes,
+                # so the human knows where the finished pipeline wrote its outputs.
+                # Without this they'd have to dig through the activity log or the
+                # filesystem to find the result.
+                elif msg.name == "export_final":
+                    try:
+                        result = json.loads(result_text)
+                        files = result.get("exported_files", [])
+                        if files:
+                            lines = ["**Pipeline complete — output files written:**", ""]
+                            for f in files:
+                                size_mb = f.get("file_size_mb", "?")
+                                fmt = f.get("format", "?")
+                                profile = f.get("icc_profile", "?")
+                                path = f.get("path", "?")
+                                lines.append(f"- `{path}`")
+                                lines.append(f"  *{fmt} · {profile} · {size_mb} MB*")
+                            chat_messages.append({
+                                "role": "assistant",
+                                "content": "\n".join(lines),
+                            })
                     except (json.JSONDecodeError, KeyError):
                         pass
 
@@ -323,13 +348,18 @@ async def _stream_graph(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    variant_pool: list[dict],
     working_dir: str,
     is_linear: bool,
 ):
     """
-    Core async streaming loop. Yields (chat, activity, gallery) tuples.
+    Core async streaming loop. Yields (chat, activity, gallery, variant_pool).
     Routes agent text to chat (HITL) or activity log (autonomous).
     Handles interrupt payloads for HITL display.
+
+    variant_pool is replaced fresh from each HITL payload (not mutated in
+    place) so the UI's variant panel re-renders via @gr.render when it
+    changes. Empty list outside of HITL.
     """
     interrupt_payload = None
     active_hitl = False
@@ -342,41 +372,54 @@ async def _stream_graph(
         if result is not None:
             interrupt_payload = result
 
-        yield chat_messages, activity_log, gallery_images
+        yield chat_messages, activity_log, gallery_images, variant_pool
 
     # After stream ends, handle any interrupt payload for UI display
     if interrupt_payload is not None:
         title = interrupt_payload.get("title", "Review")
-        agent_text = interrupt_payload.get("agent_text", "")
         images = interrupt_payload.get("images", [])
 
-        # Populate gallery with images (if available)
-        if images and working_dir:
+        # Refresh the variant pool from the payload — replaces any prior
+        # pool in the UI. Backend already cleared it on phase advance or
+        # variant approval, so this naturally reflects the current gate.
+        variant_pool = list(interrupt_payload.get("variant_pool", []) or [])
+
+        # Populate gallery from images_from_tool ONLY if present_images didn't
+        # already populate it during streaming. The agent's curated comparison
+        # set (with proper labels) takes precedence over the auto-extracted
+        # tool outputs. Without this guard, the post-stream block would clobber
+        # the agent's 3-image comparison with a generic 2-image "Variant N"
+        # list pulled from images_from_tool, dropping any non-output reference
+        # images (e.g. the original / pre-gradient image).
+        if images and working_dir and not gallery_images:
             preview_paths = _convert_fits_to_preview(images, working_dir, is_linear)
             if gallery_images is None:
                 gallery_images = []
-            gallery_images.clear()
             for i, p in enumerate(preview_paths):
                 if Path(p).exists():
                     gallery_images.append((p, f"Variant {i + 1}"))
 
-        # Show HITL review prompt in chat
-        chat_messages.append({
-            "role": "assistant",
-            "content": (
-                f"**{title}**\n\n"
-                f"{agent_text}\n\n"
+        # Show HITL review prompt in chat. Agent text is rendered earlier
+        # in the streaming loop during active HITL — we don't repeat it here.
+        if variant_pool:
+            footer = (
+                f"**{title}** — {len(variant_pool)} variant"
+                f"{'s' if len(variant_pool) != 1 else ''} ready for review.\n\n"
                 f"---\n"
-                f"*Review the results above. Send feedback, ask questions, "
-                f"request variants, or click Approve to continue.*"
-            ) if agent_text else (
-                f"**{title}** — Awaiting your review.\n\n"
+                f"*Pick a variant from the panel to commit and advance, "
+                f"or send feedback to iterate. Type a rationale in the box "
+                f"to record it with your approval.*"
+            )
+        else:
+            footer = (
+                f"**{title}** — awaiting your review.\n\n"
                 f"---\n"
-                f"*Send feedback or click Approve to continue.*"
-            ),
-        })
+                f"*No variants in the pool yet — send feedback to guide the agent.*"
+            )
 
-        yield chat_messages, activity_log, gallery_images
+        chat_messages.append({"role": "assistant", "content": footer})
+
+        yield chat_messages, activity_log, gallery_images, variant_pool
 
 
 # ── Event handlers (async generators, direct binding) ────────────────────────
@@ -398,10 +441,11 @@ async def start_session(
     chat_messages: list[dict] = []
     activity_log: list[dict] = []
     gallery_images: list[tuple] = []
+    variant_pool: list[dict] = []
 
     if not dataset_path or not target_name:
         chat_messages.append({"role": "assistant", "content": "Please provide both a dataset path and target name."})
-        yield chat_messages, activity_log, gallery_images, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, state
         return
 
     # Block session start if dependencies are missing (checked at app startup)
@@ -410,7 +454,7 @@ async def start_session(
             "role": "assistant",
             "content": f"**Cannot start — missing dependencies.**\n\n{_DEPENDENCY_ERROR}",
         })
-        yield chat_messages, activity_log, gallery_images, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, state
         return
 
     # Parse remove_stars dropdown value
@@ -423,7 +467,7 @@ async def start_session(
 
     thread_id = _make_thread_id(target_name)
     chat_messages.append({"role": "assistant", "content": f"Starting session **{thread_id}**\n\nIngesting dataset from `{dataset_path}`..."})
-    yield chat_messages, activity_log, gallery_images, state
+    yield chat_messages, activity_log, gallery_images, variant_pool, state
 
     try:
         # Apply equipment overrides from UI to os.environ
@@ -503,7 +547,7 @@ async def start_session(
         provider = os.environ.get("LLM_PROVIDER", "unknown")
         logger.info(f"Pipeline starting: model={model}, provider={provider}, thread={thread_id}")
 
-        yield chat_messages, activity_log, gallery_images, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, state
 
         # Initialize memory if enabled — fail loud, don't start with degraded search
         if is_memory_enabled():
@@ -515,21 +559,21 @@ async def start_session(
                         f"**Memory initialization failed — session cannot start.**\n\n{err}"
                     ),
                 })
-                yield chat_messages, activity_log, gallery_images, state
+                yield chat_messages, activity_log, gallery_images, variant_pool, state
                 return
 
         # Stream the graph
-        async for chat_msgs, act_log, gal_imgs in _stream_graph(
+        async for chat_msgs, act_log, gal_imgs, vpool in _stream_graph(
             _GRAPH, config, initial_state,
-            chat_messages, activity_log, gallery_images,
+            chat_messages, activity_log, gallery_images, variant_pool,
             working_dir, state.get("is_linear", True),
         ):
-            yield chat_msgs, act_log, gal_imgs, state
+            yield chat_msgs, act_log, gal_imgs, vpool, state
 
     except Exception as e:
         logger.exception(f"Session error: {e}")
         chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, state
 
 
 async def send_message(
@@ -537,15 +581,18 @@ async def send_message(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    variant_pool: list[dict],
     state: dict,
 ):
     """Handle user message during HITL — resume graph with feedback."""
     # Gradio 6 Gallery.preprocess(None) returns None for empty gallery
     if gallery_images is None:
         gallery_images = []
+    if variant_pool is None:
+        variant_pool = []
 
     if not user_text.strip():
-        yield chat_messages, activity_log, gallery_images, state, ""
+        yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
         return
 
     config = state.get("config")
@@ -554,57 +601,83 @@ async def send_message(
 
     if not config:
         chat_messages.append({"role": "assistant", "content": "No active session. Start a new session first."})
-        yield chat_messages, activity_log, gallery_images, state, ""
+        yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
         return
 
     chat_messages.append({"role": "user", "content": user_text})
-    yield chat_messages, activity_log, gallery_images, state, ""
+    yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
 
     try:
-        async for chat_msgs, act_log, gal_imgs in _stream_graph(
+        async for chat_msgs, act_log, gal_imgs, vpool in _stream_graph(
             _GRAPH, config, Command(resume=user_text),
-            chat_messages, activity_log, gallery_images,
+            chat_messages, activity_log, gallery_images, variant_pool,
             working_dir, is_linear,
         ):
-            yield chat_msgs, act_log, gal_imgs, state, ""
+            yield chat_msgs, act_log, gal_imgs, vpool, state, ""
     except Exception as e:
         logger.exception(f"Send message error: {e}")
         chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, state, ""
+        yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
 
 
-async def approve_action(
+async def approve_variant_action(
+    variant_id: str,
+    variant_label: str,
+    rationale: str,
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    variant_pool: list[dict],
     state: dict,
 ):
-    """Handle approve button — resume graph with APPROVE_SENTINEL."""
+    """
+    Handle a variant Approve button click — resume the graph with a structured
+    APPROVE_VARIANT sentinel that names the chosen variant and carries the
+    textbox content as the human's rationale.
+
+    The backend's hitl_check parses the sentinel, calls promote_variant to
+    move the chosen variant's file to current_image, and clears the pool.
+    """
     if gallery_images is None:
         gallery_images = []
+    if variant_pool is None:
+        variant_pool = []
+
     config = state.get("config")
     working_dir = state.get("working_dir", "")
     is_linear = state.get("is_linear", True)
 
     if not config:
         chat_messages.append({"role": "assistant", "content": "No active session."})
-        yield chat_messages, activity_log, gallery_images, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
         return
 
-    chat_messages.append({"role": "user", "content": "Approved."})
-    yield chat_messages, activity_log, gallery_images, state
+    # Echo the human's choice into chat for the audit trail
+    if rationale.strip():
+        chat_messages.append({
+            "role": "user",
+            "content": f"Approving **{variant_id}** ({variant_label}) — {rationale.strip()}",
+        })
+    else:
+        chat_messages.append({
+            "role": "user",
+            "content": f"Approving **{variant_id}** ({variant_label}).",
+        })
+    yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
+
+    sentinel = build_variant_approval(variant_id, rationale.strip())
 
     try:
-        async for chat_msgs, act_log, gal_imgs in _stream_graph(
-            _GRAPH, config, Command(resume=APPROVE_SENTINEL),
-            chat_messages, activity_log, gallery_images,
+        async for chat_msgs, act_log, gal_imgs, vpool in _stream_graph(
+            _GRAPH, config, Command(resume=sentinel),
+            chat_messages, activity_log, gallery_images, variant_pool,
             working_dir, is_linear,
         ):
-            yield chat_msgs, act_log, gal_imgs, state
+            yield chat_msgs, act_log, gal_imgs, vpool, state, ""
     except Exception as e:
-        logger.exception(f"Approve error: {e}")
+        logger.exception(f"Variant approve error: {e}")
         chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
 
 
 async def resume_session(
@@ -612,14 +685,17 @@ async def resume_session(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    variant_pool: list[dict],
     state: dict,
 ):
     """Resume a session from an existing checkpoint."""
     if gallery_images is None:
         gallery_images = []
+    if variant_pool is None:
+        variant_pool = []
     if not resume_id.strip():
         chat_messages.append({"role": "assistant", "content": "Please enter a thread ID to resume."})
-        yield chat_messages, activity_log, gallery_images, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, state
         return
 
     config = {"configurable": {"thread_id": resume_id}}
@@ -635,19 +711,19 @@ async def resume_session(
     }
 
     chat_messages.append({"role": "assistant", "content": f"Resuming session **{resume_id}**..."})
-    yield chat_messages, activity_log, gallery_images, state
+    yield chat_messages, activity_log, gallery_images, variant_pool, state
 
     try:
-        async for chat_msgs, act_log, gal_imgs in _stream_graph(
+        async for chat_msgs, act_log, gal_imgs, vpool in _stream_graph(
             _GRAPH, config, Command(resume="Continue from checkpoint."),
-            chat_messages, activity_log, gallery_images,
+            chat_messages, activity_log, gallery_images, variant_pool,
             state.get("working_dir", ""), state.get("is_linear", True),
         ):
-            yield chat_msgs, act_log, gal_imgs, state
+            yield chat_msgs, act_log, gal_imgs, vpool, state
     except Exception as e:
         logger.exception(f"Resume error: {e}")
         chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, state
 
 
 async def _check_resume_diffs(
@@ -655,22 +731,25 @@ async def _check_resume_diffs(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    variant_pool: list[dict],
     state: dict,
 ):
     """
     Check for settings diffs before resuming. If diffs found, show warning
     and make Confirm Resume button visible. If no diffs, proceed with resume.
 
-    Yields: (chat, activity, gallery, state, confirm_btn_update)
+    Yields: (chat, activity, gallery, variant_pool, state, confirm_btn_update)
     """
     if gallery_images is None:
         gallery_images = []
+    if variant_pool is None:
+        variant_pool = []
     confirm_hidden = gr.update(visible=False)
     confirm_visible = gr.update(visible=True)
 
     if not resume_id.strip():
         chat_messages.append({"role": "assistant", "content": "Please enter a thread ID to resume."})
-        yield chat_messages, activity_log, gallery_images, state, confirm_hidden
+        yield chat_messages, activity_log, gallery_images, variant_pool, state, confirm_hidden
         return
 
     # Look up the original session's settings
@@ -695,11 +774,11 @@ async def _check_resume_diffs(
                     f"or update the tabs and click **Resume** to re-check."
                 ),
             })
-            yield chat_messages, activity_log, gallery_images, state, confirm_visible
+            yield chat_messages, activity_log, gallery_images, variant_pool, state, confirm_visible
             return
 
     # No diffs (or no snapshot found) — proceed directly
-    async for result in resume_session(resume_id, chat_messages, activity_log, gallery_images, state):
+    async for result in resume_session(resume_id, chat_messages, activity_log, gallery_images, variant_pool, state):
         yield *result, confirm_hidden
 
 
@@ -708,6 +787,7 @@ async def _check_resume_diffs(
 
 def _apply_ui_settings(
     recursion_limit, max_tools_phase, max_consecutive, max_nudges,
+    max_silent_hitl,
     phase_linear, phase_stretch, phase_nonlinear,
     cleanup_runs, prune_analysis,
     llm_model,
@@ -720,6 +800,7 @@ def _apply_ui_settings(
     os.environ["MAX_TOOLS_PER_PHASE"] = str(int(max_tools_phase))
     os.environ["MAX_CONSECUTIVE_SAME_TOOL"] = str(int(max_consecutive))
     os.environ["MAX_AUTONOMOUS_NUDGES"] = str(int(max_nudges))
+    os.environ["MAX_SILENT_HITL_TOOLS"] = str(int(max_silent_hitl))
     # Per-phase overrides — only the phases exposed in the UI
     os.environ["MAX_TOOLS_LINEAR"] = str(int(phase_linear))
     os.environ["MAX_TOOLS_STRETCH"] = str(int(phase_stretch))
@@ -780,7 +861,7 @@ def _build_settings_snapshot() -> dict:
     """Capture current runtime settings into a dict for later diff comparison."""
     from muphrid.graph.hitl import (
         is_autonomous, is_memory_enabled, vlm_hitl, vlm_autonomous,
-        TOOL_TO_HITL, is_enabled,
+        vlm_window_cap, TOOL_TO_HITL, is_enabled,
     )
     return {
         "model": os.environ.get("LLM_MODEL", ""),
@@ -788,10 +869,12 @@ def _build_settings_snapshot() -> dict:
         "memory": is_memory_enabled(),
         "vlm_hitl": vlm_hitl(),
         "vlm_autonomous": vlm_autonomous(),
+        "vlm_retention_max_images": vlm_window_cap(),
         "recursion_limit": int(os.environ.get("RECURSION_LIMIT", "100")),
         "max_tools_per_phase": int(os.environ.get("MAX_TOOLS_PER_PHASE", "30")),
         "max_consecutive_same_tool": int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "3")),
         "max_autonomous_nudges": int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "2")),
+        "max_silent_hitl_tools": int(os.environ.get("MAX_SILENT_HITL_TOOLS", "3")),
         "max_tools_ingest": int(os.environ.get("MAX_TOOLS_INGEST", "5")),
         "max_tools_calibration": int(os.environ.get("MAX_TOOLS_CALIBRATION", "10")),
         "max_tools_registration": int(os.environ.get("MAX_TOOLS_REGISTRATION", "5")),
@@ -894,6 +977,10 @@ def build_app() -> gr.Blocks:
             "working_dir": "",
             "is_linear": True,
         })
+        # Per-session variant pool. Re-set fresh from each HITL payload by the
+        # streaming wrappers. The variant panel below uses @gr.render against
+        # this state to redraw approve buttons whenever the pool changes.
+        variant_pool_state = gr.State([])
 
         gr.Markdown("# Muphrid")
 
@@ -951,14 +1038,13 @@ def build_app() -> gr.Blocks:
                         buttons=["copy", "copy_all"],
                     )
                     msg_input = gr.Textbox(
-                        placeholder="Reply...",
+                        placeholder="Reply, or type a rationale before approving a variant...",
                         lines=1,
                         max_lines=20,
                         show_label=False,
                         container=False,
                         autoscroll=True,
                     )
-                    approve_btn = gr.Button("Approve", variant="primary", size="sm")
 
                 with gr.Column(scale=1):
                     gallery = gr.Gallery(
@@ -975,6 +1061,90 @@ def build_app() -> gr.Blocks:
                         height=300,
                         buttons=[],
                     )
+
+            # ── Variant approval panel ───────────────────────────────────
+            # Re-rendered whenever variant_pool_state changes. Each variant
+            # gets one Approve button; clicking it sends a structured
+            # APPROVE_VARIANT sentinel via the streaming backend. The textbox
+            # content (if any) travels along as the human's recorded rationale.
+            #
+            # Defined after both columns so all referenced components
+            # (chatbot, msg_input, activity, gallery, session_state) are in
+            # scope when the render function is invoked.
+            with gr.Group():
+                @gr.render(inputs=variant_pool_state)
+                def render_variant_panel(variants):
+                    if not variants:
+                        gr.Markdown(
+                            "*No variants in the pool yet — the agent will "
+                            "produce them as it iterates through this phase.*"
+                        )
+                        return
+                    gr.Markdown(f"### Variants ({len(variants)})")
+                    for v in variants:
+                        vid = v.get("id", "?")
+                        label = v.get("label", "")
+                        metrics = v.get("metrics", {}) or {}
+                        metric_bits = []
+                        for key in ("gradient_magnitude", "snr_estimate", "signal_coverage_pct"):
+                            val = metrics.get(key)
+                            if val is None:
+                                continue
+                            short = key.split("_")[0]
+                            if isinstance(val, float):
+                                metric_bits.append(f"{short}={val:.3f}")
+                            else:
+                                metric_bits.append(f"{short}={val}")
+                        metric_str = " · ".join(metric_bits)
+                        with gr.Row():
+                            desc = f"**{vid}** — {label}"
+                            if metric_str:
+                                desc += f"  \n*{metric_str}*"
+                            gr.Markdown(desc)
+                            btn = gr.Button(
+                                f"Approve {vid}",
+                                variant="primary",
+                                size="sm",
+                                scale=0,
+                            )
+                            # Capture vid + label in a closure so each button
+                            # knows which variant it commits without needing
+                            # gr.State() instances inside the render loop —
+                            # creating fresh gr.State on every render triggers
+                            # Svelte's effect_update_depth_exceeded infinite
+                            # loop guard and freezes the entire UI.
+                            #
+                            # The closure is an async generator (matching
+                            # approve_variant_action's signature) so Gradio's
+                            # inspect-based dispatch routes it correctly.
+                            async def _approve(
+                                rationale, chat, act, gal, pool, sess,
+                                _vid=vid, _label=label,
+                            ):
+                                async for result in approve_variant_action(
+                                    _vid, _label, rationale,
+                                    chat, act, gal, pool, sess,
+                                ):
+                                    yield result
+                            btn.click(
+                                fn=_approve,
+                                inputs=[
+                                    msg_input,
+                                    chatbot,
+                                    activity,
+                                    gallery,
+                                    variant_pool_state,
+                                    session_state,
+                                ],
+                                outputs=[
+                                    chatbot,
+                                    activity,
+                                    gallery,
+                                    variant_pool_state,
+                                    session_state,
+                                    msg_input,
+                                ],
+                            )
 
         # ── Session Notes tab ────────────────────────────────────────
         with gr.Tab("Session Notes"):
@@ -1020,6 +1190,23 @@ def build_app() -> gr.Blocks:
                 label="Autonomous mode (skip all HITL)",
                 value=hitl_defaults.get("autonomous", False),
             )
+
+            gr.Markdown("### Silent-Tool Backstop")
+            gr.Markdown(
+                "During an active HITL conversation, the agent normally re-runs "
+                "tools and narrates the comparison before the next interrupt fires "
+                "— that's how multi-variant comparisons work. But an agent that "
+                "never pauses to narrate can string together many tool calls while "
+                "the human is locked out. This backstop forces an interrupt after N "
+                "HITL-mapped tools have run since the agent last spoke. "
+                "Set to 0 to disable."
+            )
+            max_silent_hitl = gr.Number(
+                label="Max silent HITL tools before forced interrupt",
+                value=env_defaults["max_silent_hitl_tools"],
+                precision=0,
+                info="3 fits a typical 3-variant comparison; lower = more interrupts.",
+            )
             gr.Markdown("### VLM (Visual Language Model)")
             gr.Markdown(
                 "When enabled, preview images are injected as base64 into the agent's "
@@ -1032,6 +1219,18 @@ def build_app() -> gr.Blocks:
             vlm_present = gr.Checkbox(
                 label="VLM autonomous (agent can visually inspect images outside of HITL)",
                 value=hitl_defaults.get("vlm_autonomous", False),
+            )
+            vlm_retention = gr.Number(
+                label="VLM retention cap (images)",
+                value=hitl_defaults.get("vlm_retention_max_images", 8),
+                precision=0,
+                minimum=1,
+                maximum=64,
+                info=(
+                    "Sliding-window cap on the number of images retained in the agent's "
+                    "view. Only applies when VLM autonomous is on. The active HITL gate "
+                    "is always shown in addition to this cap."
+                ),
             )
             gr.Markdown("### Long-Term Memory")
             gr.Markdown(
@@ -1111,10 +1310,14 @@ def build_app() -> gr.Blocks:
                 )
             with gr.Row():
                 max_consecutive = gr.Number(
-                    label="Max consecutive same tool",
+                    label="Max identical tool calls per segment",
                     value=env_defaults["max_consecutive_same_tool"],
                     precision=0,
-                    info="Hard fail if agent calls the same tool N times in a row. 0 = disabled.",
+                    info=(
+                        "Hard fail if agent calls a tool with identical args N times "
+                        "within the current segment (since last human input or phase advance). "
+                        "Counts interleaved repeats, not just strictly consecutive. 0 = disabled."
+                    ),
                 )
                 max_nudges = gr.Number(
                     label="Max autonomous nudges",
@@ -1152,6 +1355,7 @@ def build_app() -> gr.Blocks:
         autonomous_mode.change(fn=lambda v: set_autonomous(v), inputs=[autonomous_mode])
         vlm_hitl.change(fn=lambda v: set_vlm_hitl(v), inputs=[vlm_hitl])
         vlm_present.change(fn=lambda v: set_vlm_autonomous(v), inputs=[vlm_present])
+        vlm_retention.change(fn=lambda v: set_vlm_retention_max(int(v)), inputs=[vlm_retention])
         memory_enabled.change(fn=_on_memory_toggle, inputs=[memory_enabled])
         llm_model.change(fn=_format_model_info, inputs=[llm_model], outputs=[model_info])
 
@@ -1168,6 +1372,7 @@ def build_app() -> gr.Blocks:
             fn=_apply_ui_settings,
             inputs=[
                 recursion_limit, max_tools_phase, max_consecutive, max_nudges,
+                max_silent_hitl,
                 phase_linear, phase_stretch, phase_nonlinear,
                 cleanup_runs, prune_analysis,
                 llm_model,
@@ -1180,25 +1385,23 @@ def build_app() -> gr.Blocks:
                 pixel_size, sensor_type, focal_length,
                 session_state,
             ],
-            outputs=[chatbot, activity, gallery, session_state],
+            outputs=[chatbot, activity, gallery, variant_pool_state, session_state],
         )
 
         # Direct handler binding — no wrappers
         msg_input.submit(
             fn=send_message,
-            inputs=[msg_input, chatbot, activity, gallery, session_state],
-            outputs=[chatbot, activity, gallery, session_state, msg_input],
+            inputs=[msg_input, chatbot, activity, gallery, variant_pool_state, session_state],
+            outputs=[chatbot, activity, gallery, variant_pool_state, session_state, msg_input],
         )
 
-        approve_btn.click(
-            fn=approve_action,
-            inputs=[chatbot, activity, gallery, session_state],
-            outputs=[chatbot, activity, gallery, session_state],
-        )
+        # Bare Approve button is removed — approval is variant-specific via the
+        # variant panel above. The textbox carries the rationale.
 
         # Resume: apply settings, check diffs, warn if changed
         _apply_inputs = [
             recursion_limit, max_tools_phase, max_consecutive, max_nudges,
+            max_silent_hitl,
             phase_linear, phase_stretch, phase_nonlinear,
             cleanup_runs, prune_analysis,
             llm_model,
@@ -1209,8 +1412,8 @@ def build_app() -> gr.Blocks:
             inputs=_apply_inputs,
         ).then(
             fn=_check_resume_diffs,
-            inputs=[resume_id, chatbot, activity, gallery, session_state],
-            outputs=[chatbot, activity, gallery, session_state, confirm_resume_btn],
+            inputs=[resume_id, chatbot, activity, gallery, variant_pool_state, session_state],
+            outputs=[chatbot, activity, gallery, variant_pool_state, session_state, confirm_resume_btn],
         )
 
         # Confirm Resume: apply settings, skip diff check, proceed directly
@@ -1219,8 +1422,8 @@ def build_app() -> gr.Blocks:
             inputs=_apply_inputs,
         ).then(
             fn=resume_session,
-            inputs=[resume_id, chatbot, activity, gallery, session_state],
-            outputs=[chatbot, activity, gallery, session_state],
+            inputs=[resume_id, chatbot, activity, gallery, variant_pool_state, session_state],
+            outputs=[chatbot, activity, gallery, variant_pool_state, session_state],
         )
 
         # Initialize async resources on app load

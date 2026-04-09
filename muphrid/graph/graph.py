@@ -22,6 +22,7 @@ from muphrid.graph.nodes import (
     phase_router,
     route_after_agent,
     route_after_phase_router,
+    variant_snapshot,
 )
 from muphrid.graph.registry import tools_for_phase
 from muphrid.graph.state import AstroState, ProcessingPhase
@@ -84,6 +85,7 @@ def build_graph(
     builder.add_node("phase_router", phase_router)
     builder.add_node("agent", agent_node)
     builder.add_node("action", action_node)
+    builder.add_node("variant_snapshot", variant_snapshot)
     builder.add_node("hitl_check", hitl_check)
     builder.add_node("agent_chat", agent_chat)
 
@@ -104,8 +106,12 @@ def build_graph(
         },
     )
 
-    # action → hitl_check (every tool execution gets checked for HITL)
-    builder.add_edge("action", "hitl_check")
+    # action → variant_snapshot → hitl_check
+    # variant_snapshot captures HITL-mapped tool outputs into the variant pool
+    # and enriches their ToolMessages with a pool summary for the agent. It's
+    # mode-agnostic — runs in both HITL and autonomous modes.
+    builder.add_edge("action", "variant_snapshot")
+    builder.add_edge("variant_snapshot", "hitl_check")
 
     # hitl_check → agent (passes through or returns with human feedback)
     builder.add_edge("hitl_check", "agent")

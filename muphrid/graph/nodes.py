@@ -28,16 +28,19 @@ from muphrid.graph.hitl import (
     is_affirmative,
     is_autonomous,
     is_enabled,
+    is_variant_approval,
+    parse_variant_approval,
     resolve_hitl_checkpoint,
     tool_cfg,
     vlm_autonomous,
     vlm_hitl,
+    vlm_window_cap,
 )
 from muphrid.graph.content import image_blocks, text_content
 from muphrid.graph.prompts import PHASE_PROMPTS as _PHASE_PROMPTS
 from muphrid.graph.prompts import SYSTEM_BASE as _SYSTEM_BASE
 from muphrid.graph.registry import all_tools, tools_for_phase
-from muphrid.graph.state import AstroState, HITLPayload, ProcessingPhase
+from muphrid.graph.state import AstroState, HITLPayload, ProcessingPhase, Variant
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +114,94 @@ def _strip_vlm_images(messages: list) -> list:
     return result
 
 
+def _last_phase_boundary_index(messages: list) -> int:
+    """
+    Return the index of the first message in the current phase, i.e. one
+    past the last successful advance_phase ToolMessage. Returns 0 if no
+    successful advance_phase is in the history.
+
+    Shared by _prune_phase_analysis and _apply_vlm_retention_policy.
+    """
+    boundary = 0
+    for i, msg in enumerate(messages):
+        if (
+            isinstance(msg, ToolMessage)
+            and getattr(msg, "name", None) == "advance_phase"
+            and "Cannot advance" not in str(msg.content)
+        ):
+            boundary = i + 1
+    return boundary
+
+
+def _current_hitl_gate_start(messages: list, phase_start: int) -> int:
+    """
+    Return the index of the first message in the current HITL gate.
+
+    A "gate" is bounded by either the phase boundary or the most recent
+    HumanMessage tagged with additional_kwargs={"event": "gate_closed"}
+    (written by promote_variant and the bare-approval path in hitl_check
+    when a HITL gate resolves). Walks backward from the end down to
+    phase_start. If a gate-close marker is found, the gate starts at
+    that_index + 1. Otherwise the gate starts at phase_start.
+    """
+    for i in range(len(messages) - 1, phase_start - 1, -1):
+        msg = messages[i]
+        if isinstance(msg, HumanMessage):
+            kwargs = getattr(msg, "additional_kwargs", None) or {}
+            if kwargs.get("event") == "gate_closed":
+                return i + 1
+    return phase_start
+
+
+def _is_vlm_hitl_message(msg) -> bool:
+    """
+    True if msg is a multimodal HumanMessage tagged as a HITL VLM injection
+    (label prefix [VLM-HITL]). Used by the retention policy to identify
+    messages that must always be pinned during an active HITL gate.
+    """
+    if not isinstance(msg, HumanMessage):
+        return False
+    if not isinstance(msg.content, list):
+        return False
+    for block in msg.content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            return str(block.get("text", "")).startswith("[VLM-HITL]")
+    return False
+
+
+def _replace_with_placeholder(msg: HumanMessage, placeholder: str) -> HumanMessage:
+    """
+    Build a new HumanMessage with all image_url blocks removed and a static
+    placeholder text appended. Preserves any existing text. Pure constructor.
+    """
+    existing_text = text_content(msg.content)
+    combined = f"{existing_text}\n{placeholder}" if existing_text else placeholder
+    return HumanMessage(content=combined)
+
+
+def _trim_message_images(
+    msg: HumanMessage, keep_newest: int, placeholder: str
+) -> HumanMessage:
+    """
+    Build a new HumanMessage that keeps only the newest `keep_newest` image
+    blocks (last in list order) and drops the older ones. Appends a static
+    placeholder text noting how many were dropped. Pure constructor.
+    """
+    if not isinstance(msg.content, list):
+        return msg
+    text_blocks = [b for b in msg.content if isinstance(b, dict) and b.get("type") == "text"]
+    img_blks = image_blocks(msg.content)
+    n_total = len(img_blks)
+    if keep_newest >= n_total:
+        return msg
+    kept_imgs = img_blks[n_total - keep_newest:] if keep_newest > 0 else []
+    new_blocks: list[dict] = []
+    new_blocks.extend(text_blocks)
+    new_blocks.extend(kept_imgs)
+    new_blocks.append({"type": "text", "text": placeholder})
+    return HumanMessage(content=new_blocks)
+
+
 _ANALYSIS_TOOLS = {"analyze_image", "analyze_frames"}
 
 
@@ -129,15 +220,7 @@ def _prune_phase_analysis(messages: list) -> list:
     if os.environ.get("PRUNE_PHASE_ANALYSIS", "").lower() not in ("1", "true"):
         return messages
 
-    # Find the last successful advance_phase boundary
-    phase_boundary = 0
-    for i, msg in enumerate(messages):
-        if (
-            isinstance(msg, ToolMessage)
-            and getattr(msg, "name", None) == "advance_phase"
-            and "Cannot advance" not in str(msg.content)
-        ):
-            phase_boundary = i + 1
+    phase_boundary = _last_phase_boundary_index(messages)
 
     result = []
     for i, msg in enumerate(messages):
@@ -228,10 +311,172 @@ def _inject_present_images_vlm(
                     preview_paths.append(str(p))
 
             if preview_paths:
-                return _make_vlm_message(preview_paths, "Visual inspection of presented images")
+                return _make_vlm_message(
+                    preview_paths,
+                    "Visual inspection of presented images",
+                    vlm_role="autonomous",
+                )
             return None
         break
     return None
+
+
+# ── VLM retention policy ─────────────────────────────────────────────────────
+#
+# Single source of truth for "what images can the agent see right now".
+# Mode-aware:
+#
+#   neither       → strip everything (current behavior)
+#   vlm_hitl only → during active HITL: pin current gate's [VLM-HITL] messages
+#                   and strip everything else.
+#                   outside HITL: strip everything (no leakage past gate).
+#   vlm_autonomous → phase-scoped sliding window with optional HITL pinning:
+#       - prior-phase images released to placeholder text
+#       - current HITL gate's [VLM-HITL] messages pinned (uncapped)
+#       - other multimodal HumanMessages bounded by vlm_window_cap()
+#
+# Pure function: returns a new list, never mutates messages or state.
+# Only rewrites HumanMessages — ToolMessages (including the cache_control
+# advance_phase marker set above in agent_node) are never touched.
+
+_VLM_PLACEHOLDER_PRIOR_PHASE = (
+    "[VLM: image released — belonged to a completed phase]"
+)
+_VLM_PLACEHOLDER_WINDOW = (
+    "[VLM: image released by sliding-window retention policy]"
+)
+
+
+def _vlm_trim_placeholder(kept: int, total: int) -> str:
+    return f"[VLM: kept newest {kept} of {total} images; older ones released by retention policy]"
+
+
+def _apply_vlm_retention_policy(messages: list, raw_messages: list) -> list:
+    """
+    Apply the VLM image retention policy to the message list passed to the
+    model. See module-level comment above for the full policy spec.
+    """
+    hitl_on = vlm_hitl()
+    auto_on = vlm_autonomous()
+
+    # Both modes off → strip everything (legacy behavior).
+    if not hitl_on and not auto_on:
+        return _strip_vlm_images(messages)
+
+    in_active_hitl = _in_active_hitl(raw_messages)
+
+    # ── Mode A: vlm_hitl only ────────────────────────────────────────────
+    # Outside HITL: strip everything (no leakage past gate).
+    # Inside HITL: pin current gate's [VLM-HITL] messages, strip the rest.
+    if hitl_on and not auto_on:
+        if not in_active_hitl:
+            return _strip_vlm_images(messages)
+
+        phase_start = _last_phase_boundary_index(messages)
+        gate_start = _current_hitl_gate_start(messages, phase_start)
+        pinned_indices = {
+            i for i in range(gate_start, len(messages))
+            if _is_vlm_hitl_message(messages[i])
+        }
+
+        result: list = []
+        for i, msg in enumerate(messages):
+            if i in pinned_indices:
+                result.append(msg)
+            elif isinstance(msg, HumanMessage) and image_blocks(msg.content):
+                result.append(_replace_with_placeholder(msg, _VLM_PLACEHOLDER_WINDOW))
+            else:
+                result.append(msg)
+        logger.debug(
+            f"vlm_retention(hitl-only): pinned={len(pinned_indices)} "
+            f"gate_start={gate_start} phase_start={phase_start}"
+        )
+        return result
+
+    # ── Mode B/C: vlm_autonomous on (with or without vlm_hitl) ───────────
+    # The autonomous present_images injection (if any) was already appended
+    # to `messages` by agent_node before calling this helper, so it shows up
+    # as the newest message and is naturally counted in the window pass.
+    #
+    # The cap is a HARD total ceiling on visible images. The single exception
+    # is "gate overflow": when the active HITL gate alone exceeds the cap,
+    # the gate is shown in full (so the user can reference any variant in
+    # Gradio) but no remaining budget is granted to older non-gate images.
+    # In all other cases HITL gate images count against the cap like any
+    # other multimodal HumanMessage.
+
+    phase_start = _last_phase_boundary_index(messages)
+    gate_start = _current_hitl_gate_start(messages, phase_start)
+
+    # Identify HITL gate messages and their total image count.
+    hitl_gate_indices: set[int] = (
+        {
+            i for i in range(gate_start, len(messages))
+            if _is_vlm_hitl_message(messages[i])
+        }
+        if hitl_on
+        else set()
+    )
+    hitl_gate_image_count = sum(
+        len(image_blocks(messages[i].content)) for i in hitl_gate_indices
+    )
+
+    cap = vlm_window_cap()
+
+    # Gate-overflow exception: only when the active HITL gate alone exceeds
+    # the cap. In that case pin the gate (zero remaining budget for older
+    # images). Otherwise the gate counts against the cap normally.
+    gate_overflow = hitl_gate_image_count > cap
+    pinned_indices: set[int] = hitl_gate_indices if gate_overflow else set()
+    remaining = 0 if gate_overflow else cap
+
+    # Phase-release pass: strip image blocks from any pre-phase HumanMessage,
+    # leave a placeholder so the agent knows visual context existed there.
+    result = list(messages)
+    for i in range(phase_start):
+        msg = result[i]
+        if isinstance(msg, HumanMessage) and image_blocks(msg.content):
+            result[i] = _replace_with_placeholder(msg, _VLM_PLACEHOLDER_PRIOR_PHASE)
+
+    # Sliding window pass: walk reverse from end down to phase_start, count
+    # images, keep newest until cap is exhausted, strip older ones. Pinned
+    # messages (gate overflow only) skip the budget entirely.
+    kept_count = 0
+    stripped_count = 0
+    for i in range(len(result) - 1, phase_start - 1, -1):
+        if i in pinned_indices:
+            continue
+        msg = result[i]
+        if not isinstance(msg, HumanMessage):
+            continue
+        n_imgs = len(image_blocks(msg.content))
+        if n_imgs == 0:
+            continue
+        if remaining >= n_imgs:
+            remaining -= n_imgs
+            kept_count += n_imgs
+            continue
+        if remaining > 0:
+            keep = remaining
+            result[i] = _trim_message_images(
+                msg, keep_newest=keep, placeholder=_vlm_trim_placeholder(keep, n_imgs)
+            )
+            kept_count += keep
+            stripped_count += (n_imgs - keep)
+            remaining = 0
+        else:
+            result[i] = _replace_with_placeholder(msg, _VLM_PLACEHOLDER_WINDOW)
+            stripped_count += n_imgs
+
+    pinned_image_count = sum(
+        len(image_blocks(result[i].content)) for i in pinned_indices
+    )
+    logger.debug(
+        f"vlm_retention(auto): cap={cap} kept={kept_count} pinned={pinned_image_count} "
+        f"stripped={stripped_count} gate_overflow={gate_overflow} "
+        f"gate_imgs={hitl_gate_image_count} gate_start={gate_start} phase_start={phase_start}"
+    )
+    return result
 
 
 # ── Stuck-loop detection ──────────────────────────────────────────────────────
@@ -286,50 +531,72 @@ def _check_phase_tool_limit(messages: list, phase) -> None:
 
 def _check_stuck_loop(messages: list) -> None:
     """
-    Walk backward through recent messages to detect repeated identical tool calls.
-    Raises StuckLoopError if the limit is hit. Does nothing if limit is 0.
+    Detect repeated identical tool calls within the current segment.
 
-    Only triggers when both the tool name AND arguments are identical across
-    consecutive calls. Calling build_masters(file_type="bias") then
-    build_masters(file_type="dark") is intentional — not a stuck loop.
+    A "segment" is the run of agent activity since the most recent reset point:
+    either the last successful advance_phase (new phase = clean slate) or the
+    last HumanMessage (human gave new direction = clean slate). Within a
+    segment, every (name, args) fingerprint is counted; if any single
+    fingerprint appears `MAX_CONSECUTIVE_SAME_TOOL` or more times, the agent
+    is stuck and StuckLoopError is raised.
+
+    The previous version only flagged STRICTLY CONSECUTIVE repeats and missed
+    the common stuck pattern of `[curves(X), satu(Y), curves(X), satu(Y),
+    curves(X)]` — the agent thinks it's iterating but really it's re-applying
+    the same parameters with no-op work in between. The counter-based check
+    catches this regardless of interleaving.
+
+    Note: the env var name is historical — the semantic is now "max identical
+    invocations within the current segment", not "max consecutive".
+
+    Calling build_masters(file_type="bias") then build_masters(file_type="dark")
+    still passes, because the args differ → distinct fingerprints → distinct
+    counts. Only repeated calls with the *same* args trip the detector.
     """
     import json
     import os
+    from collections import Counter
+
     limit = int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "0"))
     if limit <= 0:
         return
 
-    # Collect (name, args_fingerprint) tuples for recent tool calls
-    recent_calls: list[str] = []  # serialized (name, sorted_args) for comparison
+    counts: Counter[str] = Counter()
     for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            # advance_phase marks the start of a new phase = clean slate
+            if getattr(msg, "name", None) == "advance_phase":
+                break
+            continue  # other tool results don't affect the count
+        if isinstance(msg, HumanMessage):
+            # Human intervention resets — re-application after feedback is OK
+            break
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tc in msg.tool_calls:
                 fingerprint = json.dumps(
                     {"name": tc["name"], "args": tc.get("args", {})},
                     sort_keys=True,
                 )
-                recent_calls.append(fingerprint)
-            if len(recent_calls) >= limit:
-                break
-        elif isinstance(msg, (ToolMessage,)):
-            continue  # skip tool results, look at the AI calls
-        elif isinstance(msg, HumanMessage):
-            break  # human intervention resets the counter
-        elif isinstance(msg, AIMessage) and not msg.tool_calls:
-            break  # text response resets the counter
+                counts[fingerprint] += 1
+        # Text-only AIMessages are part of the segment (analysis between
+        # tool calls), they don't reset the counter.
 
-    if len(recent_calls) < limit:
+    if not counts:
         return
 
-    check = recent_calls[:limit]
-    if len(set(check)) == 1:
-        # All calls are identical (same name + same args)
-        call_info = json.loads(check[0])
+    # Find the fingerprint that's been called the most
+    most_common, count = counts.most_common(1)[0]
+    if count >= limit:
+        info = json.loads(most_common)
         raise StuckLoopError(
-            f"Agent called '{call_info['name']}' {limit} times with identical "
-            f"arguments {call_info['args']} — aborting. "
-            f"This likely means the model is stuck or the tool is broken. "
-            f"Set MAX_CONSECUTIVE_SAME_TOOL=0 in .env to disable this check."
+            f"Agent called '{info['name']}' {count} times with identical "
+            f"arguments {info['args']} within the current segment "
+            f"(limit: {limit}) — aborting. Other tool calls interleaved "
+            f"between these do not unwind the count; the agent is "
+            f"re-applying the same operation without meaningful change. "
+            f"If you intended this re-application, send a feedback message "
+            f"to reset the segment. Set MAX_CONSECUTIVE_SAME_TOOL=0 in "
+            f".env to disable this check."
         )
 
 
@@ -468,26 +735,23 @@ def make_agent_node(model_factory):
         else:
             messages = [SystemMessage(content=system)] + raw_messages
 
-        # VLM scoping: images are only visible when relevant.
-        # - During active HITL (vlm_hitl): preserve all images
-        # - After present_images call outside HITL (vlm_autonomous): inject
-        #   images for this one reasoning cycle
-        # - Otherwise: strip all images from the view
-        _active_hitl = _in_active_hitl(raw_messages)
-        _has_present_images = _recent_present_images(raw_messages)
-
-        if _active_hitl and vlm_hitl():
-            pass  # Keep images — agent is in visual HITL conversation
-        elif _has_present_images and vlm_autonomous() and not _active_hitl:
-            # Inject present_images results as base64 for autonomous inspection
+        # VLM scoping: see _apply_vlm_retention_policy for the full policy.
+        # First, optionally inject the autonomous present_images result so it
+        # becomes the newest message (and is naturally counted by the window
+        # pass inside the policy helper).
+        if (
+            vlm_autonomous()
+            and _recent_present_images(raw_messages)
+            and not _in_active_hitl(raw_messages)
+        ):
             working_dir = state.get("dataset", {}).get("working_dir", "")
             is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
             vlm_msg = _inject_present_images_vlm(raw_messages, working_dir, is_linear)
             if vlm_msg:
                 messages.append(vlm_msg)
                 logger.info("VLM autonomous: injecting present_images for visual inspection")
-        else:
-            messages = _strip_vlm_images(messages)
+
+        messages = _apply_vlm_retention_policy(messages, raw_messages)
 
         # Prune analysis outputs from completed phases — the model's reasoning
         # captured the conclusions; raw JSON is dead weight after phase ends.
@@ -588,14 +852,22 @@ def make_action_node():
 # ── VLM image injection ──────────────────────────────────────────────────────
 
 
-def _make_vlm_message(image_paths: list[str], label: str) -> HumanMessage | None:
+def _make_vlm_message(
+    image_paths: list[str], label: str, vlm_role: str = "hitl"
+) -> HumanMessage | None:
     """
     Build a multimodal HumanMessage with base64-encoded preview images.
 
     Converts FITS to JPG previews first. Returns None if no valid images.
     Images must be JPG/PNG — raw FITS cannot be base64-encoded for LLMs.
+
+    The vlm_role parameter ("hitl" or "autonomous") tags the message via
+    the leading text-block prefix ([VLM-HITL] or [VLM-AUTO]). The retention
+    policy in _apply_vlm_retention_policy reads this prefix to decide which
+    multimodal HumanMessages must be pinned during an active HITL gate.
     """
-    content: list[dict] = [{"type": "text", "text": f"[VLM] {label}"}]
+    tag = "[VLM-HITL]" if vlm_role == "hitl" else "[VLM-AUTO]"
+    content: list[dict] = [{"type": "text", "text": f"{tag} {label}"}]
     has_image = False
 
     for img_path in image_paths:
@@ -681,6 +953,409 @@ def _collect_hitl_images(messages: list, working_dir: str, is_linear: bool) -> l
     return preview_paths
 
 
+# ── variant_snapshot ──────────────────────────────────────────────────────────
+#
+# Runs after the action node, before hitl_check. Detects HITL-mapped tool
+# executions and snapshots them into state.variant_pool. Each captured variant
+# is a stable record of "what the agent tried" — params, output file, metrics
+# at the moment of capture. The pool accumulates across iterations within a
+# HITL gate and is cleared on phase advance or variant commit.
+#
+# Two side effects per HITL-tool execution:
+#   1. Append a Variant entry to state.variant_pool
+#   2. Enrich the ToolMessage's content with a formatted pool summary so the
+#      agent has a stable, indexed view of its own attempts on its next turn.
+#
+# Behavior is mode-agnostic: the pool builds in both HITL and autonomous modes.
+# In autonomous mode it's pure observability; in HITL mode it powers the UI's
+# variant panel and is the surface the human approves from.
+#
+# File semantics: variants reference the tool's actual output_path. Most HITL
+# tools (e.g. remove_gradient) auto-name outputs by parameter, so each variant
+# is naturally a distinct file. For tools that overwrite, multiple pool entries
+# may share a file_path — this degrades gracefully (one approvable artifact
+# from the user's view) without breaking the protocol.
+
+# Keys to probe for the variant's primary file path, in priority order. Mirrors
+# _IMAGE_PATH_KEYS in hitl.py but lives here so this module is self-contained.
+_VARIANT_FILE_KEYS = (
+    "output_path",
+    "result_path",
+    "stretched_image_path",
+    "starless_image_path",
+    "exported_path",
+    "mask_path",
+)
+
+# A small slice of metrics worth snapshotting alongside each variant. Captured
+# from current state at variant creation time so the agent and the UI can
+# compare variants without re-reading files. Most are populated by analyze_image
+# or by the HITL tool itself; missing keys are fine.
+_VARIANT_METRIC_KEYS = (
+    "gradient_magnitude",
+    "snr_estimate",
+    "background_flatness",
+    "channel_imbalance",
+    "green_excess",
+    "signal_coverage_pct",
+    "current_fwhm",
+    "current_noise",
+    "current_background",
+    "star_count",
+    "contrast_ratio",
+)
+
+
+def _phase_short_code(hitl_key: str | None) -> str:
+    """
+    Extract the 'T09'-style prefix from a hitl_key like 'T09_gradient'.
+    Falls back to 'TXX' if the key doesn't follow the convention.
+    """
+    if not hitl_key:
+        return "TXX"
+    head = hitl_key.split("_", 1)[0]
+    return head if head.startswith("T") else "TXX"
+
+
+def _find_ai_message_for_tool_call(messages: list, tool_call_id: str) -> AIMessage | None:
+    """Walk backward through messages to find the AIMessage that issued tool_call_id."""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                if tc.get("id") == tool_call_id:
+                    return msg
+    return None
+
+
+def _extract_variant_params(tool_msg: ToolMessage, ai_msg: AIMessage | None) -> dict:
+    """
+    Best-effort extraction of the params used for this variant.
+
+    Priority:
+      1. Tool's own 'settings' field in the result JSON (flat, tool-curated)
+      2. AIMessage tool_call args (nested but always available)
+      3. Empty dict (degraded but non-fatal)
+    """
+    # Try parsing the tool result for a 'settings' block
+    try:
+        result = json.loads(text_content(tool_msg.content))
+        if isinstance(result, dict) and isinstance(result.get("settings"), dict):
+            return result["settings"]
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Fall back to the AI message tool_call args
+    if ai_msg is not None:
+        for tc in ai_msg.tool_calls or []:
+            if tc.get("id") == tool_msg.tool_call_id:
+                args = tc.get("args", {})
+                return args if isinstance(args, dict) else {}
+    return {}
+
+
+def _extract_variant_paths(tool_msg: ToolMessage) -> tuple[str | None, str | None]:
+    """
+    Pull the variant's primary file path and (optional) preview path from the
+    tool result JSON. Returns (file_path, preview_path).
+    """
+    try:
+        result = json.loads(text_content(tool_msg.content))
+    except (json.JSONDecodeError, TypeError):
+        return None, None
+    if not isinstance(result, dict):
+        return None, None
+
+    file_path: str | None = None
+    for key in _VARIANT_FILE_KEYS:
+        if val := result.get(key):
+            file_path = str(val)
+            break
+
+    preview_path = result.get("preview_path")
+    return file_path, (str(preview_path) if preview_path else None)
+
+
+def _extract_variant_label(tool_msg: ToolMessage, params: dict) -> str | None:
+    """
+    Use the tool's own variant_label if it provides one, else None and the
+    caller will synthesize one from the params.
+    """
+    try:
+        result = json.loads(text_content(tool_msg.content))
+        if isinstance(result, dict):
+            label = result.get("variant_label")
+            return str(label) if label else None
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def _format_param_summary(params: dict, max_items: int = 4) -> str:
+    """
+    Render a params dict as a compact one-line string for use in labels.
+    Flattens one level of nesting, drops noise like None values.
+    """
+    flat: list[tuple[str, Any]] = []
+    for k, v in params.items():
+        if v is None:
+            continue
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                if vv is None:
+                    continue
+                flat.append((kk, vv))
+        else:
+            flat.append((k, v))
+    flat = flat[:max_items]
+    return ", ".join(f"{k}={v}" for k, v in flat)
+
+
+def _snapshot_metrics(state: AstroState) -> dict:
+    """Capture a small relevant slice of metrics from current state."""
+    metrics = state.get("metrics", {}) or {}
+    snapshot = {}
+    for key in _VARIANT_METRIC_KEYS:
+        val = metrics.get(key)
+        if val is not None:
+            snapshot[key] = val
+    return snapshot
+
+
+def _make_variant(
+    tool_msg: ToolMessage,
+    ai_msg: AIMessage | None,
+    state: AstroState,
+    pool: list[Variant],
+    phase: ProcessingPhase,
+) -> Variant | None:
+    """
+    Build a Variant entry from a HITL-tool ToolMessage. Returns None if the
+    tool result lacks a usable file path (treated as a non-variant — e.g. a
+    failed tool call that the action node still produced a message for).
+    """
+    from datetime import datetime, timezone
+
+    hitl_key = TOOL_TO_HITL.get(tool_msg.name)
+    short = _phase_short_code(hitl_key)
+
+    file_path, preview_path = _extract_variant_paths(tool_msg)
+    if not file_path:
+        return None
+
+    params = _extract_variant_params(tool_msg, ai_msg)
+
+    # Generate stable id: T09_v1, T09_v2, ...  (counts existing entries with
+    # the same prefix; pool is per-gate so this stays small)
+    same_phase = [v for v in pool if v.get("id", "").startswith(f"{short}_v")]
+    n = len(same_phase) + 1
+    variant_id = f"{short}_v{n}"
+
+    # Label: prefer tool's own variant_label, else synthesize from params
+    tool_label = _extract_variant_label(tool_msg, params)
+    if tool_label:
+        label = f"{short} v{n} — {tool_label}"
+    else:
+        param_str = _format_param_summary(params)
+        label = f"{short} v{n} — {tool_msg.name}({param_str})" if param_str else f"{short} v{n} — {tool_msg.name}"
+
+    return Variant(
+        id=variant_id,
+        phase=phase.value if hasattr(phase, "value") else str(phase),
+        tool_name=tool_msg.name,
+        label=label,
+        params=params,
+        file_path=file_path,
+        preview_path=preview_path,
+        metrics=_snapshot_metrics(state),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        rationale=None,
+    )
+
+
+def _validate_variant_pool(pool: list[Variant]) -> tuple[list[Variant], list[str]]:
+    """
+    Drop variants whose backing files no longer exist on disk.
+
+    Returns (kept, dropped_ids). Used to self-correct the pool on resume —
+    after a session is reloaded from checkpoint, files referenced by old
+    variant entries may have been wiped (cleanup_previous_runs) or manually
+    deleted. The dangling entries get pruned silently rather than confusing
+    the UI with broken Approve buttons.
+    """
+    kept: list[Variant] = []
+    dropped: list[str] = []
+    for v in pool:
+        path = v.get("file_path")
+        if path and Path(path).exists():
+            kept.append(v)
+        else:
+            dropped.append(v.get("id", "?"))
+    return kept, dropped
+
+
+def variant_snapshot(state: AstroState) -> dict[str, Any]:
+    """
+    Detect HITL-mapped tool executions in the latest action result and
+    snapshot them into state.variant_pool.
+
+    Runs between action and hitl_check, but is gated to HITL-only: it only
+    captures variants when HITL is actually enabled for the trailing
+    HITL-mapped tool. Outside HITL (autonomous mode, per-tool checkbox off,
+    runtime override disabled), the function returns early as a no-op and
+    the pool stays empty.
+
+    The pool exists solely to ground HITL conversations — its only consumers
+    are the Gradio variant panel and the hitl_check approval-dispatch path.
+    The agent itself uses message history for its own bookkeeping and never
+    reads the pool as a structured artifact, so this function does NOT
+    enrich the ToolMessage stream — it only writes to state.variant_pool.
+
+    Side effect: also self-corrects the pool by dropping any entries whose
+    backing files no longer exist on disk. This handles resume after the
+    files were cleaned up between sessions.
+    """
+    messages = state.get("messages", [])
+    if not messages:
+        return {}
+
+    # Walk backward through trailing ToolMessages from the most recent action.
+    # Stop at the first non-ToolMessage.
+    trailing: list[ToolMessage] = []
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            trailing.append(msg)
+        else:
+            break
+    trailing.reverse()  # restore chronological order
+
+    if not trailing:
+        return {}
+
+    # Filter to HITL-mapped tools only
+    hitl_msgs = [m for m in trailing if m.name in TOOL_TO_HITL]
+    if not hitl_msgs:
+        return {}
+
+    # ── HITL-enabled gate ────────────────────────────────────────────
+    # The pool's only consumers are the HITL UI panel and the hitl_check
+    # approval handler. If HITL isn't actually enabled for the tool that
+    # just executed, no consumer will ever read the pool, so the producer
+    # should not run. This is the same gate hitl_check uses to decide
+    # whether to fire interrupts, so producer and consumer agree on when
+    # HITL is "really" engaged.
+    last_hitl_msg = hitl_msgs[-1]
+    hitl_key = TOOL_TO_HITL.get(last_hitl_msg.name)
+    if hitl_key is None or not is_enabled(hitl_key):
+        return {}
+
+    phase = state.get("phase", ProcessingPhase.INGEST)
+    raw_pool = list(state.get("variant_pool", []) or [])
+
+    # Self-correct: drop dangling entries before processing new captures
+    pool, dropped = _validate_variant_pool(raw_pool)
+    if dropped:
+        logger.info(
+            f"variant_snapshot: dropped {len(dropped)} dangling variant(s) "
+            f"with missing files: {dropped}"
+        )
+
+    pool_changed = len(dropped) > 0
+    existing_paths = {v.get("file_path") for v in pool}
+
+    new_pool = pool
+    snapshotted_any = False
+
+    for msg in hitl_msgs:
+        # Dedup on file_path: if a variant with the same output file is
+        # already in the pool, we've already captured this tool call.
+        ai_msg = _find_ai_message_for_tool_call(messages, msg.tool_call_id)
+        candidate = _make_variant(msg, ai_msg, state, new_pool, phase)
+
+        if candidate is not None and candidate["file_path"] not in existing_paths:
+            new_pool = new_pool + [candidate]
+            existing_paths.add(candidate["file_path"])
+            snapshotted_any = True
+            logger.info(
+                f"variant_snapshot: captured {candidate['id']} "
+                f"({msg.name}) → {Path(candidate['file_path']).name}"
+            )
+
+    # Persist the pool whenever it changed for any reason: new captures OR
+    # dangling-entry pruning. Otherwise the next invocation would re-prune
+    # the same dangling entries.
+    if snapshotted_any or pool_changed:
+        return {"variant_pool": new_pool}
+    return {}
+
+
+# ── variant promotion ────────────────────────────────────────────────────────
+
+
+def find_variant_in_pool(pool: list[Variant], variant_id: str) -> Variant | None:
+    """Look up a Variant by id. Pure helper."""
+    for v in pool:
+        if v.get("id") == variant_id:
+            return v
+    return None
+
+
+def promote_variant(
+    state: AstroState, variant_id: str, rationale: str | None = None
+) -> dict[str, Any] | None:
+    """
+    Promote a pool variant to the current image and clear the pool.
+
+    This is the single source of truth for "approving a variant" — used by
+    hitl_check on human approval and reusable from a future autonomous-mode
+    commit_variant tool. Pure function over state: returns the dict update
+    that should be merged into AstroState. Returns None if the variant_id
+    isn't in the pool (caller decides how to surface the error).
+
+    State changes:
+      - paths.current_image := variant.file_path
+      - variant_pool := []
+      - active_hitl := False
+      - messages: append a HumanMessage announcing the approval (with
+        rationale if supplied) so the agent's next turn sees the commit
+
+    Note: this is a backend state mutation that happens during HITL resume,
+    not via a tool call. It's the one place where current_image can move to
+    a non-most-recent file. The agent doesn't track "last tool output" beyond
+    what's in messages, so its next tool call will read the promoted file
+    correctly.
+    """
+    pool = state.get("variant_pool", []) or []
+    variant = find_variant_in_pool(pool, variant_id)
+    if variant is None:
+        return None
+
+    # Build the approval text the agent will see on its next turn
+    approval_lines = [f"Approved {variant['id']} ({variant['label']})."]
+    if rationale:
+        approval_lines.append(f"Rationale: {rationale}")
+    approval_lines.append("Continue to the next step.")
+    approval_text = "\n".join(approval_lines)
+
+    paths = dict(state.get("paths", {}) or {})
+    paths["current_image"] = variant["file_path"]
+
+    logger.info(
+        f"promote_variant: {variant['id']} → current_image "
+        f"({Path(variant['file_path']).name})"
+        + (f" with rationale" if rationale else "")
+    )
+
+    return {
+        "paths": paths,
+        "variant_pool": [],
+        "active_hitl": False,
+        "messages": [HumanMessage(
+            content=approval_text,
+            additional_kwargs={"event": "gate_closed"},
+        )],
+    }
+
+
 # ── hitl_check ────────────────────────────────────────────────────────────────
 
 
@@ -695,6 +1370,62 @@ def _find_active_hitl_tool(messages: list) -> tuple[str | None, str | None]:
         if isinstance(msg, ToolMessage) and msg.name in TOOL_TO_HITL:
             return TOOL_TO_HITL[msg.name], msg.name
     return None, None
+
+
+def _count_silent_hitl_tools(messages: list) -> int:
+    """
+    Count consecutive HITL-mapped tool executions since the most recent
+    "conversation breath" — defined as any of:
+      - The agent emitted a non-empty text-only AIMessage (it narrated)
+      - The human sent a HumanMessage (real input, not VLM injection or
+        system HITL prompt)
+      - The pipeline crossed a phase boundary (advance_phase ToolMessage)
+
+    Used by hitl_check to detect the runaway pattern where an agent in
+    active HITL re-applies HITL-mapped tools without ever pausing to talk,
+    starving the human of any review opportunity. The "wait for narration"
+    branch trusts the agent to take a breath; this counter is the safety net
+    that catches the agent when it doesn't.
+
+    Returns the number of HITL-mapped ToolMessages seen since the last reset
+    point. The current ToolMessage at the end of `messages` is included in
+    the count.
+    """
+    from muphrid.graph.hitl import TOOL_TO_HITL
+
+    count = 0
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            name = getattr(msg, "name", None)
+            if name == "advance_phase":
+                # Phase boundary — clean slate
+                break
+            if name in TOOL_TO_HITL:
+                count += 1
+            continue
+        if isinstance(msg, AIMessage):
+            if msg.tool_calls:
+                # Tool-call-only AIMessage isn't a "narration breath"; the
+                # agent dispatched without speaking. Keep counting.
+                continue
+            text = text_content(msg.content) if msg.content else ""
+            if text.strip():
+                # Real text emission = the agent narrated. Reset point.
+                break
+            continue
+        if isinstance(msg, HumanMessage):
+            # Don't reset on system-injected HITL prompts or VLM injections —
+            # those aren't real human input. Real input or auto-approval text
+            # is the reset.
+            kwargs = getattr(msg, "additional_kwargs", {}) or {}
+            if kwargs.get("is_hitl_prompt") or kwargs.get("is_nudge"):
+                continue
+            if isinstance(msg.content, list):
+                # Multimodal block (VLM image injection) — not human input
+                continue
+            # Real HumanMessage content (free-text or approval) = reset
+            break
+    return count
 
 
 def hitl_check(state: AstroState) -> dict[str, Any]:
@@ -762,9 +1493,39 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                 )],
             }
         else:
-            # Re-run during active HITL — let agent analyze new result
-            logger.info(f"HITL tool {tool_name} re-executed — letting agent analyze new result")
-            return {}
+            # Re-run during active HITL.
+            #
+            # Default behavior: pass through and let the agent narrate the
+            # new result before we interrupt. This keeps the comparison
+            # workflow intact (agent runs N variants, narrates them, the
+            # human reviews them all in one go with the agent's analysis).
+            #
+            # Safety net: count how many HITL-mapped tools have run since
+            # the last narration breath. If the agent has been silently
+            # firing tools without ever speaking, force the interrupt to
+            # give the human a chance to intervene. Without this guard, an
+            # agent that never narrates can run dozens of tools after the
+            # last interrupt and the human has no way to step in. This is
+            # what bit the m20 trifid run — 54 silent tool calls after the
+            # last human feedback.
+            import os
+            silent_count = _count_silent_hitl_tools(messages)
+            silent_limit = int(os.environ.get("MAX_SILENT_HITL_TOOLS", "3"))
+            if silent_limit > 0 and silent_count >= silent_limit:
+                logger.warning(
+                    f"HITL silent-tool backstop tripped: {silent_count} "
+                    f"HITL-mapped tools have run since the agent's last "
+                    f"narration (limit: {silent_limit}) — forcing interrupt "
+                    f"on {tool_name} to restore human visibility."
+                )
+                # Fall through to the interrupt branch below
+            else:
+                logger.info(
+                    f"HITL tool {tool_name} re-executed "
+                    f"(silent_count={silent_count}/{silent_limit}) — "
+                    f"letting agent analyze new result"
+                )
+                return {}
 
     # ── Agent has analyzed — fire interrupt ──────────────────────────
     cfg = tool_cfg(hitl_key)
@@ -777,6 +1538,18 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
             _agent_text = text_content(msg.content)
             break
 
+    # Self-correct the pool before exposing it to the UI: drop any dangling
+    # entries whose files have been removed (e.g., across a session restart
+    # with cleanup_previous_runs=true). The UI must never render an Approve
+    # button for a non-existent file.
+    raw_pool_for_payload = list(state.get("variant_pool", []) or [])
+    payload_pool, dropped_at_payload = _validate_variant_pool(raw_pool_for_payload)
+    if dropped_at_payload:
+        logger.info(
+            f"hitl_check: dropped {len(dropped_at_payload)} dangling variant(s) "
+            f"before payload: {dropped_at_payload}"
+        )
+
     payload = HITLPayload(
         type=cfg["type"],
         title=cfg["title"],
@@ -784,6 +1557,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         images=image_paths,
         context=messages[-6:],
         agent_text=_agent_text,
+        variant_pool=payload_pool,
     )
 
     # VLM during HITL: inject base64 preview images so the agent can see
@@ -794,7 +1568,11 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
         preview_paths = _collect_hitl_images(messages, working_dir, is_linear)
         if preview_paths:
-            vlm_msg = _make_vlm_message(preview_paths, f"Current result from {tool_name}")
+            vlm_msg = _make_vlm_message(
+                preview_paths,
+                f"Current result from {tool_name}",
+                vlm_role="hitl",
+            )
             if vlm_msg:
                 vlm_messages = [vlm_msg]
                 logger.info(f"VLM HITL: injecting {len(preview_paths)} images")
@@ -805,6 +1583,47 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
 
     response_text = str(response)
 
+    # ── Variant approval ─────────────────────────────────────────────
+    # The Gradio variant panel sends a structured sentinel naming the
+    # specific variant being committed plus an optional rationale from
+    # the textbox. Promote the chosen variant's file to current_image,
+    # clear the pool, and surface the rationale to memory extraction.
+    if is_variant_approval(response_text):
+        variant_id, rationale = parse_variant_approval(response_text)
+        if variant_id is None:
+            # Malformed payload — treat as feedback rather than approval
+            logger.warning(f"Malformed variant approval payload: {response_text!r}")
+            return {
+                "messages": vlm_messages + [HumanMessage(content=response_text)],
+                "active_hitl": True,
+            }
+
+        update = promote_variant(state, variant_id, rationale=rationale or None)
+        if update is None:
+            # Variant id not in pool — surface as feedback so the human
+            # sees something went wrong without losing the conversation
+            logger.warning(
+                f"Variant approval for {variant_id!r} but no matching pool entry"
+            )
+            return {
+                "messages": vlm_messages + [HumanMessage(
+                    content=(
+                        f"[System] Variant {variant_id} not found in the current "
+                        f"pool — it may have been cleared by a phase advance. "
+                        f"Please re-review and approve again."
+                    )
+                )],
+                "active_hitl": True,
+            }
+
+        # Long-term memory extraction with rationale as the note
+        _extract_hitl_memories(state, messages, tool_name, rationale or "")
+
+        # Merge vlm_messages with the promotion update's messages
+        update["messages"] = vlm_messages + update["messages"]
+        return update
+
+    # ── Bare approval (CLI / fallback) ───────────────────────────────
     if is_affirmative(response_text):
         from muphrid.graph.hitl import extract_approval_note
         note = extract_approval_note(response_text)
@@ -815,7 +1634,11 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
 
         return {
             "active_hitl": False,
-            "messages": vlm_messages + [HumanMessage(content=approval_text)],
+            "variant_pool": [],
+            "messages": vlm_messages + [HumanMessage(
+                content=approval_text,
+                additional_kwargs={"event": "gate_closed"},
+            )],
         }
 
     # Human gave feedback — keep in HITL loop

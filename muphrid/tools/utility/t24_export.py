@@ -20,6 +20,7 @@ Siril commands (verified against Siril 1.4 CLI docs):
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Annotated
 
@@ -306,7 +307,7 @@ def export_final(
             "exported_files": exported_files,
         },
         "messages": [ToolMessage(
-            content=str({"exported_files": exported_files}),
+            content=json.dumps({"exported_files": exported_files}, indent=2),
             tool_call_id=tool_call_id,
         )],
     })

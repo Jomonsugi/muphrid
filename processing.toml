@@ -34,6 +34,19 @@ max_consecutive_same_tool = 3
 # Max consecutive text-only responses before failing
 max_autonomous_nudges = 2
 
+# Force a HITL interrupt after the agent has run this many HITL-mapped tools
+# during an active HITL conversation without ever pausing to narrate. The
+# default re-run behavior is to wait for the agent to take a "narration breath"
+# (a text-only AIMessage) before firing the interrupt — that lets the agent
+# run a multi-variant comparison and present them all in one go. But an agent
+# that never narrates can string together dozens of tools while the human is
+# locked out. This counter is the safety net.
+#
+# Set to 0 to disable. 3 is a sensible default: enough headroom for a typical
+# 3-variant comparison to fit in one breath, but tight enough to catch the
+# runaway pattern within a few extra calls.
+max_silent_hitl_tools = 3
+
 # ── Per-phase tool limits ─────────────────────────────────────────────────────
 # Override the global default for specific phases. 0 = use global default.
 #

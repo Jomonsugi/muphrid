@@ -16,6 +16,7 @@
 autonomous = false
 vlm_hitl = false         # when true, agent sees all images (base64) during HITL conversations
 vlm_autonomous = false   # when true, agent can visually inspect images outside of HITL via present_images
+vlm_retention_max_images = 8   # max images retained in agent view (excluding active HITL gate, which is always shown)
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 
