@@ -359,6 +359,9 @@ def advance_phase(
         # been promoted to current_image (either by hitl_check on variant
         # approval, or by the tool itself in autonomous mode).
         "variant_pool": [],
+        # visual_context is the VLM working set. Phase advance is the natural
+        # release point: prior-phase visuals are no longer decision-relevant.
+        "visual_context": [],
         "messages": [ToolMessage(
             content=json.dumps(result, indent=2),
             tool_call_id=tool_call_id,

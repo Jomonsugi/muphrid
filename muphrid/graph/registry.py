@@ -61,6 +61,7 @@ from muphrid.tools.utility.t23_pixel_math import pixel_math
 from muphrid.tools.utility.t28_extract_narrowband import extract_narrowband
 from muphrid.tools.utility.t29_resolve_target import resolve_target
 from muphrid.tools.utility.t30_advance_phase import advance_phase
+from muphrid.tools.utility.t31_commit_variant import commit_variant
 from muphrid.tools.utility.t32_present_images import present_images
 
 
@@ -73,6 +74,7 @@ UTILITY_TOOLS = [
     extract_narrowband,
     resolve_target,
     advance_phase,
+    commit_variant,
     present_images,
 ]
 

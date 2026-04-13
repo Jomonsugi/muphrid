@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """
-Unit tests for the VLM image retention policy.
+Unit tests for the state-driven VLM view construction.
 
 Run from project root:
     uv run python scripts/test_vlm_retention.py
 
-Exit 0 = all cases pass. Exit 1 = one or more failed.
+Exit 0 = all checks pass. Exit 1 = one or more failed.
 
-Builds synthetic message lists with stub base64 image_url blocks (no real
-encoding required) and asserts on the output of _apply_vlm_retention_policy.
-Also covers the helpers it depends on: _last_phase_boundary_index,
-_current_hitl_gate_start, _is_vlm_hitl_message.
+The architecture:
+  - state.variant_pool   → canonical store for active HITL gate variants
+  - state.visual_context → non-variant working set (present_images, phase_carry)
+
+_select_visible_refs reads BOTH and produces the filtered VisualRef list the
+agent should see this turn. _build_vlm_view base64-encodes those paths into
+an ephemeral multimodal HumanMessage and appends it to the message list. No
+"retention policy" walks messages — state owns visibility end to end.
+
+Tests cover:
+  1. _select_visible_refs   (pure-ish: state → filtered VisualRef list)
+  2. _build_vlm_view        (state + messages → messages + ephemeral VLM msg)
+
+Stub JPGs are written to a tempdir so _make_vlm_message has real bytes to
+base64-encode.
 """
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 project_root = Path(__file__).resolve().parent.parent
@@ -29,13 +41,16 @@ from langchain_core.messages import (
 )
 
 from muphrid.graph import hitl as hitl_mod
-from muphrid.graph.content import image_blocks
+from muphrid.graph.content import image_blocks, text_content
 from muphrid.graph.nodes import (
-    _apply_vlm_retention_policy,
-    _current_hitl_gate_start,
-    _is_vlm_hitl_message,
-    _last_phase_boundary_index,
+    _build_vlm_view,
+    _format_variant_pool_for_prompt,
+    _select_visible_refs,
+    _strip_vlm_images,
+    build_variant_promotion_update,
 )
+from muphrid.graph.state import Variant, VisualRef
+from muphrid.tools.utility.t31_commit_variant import commit_variant
 
 
 _failures: list[str] = []
@@ -51,49 +66,70 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         _failures.append(name)
 
 
-def stub_image() -> dict:
-    """Return a stub image_url content block (tiny fake base64 payload)."""
-    return {
-        "type": "image_url",
-        "image_url": {"url": "data:image/jpeg;base64,XYZ"},
+# ── Stub fixtures ────────────────────────────────────────────────────────────
+
+# Minimal valid JPG header so _make_vlm_message has something to base64-encode.
+# (_make_vlm_message just reads file bytes and encodes them — content isn't
+# validated by the helper itself.)
+_FAKE_JPG_BYTES = b"\xff\xd8\xff\xe0fakejpegbytes\xff\xd9"
+
+
+def make_stub_jpgs(n: int) -> list[str]:
+    """Create n stub JPG files in a session-wide tempdir; return paths."""
+    if not hasattr(make_stub_jpgs, "_dir"):
+        make_stub_jpgs._dir = tempfile.mkdtemp(prefix="vlm_test_")
+        make_stub_jpgs._counter = 0
+    paths = []
+    for _ in range(n):
+        make_stub_jpgs._counter += 1
+        p = Path(make_stub_jpgs._dir) / f"stub_{make_stub_jpgs._counter}.jpg"
+        p.write_bytes(_FAKE_JPG_BYTES)
+        paths.append(str(p))
+    return paths
+
+
+def vref(path: str, source: str, label: str = "stub", phase: str = "linear") -> VisualRef:
+    return VisualRef(path=path, label=label, source=source, phase=phase)
+
+
+def stub_variant(preview_path: str, vid: str = "T09_v1", label: str | None = None) -> Variant:
+    """Build a stub Variant pointing at an existing JPG preview path."""
+    return Variant(
+        id=vid,
+        phase="linear",
+        tool_name="remove_gradient",
+        label=label or f"variant {vid}",
+        params={},
+        file_path=preview_path,           # stub: same as preview for tests
+        preview_path=preview_path,        # _resolve_variant_preview returns this if it exists
+        metrics={},
+        created_at="2026-04-08T00:00:00Z",
+        rationale=None,
+    )
+
+
+def make_state(
+    variant_pool: list[Variant] | None = None,
+    visual_context: list[VisualRef] | None = None,
+    **extra,
+) -> dict:
+    """Build a minimal AstroState-shaped dict for the helpers under test."""
+    base = {
+        "variant_pool": variant_pool or [],
+        "visual_context": visual_context or [],
+        "active_hitl": False,
+        "phase": "linear",
+        "dataset": {"working_dir": ""},
+        "metrics": {"is_linear_estimate": True},
     }
-
-
-def vlm_hitl_msg(n_images: int, label: str = "test") -> HumanMessage:
-    """Build a [VLM-HITL]-tagged multimodal HumanMessage with n stub images."""
-    content = [{"type": "text", "text": f"[VLM-HITL] {label}"}]
-    for _ in range(n_images):
-        content.append(stub_image())
-    return HumanMessage(content=content)
-
-
-def vlm_auto_msg(n_images: int, label: str = "test") -> HumanMessage:
-    """Build a [VLM-AUTO]-tagged multimodal HumanMessage with n stub images."""
-    content = [{"type": "text", "text": f"[VLM-AUTO] {label}"}]
-    for _ in range(n_images):
-        content.append(stub_image())
-    return HumanMessage(content=content)
-
-
-def gate_closed_msg(text: str = "Approved T09_v3") -> HumanMessage:
-    """Build a HumanMessage tagged with the gate_closed event marker."""
-    return HumanMessage(
-        content=text,
-        additional_kwargs={"event": "gate_closed"},
-    )
-
-
-def advance_phase_tool_msg(idx: int = 0) -> ToolMessage:
-    """Build a successful advance_phase ToolMessage."""
-    return ToolMessage(
-        content='{"status": "advanced", "from": "linear", "to": "stretch"}',
-        tool_call_id=f"call_advance_{idx}",
-        name="advance_phase",
-    )
+    base.update(extra)
+    return base
 
 
 def total_image_count(messages: list) -> int:
-    return sum(len(image_blocks(m.content)) for m in messages if hasattr(m, "content"))
+    return sum(
+        len(image_blocks(m.content)) for m in messages if hasattr(m, "content")
+    )
 
 
 def reset_vlm_modes(hitl: bool, auto: bool, cap: int = 8) -> None:
@@ -103,345 +139,563 @@ def reset_vlm_modes(hitl: bool, auto: bool, cap: int = 8) -> None:
     hitl_mod._RUNTIME_VLM_RETENTION_MAX = cap
 
 
-# ── Helper-level tests ───────────────────────────────────────────────────────
+# ── _select_visible_refs cases ──────────────────────────────────────────────
 
-print("Helper checks\n" + "=" * 40)
+print("_select_visible_refs cases\n" + "=" * 40)
 
-# _last_phase_boundary_index
-msgs = [
-    SystemMessage(content="sys"),
-    HumanMessage(content="human"),
-    advance_phase_tool_msg(0),
-    AIMessage(content="moving on"),
-    advance_phase_tool_msg(1),
-    AIMessage(content="continuing"),
-]
-boundary = _last_phase_boundary_index(msgs)
-check(
-    "_last_phase_boundary_index returns index after most recent advance_phase",
-    boundary == 5,
-    f"got {boundary}, expected 5",
-)
-
-# Failed advance_phase should NOT count
-msgs2 = [
-    HumanMessage(content="h"),
-    ToolMessage(
-        content="Cannot advance: missing requirement",
-        tool_call_id="x",
-        name="advance_phase",
-    ),
-    AIMessage(content="ok"),
-]
-boundary2 = _last_phase_boundary_index(msgs2)
-check(
-    "_last_phase_boundary_index ignores failed advance_phase",
-    boundary2 == 0,
-    f"got {boundary2}, expected 0",
-)
-
-# _is_vlm_hitl_message
-check(
-    "_is_vlm_hitl_message detects [VLM-HITL] tagged HumanMessage",
-    _is_vlm_hitl_message(vlm_hitl_msg(2)) is True,
-)
-check(
-    "_is_vlm_hitl_message rejects [VLM-AUTO] tagged HumanMessage",
-    _is_vlm_hitl_message(vlm_auto_msg(2)) is False,
-)
-check(
-    "_is_vlm_hitl_message rejects plain HumanMessage",
-    _is_vlm_hitl_message(HumanMessage(content="hi")) is False,
-)
-check(
-    "_is_vlm_hitl_message rejects ToolMessage",
-    _is_vlm_hitl_message(advance_phase_tool_msg()) is False,
-)
-
-# _current_hitl_gate_start
-msgs3 = [
-    SystemMessage(content="sys"),
-    HumanMessage(content="kickoff"),
-    vlm_hitl_msg(3, "gate-1 iter-1"),
-    gate_closed_msg("Approved T09_v1"),
-    AIMessage(content="ok"),
-    vlm_hitl_msg(2, "gate-2 iter-1"),
-]
-gate = _current_hitl_gate_start(msgs3, phase_start=0)
-check(
-    "_current_hitl_gate_start finds the most recent gate_closed marker",
-    gate == 4,
-    f"got {gate}, expected 4 (just after the gate_closed marker at index 3)",
-)
-
-# No gate_closed marker → falls back to phase_start
-msgs4 = [
-    SystemMessage(content="sys"),
-    HumanMessage(content="kickoff"),
-    vlm_hitl_msg(2, "first-ever gate"),
-]
-gate2 = _current_hitl_gate_start(msgs4, phase_start=0)
-check(
-    "_current_hitl_gate_start falls back to phase_start when no marker exists",
-    gate2 == 0,
-    f"got {gate2}, expected 0",
-)
-
-# Phase boundary trumps an older gate_closed marker
-msgs5 = [
-    HumanMessage(content="h0"),
-    gate_closed_msg("Approved T09_v1"),
-    advance_phase_tool_msg(0),
-    AIMessage(content="new phase"),
-    vlm_hitl_msg(2, "new phase gate"),
-]
-phase_start_5 = _last_phase_boundary_index(msgs5)
-gate3 = _current_hitl_gate_start(msgs5, phase_start_5)
-check(
-    "_current_hitl_gate_start: phase boundary supersedes older gate_closed marker",
-    gate3 == 3,
-    f"got {gate3}, expected 3 (phase_start_5={phase_start_5})",
-)
-
-# ── Policy tests ─────────────────────────────────────────────────────────────
-
-print("\nPolicy cases\n" + "=" * 40)
-
-# Case 1: both modes off → strip everything
+# Case 1: both modes off → no refs visible
 reset_vlm_modes(hitl=False, auto=False, cap=8)
-messages = [
-    SystemMessage(content="sys"),
-    HumanMessage(content="hi"),
-    vlm_auto_msg(3, "earlier"),
-    vlm_hitl_msg(4, "now"),
-]
-out = _apply_vlm_retention_policy(messages, raw_messages=messages[1:])
+paths = make_stub_jpgs(2)
+state = make_state(
+    variant_pool=[stub_variant(paths[0], "T09_v1")],
+    visual_context=[vref(paths[1], "present_images")],
+)
+out = _select_visible_refs(state)
 check(
-    "case 1: both modes off → all images stripped",
-    total_image_count(out) == 0,
-    f"got {total_image_count(out)} images remaining",
+    "case 1: both modes off → 0 visible refs",
+    len(out) == 0,
+    f"got {len(out)}",
 )
 
-# Case 2: vlm_hitl only, in active HITL with 6 variants, cap=4 → all 6 pinned
-reset_vlm_modes(hitl=True, auto=False, cap=4)
-messages = [
-    SystemMessage(content="sys"),
-    HumanMessage(content="kickoff"),
-    vlm_auto_msg(2, "stale autonomous"),  # not pinned, should be stripped
-    AIMessage(content="ran something"),
-    ToolMessage(content="{}", tool_call_id="t1", name="remove_gradient"),
-    vlm_hitl_msg(6, "active HITL gate with 6 variants"),
-]
-raw = messages[1:]
-out = _apply_vlm_retention_policy(messages, raw_messages=raw)
-check(
-    "case 2: vlm_hitl only, active HITL with 6 variants > cap=4, all 6 pinned",
-    total_image_count(out) == 6,
-    f"got {total_image_count(out)} images remaining (expected 6)",
-)
-
-# Case 3: vlm_hitl only, NOT in active HITL → strip everything (concern 1)
+# Case 2: vlm_hitl only → only the variant_pool projection is visible
 reset_vlm_modes(hitl=True, auto=False, cap=8)
-messages = [
-    SystemMessage(content="sys"),
-    vlm_hitl_msg(4, "stale gate from before"),
-    gate_closed_msg("Approved T09_v1"),
-    AIMessage(content="working autonomously now"),
-    ToolMessage(content="{}", tool_call_id="t2", name="some_tool"),
-]
-raw = messages[1:]
-out = _apply_vlm_retention_policy(messages, raw_messages=raw)
+paths = make_stub_jpgs(4)
+state = make_state(
+    variant_pool=[
+        stub_variant(paths[0], "T09_v1"),
+        stub_variant(paths[1], "T09_v2"),
+    ],
+    visual_context=[
+        vref(paths[2], "present_images"),
+        vref(paths[3], "phase_carry"),
+    ],
+)
+out = _select_visible_refs(state)
 check(
-    "case 3 (concern 1): vlm_hitl only, NOT in active HITL → all images stripped",
-    total_image_count(out) == 0,
-    f"got {total_image_count(out)} images (expected 0 — no leakage past gate)",
+    "case 2: vlm_hitl only → only variant_pool entries visible (other sources hidden)",
+    len(out) == 2 and all(r["source"] == "hitl_variant" for r in out),
+    f"got {len(out)}, sources={[r['source'] for r in out]}",
 )
 
-# Case 4: vlm_autonomous on, 5 single-image messages, cap=3
-reset_vlm_modes(hitl=False, auto=True, cap=3)
-messages = [
-    SystemMessage(content="sys"),
-    vlm_auto_msg(1, "img1"),
-    AIMessage(content="ok"),
-    vlm_auto_msg(1, "img2"),
-    AIMessage(content="ok"),
-    vlm_auto_msg(1, "img3"),
-    AIMessage(content="ok"),
-    vlm_auto_msg(1, "img4"),
-    AIMessage(content="ok"),
-    vlm_auto_msg(1, "img5"),
-]
-raw = messages[1:]
-out = _apply_vlm_retention_policy(messages, raw_messages=raw)
+# Case 3 (concern 1): vlm_hitl only, EMPTY variant_pool → empty view
+reset_vlm_modes(hitl=True, auto=False, cap=8)
+paths = make_stub_jpgs(2)
+state = make_state(
+    variant_pool=[],
+    visual_context=[
+        vref(paths[0], "present_images"),
+        vref(paths[1], "phase_carry"),
+    ],
+)
+out = _select_visible_refs(state)
 check(
-    "case 4: autonomous on, 5 single-image messages, cap=3 → newest 3 kept",
-    total_image_count(out) == 3,
-    f"got {total_image_count(out)} images (expected 3)",
+    "case 3 (concern 1): vlm_hitl only, empty variant_pool → 0 visible (no leakage)",
+    len(out) == 0,
+    f"got {len(out)}",
 )
 
-# Case 5: vlm_autonomous on, single message with 5 images, cap=3
-reset_vlm_modes(hitl=False, auto=True, cap=3)
-messages = [
-    SystemMessage(content="sys"),
-    vlm_auto_msg(5, "five-pack"),
-]
-raw = messages[1:]
-out = _apply_vlm_retention_policy(messages, raw_messages=raw)
-check(
-    "case 5: autonomous on, single 5-image message, cap=3 → message trimmed to 3",
-    total_image_count(out) == 3,
-    f"got {total_image_count(out)} images (expected 3)",
-)
-
-# Case 6: vlm_autonomous on, phase boundary in middle → pre-phase stripped
+# Case 4: vlm_autonomous on, total entries ≤ cap → all visible
 reset_vlm_modes(hitl=False, auto=True, cap=8)
-messages = [
-    SystemMessage(content="sys"),
-    vlm_auto_msg(2, "pre-phase 1"),
-    vlm_auto_msg(2, "pre-phase 2"),
-    advance_phase_tool_msg(0),
-    AIMessage(content="new phase"),
-    vlm_auto_msg(2, "current phase"),
-]
-raw = messages[1:]
-out = _apply_vlm_retention_policy(messages, raw_messages=raw)
-# Pre-phase had 4 images; current phase has 2. Expect 2.
+paths = make_stub_jpgs(5)
+state = make_state(
+    visual_context=[vref(p, "present_images") for p in paths],
+)
+out = _select_visible_refs(state)
 check(
-    "case 6: autonomous on, phase boundary mid-stream → only post-boundary kept",
-    total_image_count(out) == 2,
-    f"got {total_image_count(out)} images (expected 2)",
+    "case 4: autonomous on, 5 ≤ cap=8 → all 5 visible",
+    len(out) == 5,
+    f"got {len(out)}",
 )
 
-# Case 7: gate-overflow exception (concern 2)
-# 8-variant gate exceeds cap=4 → gate shown in full, no budget for older imgs.
+# Case 5: vlm_autonomous on, total entries > cap → newest cap visible
+reset_vlm_modes(hitl=False, auto=True, cap=3)
+paths = make_stub_jpgs(5)
+state = make_state(
+    visual_context=[
+        vref(paths[0], "present_images", label="oldest"),
+        vref(paths[1], "present_images"),
+        vref(paths[2], "present_images"),
+        vref(paths[3], "present_images"),
+        vref(paths[4], "present_images", label="newest"),
+    ],
+)
+out = _select_visible_refs(state)
+check(
+    "case 5: autonomous on, 5 > cap=3 → newest 3 visible",
+    len(out) == 3 and out[-1]["label"] == "newest" and out[0]["path"] == paths[2],
+    f"got {len(out)}, paths={[r['path'] for r in out]}",
+)
+
+# Case 6 (concern 2): gate overflow — variant_pool alone exceeds cap
 reset_vlm_modes(hitl=True, auto=True, cap=4)
-messages = [
-    SystemMessage(content="sys"),
-    vlm_auto_msg(1, "earlier autonomous"),  # gets stripped: 0 remaining budget
-    AIMessage(content="ran tool"),
-    ToolMessage(content="{}", tool_call_id="t3", name="remove_gradient"),
-    vlm_hitl_msg(8, "active gate with 8 variants"),
-]
-raw = messages[1:]
-out = _apply_vlm_retention_policy(messages, raw_messages=raw)
-# Gate overflow: pin all 8 gate images, 0 remaining for older → strip auto.
+paths = make_stub_jpgs(9)
+state = make_state(
+    variant_pool=[stub_variant(paths[i + 1], f"T09_v{i+1}") for i in range(8)],
+    visual_context=[vref(paths[0], "present_images")],
+)
+out = _select_visible_refs(state)
 check(
-    "case 7 (concern 2): 8-variant gate > cap=4 → gate shown in full, older stripped",
-    total_image_count(out) == 8,
-    f"got {total_image_count(out)} images (expected 8 — gate overflow, no extra budget)",
+    "case 6 (concern 2): 8 variants > cap=4 → overflow shows all 8 variants, drops other sources",
+    len(out) == 8 and all(r["source"] == "hitl_variant" for r in out),
+    f"got {len(out)}, sources={[r['source'] for r in out]}",
 )
 
-# Case 7b: gate fits within cap → gate counts against cap normally
-# cap=8, 6-variant gate, 5 older single-image messages → newest 8 visible total
+# Case 6b: pool fits within cap → variants + visual_context all visible
 reset_vlm_modes(hitl=True, auto=True, cap=8)
-messages = [
-    SystemMessage(content="sys"),
-    vlm_auto_msg(1, "old1"),
-    vlm_auto_msg(1, "old2"),
-    vlm_auto_msg(1, "old3"),
-    vlm_auto_msg(1, "old4"),
-    vlm_auto_msg(1, "old5"),
-    AIMessage(content="ran tool"),
-    ToolMessage(content="{}", tool_call_id="t3b", name="remove_gradient"),
-    vlm_hitl_msg(6, "active gate with 6 variants"),
-]
-raw = messages[1:]
-out = _apply_vlm_retention_policy(messages, raw_messages=raw)
-# Gate (6) ≤ cap (8), no overflow. Walk reverse: gate takes 6, remaining=2;
-# 2 newest auto images take 2; remaining 3 auto images stripped. Total = 8.
+paths = make_stub_jpgs(5)
+state = make_state(
+    variant_pool=[
+        stub_variant(paths[2], "T09_v1"),
+        stub_variant(paths[3], "T09_v2"),
+        stub_variant(paths[4], "T09_v3"),
+    ],
+    visual_context=[
+        vref(paths[0], "present_images"),
+        vref(paths[1], "present_images"),
+    ],
+)
+out = _select_visible_refs(state)
 check(
-    "case 7b: gate fits cap → counts against cap, total ≤ cap",
-    total_image_count(out) == 8,
-    f"got {total_image_count(out)} images (expected 8 — 6 from gate + 2 newest older)",
+    "case 6b: pool fits within cap → 5 entries visible (3 variants + 2 visual_context)",
+    len(out) == 5,
+    f"got {len(out)}",
 )
 
-# Case 8: gate boundary detection — gate_closed marker between two VLM-HITL messages
-reset_vlm_modes(hitl=True, auto=True, cap=8)
-messages = [
-    SystemMessage(content="sys"),
-    vlm_hitl_msg(3, "old gate"),     # before gate_closed → not part of current gate
-    gate_closed_msg("Approved T09_v1"),
-    AIMessage(content="continuing"),
-    ToolMessage(content="{}", tool_call_id="t4", name="remove_gradient"),
-    vlm_hitl_msg(2, "new gate"),     # after gate_closed → IS the current gate
-]
-raw = messages[1:]
-out = _apply_vlm_retention_policy(messages, raw_messages=raw)
-# Current gate = new gate (2). 2 ≤ cap=8, no overflow, gate counts normally.
-# Walk reverse: new gate takes 2, remaining=6; old gate (3) takes 3, remaining=3.
-# Total = 5.
-check(
-    "case 8: gate_closed marker bounds the current gate; everything fits in cap",
-    total_image_count(out) == 5,
-    f"got {total_image_count(out)} images (expected 5 — 2 + 3, all within cap=8)",
+# Case 6c: pool ≤ cap but total > cap → newest cap entries (variants prioritized)
+reset_vlm_modes(hitl=True, auto=True, cap=3)
+paths = make_stub_jpgs(4)
+state = make_state(
+    variant_pool=[
+        stub_variant(paths[2], "T09_v1"),
+        stub_variant(paths[3], "T09_v2"),
+    ],
+    visual_context=[
+        vref(paths[0], "present_images"),
+        vref(paths[1], "present_images"),
+    ],
 )
-# Tight cap: current gate = 2 fits exactly, no budget left for old gate
-reset_vlm_modes(hitl=True, auto=True, cap=2)
-out2 = _apply_vlm_retention_policy(messages, raw_messages=raw)
-# Current gate (2) ≤ cap (2), no overflow. Walk reverse: new gate takes 2,
-# remaining=0; old gate (3) → all stripped. Total = 2.
+out = _select_visible_refs(state)
+# Combined order: visual_context first, variants last (newest). Newest 3:
+# present_images[1], variant_v1, variant_v2.
 check(
-    "case 8b: tight cap filled by current gate; older gate stripped",
-    total_image_count(out2) == 2,
-    f"got {total_image_count(out2)} images (expected 2 — current gate fills cap)",
+    "case 6c: pool ≤ cap but total > cap → newest 3 visible (variants at the end)",
+    len(out) == 3
+    and out[-1]["source"] == "hitl_variant"
+    and out[-2]["source"] == "hitl_variant"
+    and out[0]["source"] == "present_images",
+    f"got {len(out)}, sources={[r['source'] for r in out]}",
 )
 
-# Case 9: Approved-prefix HumanMessage WITHOUT the marker is NOT a gate close
-# (validates the marker is structural, not text-based)
-reset_vlm_modes(hitl=True, auto=True, cap=8)
-messages = [
-    SystemMessage(content="sys"),
-    vlm_hitl_msg(3, "first gate"),
-    HumanMessage(content="Approved this is bad"),  # plain text, no marker
-    ToolMessage(content="{}", tool_call_id="t5", name="remove_gradient"),
-    vlm_hitl_msg(2, "second gate"),
-]
-raw = messages[1:]
-out = _apply_vlm_retention_policy(messages, raw_messages=raw)
-# Without marker, both gates are in the same "current gate" (no boundary).
-# Both VLM-HITL messages should be pinned. Total: 5
+# Case 7: phase_carry + present_images, vlm_autonomous, no variants
+reset_vlm_modes(hitl=False, auto=True, cap=8)
+paths = make_stub_jpgs(2)
+state = make_state(
+    visual_context=[
+        vref(paths[0], "phase_carry", label="approved from prior gate"),
+        vref(paths[1], "present_images"),
+    ],
+)
+out = _select_visible_refs(state)
 check(
-    "case 9: plain 'Approved' text without marker does NOT close the gate",
-    total_image_count(out) == 5,
-    f"got {total_image_count(out)} images (expected 5 — both vlm_hitl msgs are in the same current gate, all fit in cap=8)",
+    "case 7: autonomous on, phase_carry + present_images visible (empty pool)",
+    len(out) == 2,
+    f"got {len(out)}",
 )
 
-# Case 10: marker propagation — explicit gate_closed marker IS detected
-reset_vlm_modes(hitl=True, auto=True, cap=8)
-messages = [
-    SystemMessage(content="sys"),
-    vlm_hitl_msg(3, "first gate"),
-    HumanMessage(
-        content="Approved this is bad",
-        additional_kwargs={"event": "gate_closed"},
-    ),
-    ToolMessage(content="{}", tool_call_id="t6", name="remove_gradient"),
-    vlm_hitl_msg(2, "second gate"),
-]
-raw = messages[1:]
-out = _apply_vlm_retention_policy(messages, raw_messages=raw)
-# Current gate = second gate (2 imgs). 2 ≤ cap=8, no overflow.
-# Walk reverse: second gate takes 2, remaining=6; first gate (3) takes 3.
-# Total: 5
-check(
-    "case 10: marker correctly closes the prior gate (loose cap keeps both)",
-    total_image_count(out) == 5,
-    f"got {total_image_count(out)} images (expected 5 — 2 + 3, all within cap=8)",
-)
-# Tight cap that triggers gate-overflow on the current gate
-reset_vlm_modes(hitl=True, auto=True, cap=1)
-out2 = _apply_vlm_retention_policy(messages, raw_messages=raw)
-# Current gate (2 imgs) > cap=1 → gate overflow. Pin current gate, 0 remaining.
-# First gate (3 imgs, NOT current) → all stripped.
-# Total: 2 (gate overflow shows the full current gate, nothing else)
-check(
-    "case 10b: tight cap triggers gate overflow; only current gate visible",
-    total_image_count(out2) == 2,
-    f"got {total_image_count(out2)} images (expected 2 — gate overflow shows current gate only)",
-)
 
-# Cleanup runtime overrides so we don't pollute other test runs
+# ── _build_vlm_view cases (with real bytes for encoding) ────────────────────
+
+print("\n_build_vlm_view cases\n" + "=" * 40)
+
+# Case 8: both modes off → strips any historical multimodal messages, no injection
 reset_vlm_modes(hitl=False, auto=False, cap=8)
+paths = make_stub_jpgs(1)
+historical_msg = HumanMessage(content=[
+    {"type": "text", "text": "old VLM injection from legacy state"},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,XYZ"}},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,XYZ"}},
+])
+messages = [
+    SystemMessage(content="sys"),
+    historical_msg,
+    AIMessage(content="ok"),
+]
+state = make_state(variant_pool=[stub_variant(paths[0], "T09_v1")])
+out = _build_vlm_view(state, messages)
+check(
+    "case 8: both modes off → all images stripped, no injection",
+    total_image_count(out) == 0,
+    f"got {total_image_count(out)} images in view",
+)
+
+# Case 9: autonomous on, refs in state → builds fresh multimodal message
+reset_vlm_modes(hitl=False, auto=True, cap=8)
+paths = make_stub_jpgs(3)
+messages = [
+    SystemMessage(content="sys"),
+    HumanMessage(content="kickoff"),
+    AIMessage(content="working"),
+]
+state = make_state(
+    visual_context=[
+        vref(paths[0], "present_images", label="img1"),
+        vref(paths[1], "present_images", label="img2"),
+        vref(paths[2], "present_images", label="img3"),
+    ],
+)
+out = _build_vlm_view(state, messages)
+check(
+    "case 9: autonomous on, 3 refs in state → 3 images injected",
+    total_image_count(out) == 3,
+    f"got {total_image_count(out)} images",
+)
+check(
+    "case 9: injected message is the LAST message in the view",
+    isinstance(out[-1], HumanMessage) and len(image_blocks(out[-1].content)) == 3,
+    "last message is not a multimodal HumanMessage with 3 images",
+)
+
+# Case 10: historical multimodal in messages + state refs → historical stripped, state wins
+reset_vlm_modes(hitl=False, auto=True, cap=8)
+paths = make_stub_jpgs(2)
+historical_msg = HumanMessage(content=[
+    {"type": "text", "text": "stale legacy VLM"},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,STALE"}},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,STALE"}},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,STALE"}},
+])
+messages = [
+    SystemMessage(content="sys"),
+    historical_msg,  # 3 stale images
+    AIMessage(content="ok"),
+]
+state = make_state(
+    variant_pool=[
+        stub_variant(paths[0], "T09_v1"),
+        stub_variant(paths[1], "T09_v2"),
+    ],
+)
+out = _build_vlm_view(state, messages)
+# Stale 3 stripped, fresh 2 injected → total 2
+check(
+    "case 10: historical images stripped; variant_pool wins",
+    total_image_count(out) == 2,
+    f"got {total_image_count(out)} (expected 2 — 3 stale stripped, 2 fresh added)",
+)
+
+# Case 11 (concern 2 end-to-end): cap=4, 6 variants in pool → all 6 visible
+reset_vlm_modes(hitl=True, auto=True, cap=4)
+paths = make_stub_jpgs(7)
+state = make_state(
+    variant_pool=[stub_variant(paths[i + 1], f"T09_v{i+1}") for i in range(6)],
+    visual_context=[vref(paths[0], "present_images", label="earlier autonomous")],
+    active_hitl=True,
+)
+messages = [SystemMessage(content="sys"), HumanMessage(content="review please")]
+out = _build_vlm_view(state, messages)
+# Gate overflow: 6 > cap=4 → show only the 6 variants, drop the autonomous one
+check(
+    "case 11 (concern 2): 6 variants in pool > cap=4 → all 6 visible, autonomous dropped",
+    total_image_count(out) == 6,
+    f"got {total_image_count(out)} (expected 6 — gate overflow)",
+)
+
+# Case 12 (concern 1 end-to-end): vlm_hitl only, empty pool → empty view
+reset_vlm_modes(hitl=True, auto=False, cap=8)
+paths = make_stub_jpgs(2)
+state = make_state(
+    variant_pool=[],
+    visual_context=[
+        vref(paths[0], "present_images"),
+        vref(paths[1], "phase_carry"),
+    ],
+)
+messages = [SystemMessage(content="sys"), HumanMessage(content="working")]
+out = _build_vlm_view(state, messages)
+check(
+    "case 12 (concern 1): vlm_hitl only, empty pool → 0 images visible",
+    total_image_count(out) == 0,
+    f"got {total_image_count(out)}",
+)
+
+
+# ── build_variant_promotion_update + commit_variant tool ────────────────────
+
+print("\nbuild_variant_promotion_update + commit_variant cases\n" + "=" * 40)
+
+# Case 13: build_variant_promotion_update happy path — paths/pool/visual_context all updated
+paths = make_stub_jpgs(3)
+state = make_state(
+    variant_pool=[
+        stub_variant(paths[0], "T09_v1", label="gradient pass A"),
+        stub_variant(paths[1], "T09_v2", label="gradient pass B"),
+        stub_variant(paths[2], "T09_v3", label="gradient pass C"),
+    ],
+    visual_context=[],
+    paths={"current_image": "/old/path.fits"},
+)
+result = build_variant_promotion_update(state, "T09_v2")
+check(
+    "case 13: build_variant_promotion_update returns (variant, update) for valid id",
+    result is not None,
+    "got None for valid id",
+)
+variant, update = result
+check(
+    "case 13: paths.current_image points at the chosen variant",
+    update["paths"]["current_image"] == paths[1],
+    f"got {update['paths']['current_image']!r} (expected {paths[1]!r})",
+)
+check(
+    "case 13: variant_pool is cleared",
+    update["variant_pool"] == [],
+    f"got {update['variant_pool']}",
+)
+check(
+    "case 13: visual_context gets exactly one phase_carry entry for the chosen variant",
+    len(update["visual_context"]) == 1
+    and update["visual_context"][0]["source"] == "phase_carry"
+    and update["visual_context"][0]["path"] == paths[1],
+    f"got {update['visual_context']}",
+)
+
+# Case 14: invalid variant id → None
+state = make_state(
+    variant_pool=[stub_variant(make_stub_jpgs(1)[0], "T09_v1")],
+)
+result = build_variant_promotion_update(state, "T09_v999")
+check(
+    "case 14: build_variant_promotion_update returns None for unknown id",
+    result is None,
+    f"got {result}",
+)
+
+# Case 15: existing visual_context entries (present_images, prior phase_carry) survive
+paths = make_stub_jpgs(3)
+existing_present = vref(paths[0], "present_images", label="prior inspection")
+existing_carry = vref(paths[1], "phase_carry", label="earlier carry")
+state = make_state(
+    variant_pool=[stub_variant(paths[2], "T09_v1", label="new variant")],
+    visual_context=[existing_present, existing_carry],
+)
+_, update = build_variant_promotion_update(state, "T09_v1")
+new_visual = update["visual_context"]
+check(
+    "case 15: existing present_images and phase_carry entries survive promotion",
+    existing_present in new_visual and existing_carry in new_visual,
+    f"existing entries missing from {new_visual}",
+)
+check(
+    "case 15: new phase_carry entry is appended for the committed variant",
+    new_visual[-1]["source"] == "phase_carry" and new_visual[-1]["path"] == paths[2],
+    f"got tail {new_visual[-1]}",
+)
+check(
+    "case 15: total visual_context length = old + 1",
+    len(new_visual) == 3,
+    f"got {len(new_visual)}",
+)
+
+# Case 16: commit_variant tool — happy path returns Command with ToolMessage
+paths = make_stub_jpgs(2)
+state = make_state(
+    variant_pool=[
+        stub_variant(paths[0], "T09_v1", label="pass A"),
+        stub_variant(paths[1], "T09_v2", label="pass B"),
+    ],
+)
+cmd = commit_variant.invoke({
+    "variant_id": "T09_v2",
+    "rationale": "cleaner gradient",
+    "state": state,
+    "tool_call_id": "test_tcid_1",
+})
+check(
+    "case 16: commit_variant returns a Command",
+    cmd is not None and hasattr(cmd, "update"),
+    f"got {type(cmd).__name__}",
+)
+check(
+    "case 16: Command.update.paths.current_image is the chosen variant's file",
+    cmd.update["paths"]["current_image"] == paths[1],
+    f"got {cmd.update['paths']['current_image']!r}",
+)
+check(
+    "case 16: Command.update.variant_pool is empty after commit",
+    cmd.update["variant_pool"] == [],
+)
+check(
+    "case 16: Command.update has exactly one phase_carry visual_context entry",
+    len(cmd.update["visual_context"]) == 1
+    and cmd.update["visual_context"][0]["source"] == "phase_carry",
+    f"got {cmd.update['visual_context']}",
+)
+tool_msgs = cmd.update["messages"]
+check(
+    "case 16: Command.update.messages contains exactly one ToolMessage",
+    len(tool_msgs) == 1 and tool_msgs[0].__class__.__name__ == "ToolMessage",
+    f"got {[type(m).__name__ for m in tool_msgs]}",
+)
+import json as _json
+payload = _json.loads(text_content(tool_msgs[0].content))
+check(
+    "case 16: ToolMessage payload reports committed variant id and rationale",
+    payload.get("status") == "committed"
+    and payload.get("variant_id") == "T09_v2"
+    and payload.get("rationale") == "cleaner gradient",
+    f"got {payload}",
+)
+check(
+    "case 16: ToolMessage payload lists the dropped variants",
+    payload.get("dropped_variants") == ["T09_v1"],
+    f"got {payload.get('dropped_variants')}",
+)
+
+# Case 17: commit_variant tool — invalid id returns error ToolMessage with valid_ids list
+paths = make_stub_jpgs(2)
+state = make_state(
+    variant_pool=[
+        stub_variant(paths[0], "T09_v1"),
+        stub_variant(paths[1], "T09_v2"),
+    ],
+)
+cmd = commit_variant.invoke({
+    "variant_id": "T09_v99",
+    "state": state,
+    "tool_call_id": "test_tcid_2",
+})
+err_msgs = cmd.update["messages"]
+err_payload = _json.loads(text_content(err_msgs[0].content))
+check(
+    "case 17: invalid id → error ToolMessage with status=error",
+    err_payload.get("status") == "error",
+    f"got {err_payload}",
+)
+check(
+    "case 17: error payload includes the list of valid ids",
+    err_payload.get("valid_ids") == ["T09_v1", "T09_v2"],
+    f"got {err_payload.get('valid_ids')}",
+)
+check(
+    "case 17: invalid commit does NOT mutate paths/pool/visual_context",
+    "paths" not in cmd.update
+    and "variant_pool" not in cmd.update
+    and "visual_context" not in cmd.update,
+    f"got update keys {list(cmd.update.keys())}",
+)
+
+# Case 18: end-to-end with VLM autonomous on — committed variant flows into the view
+# After commit, visual_context has one phase_carry entry; _build_vlm_view should
+# produce a multimodal HumanMessage with that single image.
+reset_vlm_modes(hitl=False, auto=True, cap=8)
+paths = make_stub_jpgs(2)
+state = make_state(
+    variant_pool=[
+        stub_variant(paths[0], "T09_v1"),
+        stub_variant(paths[1], "T09_v2"),
+    ],
+)
+cmd = commit_variant.invoke({
+    "variant_id": "T09_v1",
+    "state": state,
+    "tool_call_id": "test_tcid_3",
+})
+# Apply the Command's update onto state (simulate LangGraph's reducer)
+post_state = make_state(
+    variant_pool=cmd.update["variant_pool"],
+    visual_context=cmd.update["visual_context"],
+    paths=cmd.update["paths"],
+)
+messages = [SystemMessage(content="sys"), HumanMessage(content="continuing")]
+out = _build_vlm_view(post_state, messages)
+check(
+    "case 18: post-commit, _build_vlm_view shows the carried-forward image",
+    total_image_count(out) == 1,
+    f"got {total_image_count(out)} images (expected 1 — committed variant via phase_carry)",
+)
+
+
+# ── _format_variant_pool_for_prompt cases ───────────────────────────────────
+#
+# The agent reads variant_pool through its own system prompt (rebuilt every
+# turn by agent_node). _format_variant_pool_for_prompt is the bridge from
+# state.variant_pool → text the LLM can see.
+
+print("\n_format_variant_pool_for_prompt cases\n" + "=" * 40)
+
+# Case 19: empty pool → empty string (no section in prompt)
+out_text = _format_variant_pool_for_prompt([])
+check(
+    "case 19: empty pool → empty string (omits section entirely)",
+    out_text == "",
+    f"got {out_text!r}",
+)
+
+# Case 20: pool with three variants → markdown section listing all ids and labels
+v1 = stub_variant(make_stub_jpgs(1)[0], "T09_v1", label="gradient pass A")
+v2 = stub_variant(make_stub_jpgs(1)[0], "T09_v2", label="gradient pass B")
+v3 = stub_variant(make_stub_jpgs(1)[0], "T09_v3", label="gradient pass C")
+out_text = _format_variant_pool_for_prompt([v1, v2, v3])
+check(
+    "case 20: section header is present",
+    "## Active variant pool" in out_text,
+    f"missing header in {out_text[:100]!r}",
+)
+check(
+    "case 20: all three variant ids appear in the section",
+    "T09_v1" in out_text and "T09_v2" in out_text and "T09_v3" in out_text,
+    "missing variant ids",
+)
+check(
+    "case 20: variant labels appear in the section",
+    "gradient pass A" in out_text
+    and "gradient pass B" in out_text
+    and "gradient pass C" in out_text,
+    "missing labels",
+)
+check(
+    "case 20: section mentions commit_variant tool",
+    "commit_variant" in out_text,
+    "section should reference commit_variant for autonomous mode",
+)
+
+# Case 21: variant with metrics → metrics rendered inline
+v_with_metrics = Variant(
+    id="T09_v1",
+    phase="linear",
+    tool_name="remove_gradient",
+    label="gradient pass",
+    params={},
+    file_path="/tmp/x.fits",
+    preview_path=None,
+    metrics={
+        "gradient_magnitude": 0.0451,
+        "snr_estimate": 12.3,
+        "current_fwhm": 2.8,
+        "irrelevant_metric": "ignored",
+    },
+    created_at="2026-04-09T00:00:00Z",
+    rationale=None,
+)
+out_text = _format_variant_pool_for_prompt([v_with_metrics])
+check(
+    "case 21: known metrics rendered inline (gradient_magnitude)",
+    "gradient_magnitude=0.045" in out_text,
+    f"missing gradient_magnitude in {out_text!r}",
+)
+check(
+    "case 21: known metrics rendered inline (snr_estimate)",
+    "snr_estimate=12.300" in out_text,
+    f"missing snr_estimate in {out_text!r}",
+)
+check(
+    "case 21: unknown metric keys are not rendered",
+    "irrelevant_metric" not in out_text,
+    "unknown metric leaked into prompt",
+)
+
+
+# Cleanup runtime overrides
 hitl_mod._RUNTIME_VLM_HITL = None
 hitl_mod._RUNTIME_VLM_AUTONOMOUS = None
 hitl_mod._RUNTIME_VLM_RETENTION_MAX = None

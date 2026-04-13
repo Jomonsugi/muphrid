@@ -213,6 +213,35 @@ class ReportEntry(TypedDict):
     timestamp:      str          # ISO 8601
 
 
+class VisualRef(TypedDict):
+    """
+    One image the agent should see, beyond what's already in variant_pool.
+
+    visual_context (on AstroState) holds the NON-variant working set for the
+    VLM: things the agent looked at via present_images, or images carried
+    forward across a HITL gate close. The active HITL gate's variants are
+    NOT stored here — they live in state.variant_pool (the canonical store)
+    and are projected to VisualRefs at view-build time by _select_visible_refs.
+
+    Together with variant_pool, visual_context is what _select_visible_refs
+    reads to build the agent's multimodal HumanMessage at every model.invoke
+    call. Messages stay text-only; state owns visibility.
+
+    Sources currently in visual_context:
+      "present_images" — captured by the present_images tool when the agent
+                         decides to inspect specific images. Replaced on
+                         every present_images call.
+      "phase_carry"    — written by promote_variant on HITL approval to keep
+                         the chosen variant visible after the gate closes,
+                         giving the agent a stable visual anchor on what it
+                         carried forward.
+    """
+    path:   str          # JPG/PNG preview path on disk (not FITS)
+    label:  str          # short human-readable label
+    source: str          # "present_images" | "phase_carry"
+    phase:  str          # ProcessingPhase value when added (for diagnostics)
+
+
 class Variant(TypedDict):
     """
     One concrete result the agent has produced for the current HITL gate.
@@ -358,6 +387,13 @@ class AstroState(TypedDict):
     # LangGraph "replace" semantics: nodes return the full new list.
     variant_pool: list[Variant]
 
+    # Visual context — non-variant working set of images for the VLM
+    # (present_images calls, phase-carry anchors). Active HITL gate variants
+    # live in variant_pool, not here — _select_visible_refs reads BOTH at
+    # view-build time. Messages stay text-only; state owns visibility.
+    # See VisualRef for source semantics.
+    visual_context: list[VisualRef]
+
 
 # ── Factory ────────────────────────────────────────────────────────────────────
 
@@ -434,6 +470,7 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
         user_feedback={},
         active_hitl=False,
         variant_pool=[],
+        visual_context=[],
     )
 
 

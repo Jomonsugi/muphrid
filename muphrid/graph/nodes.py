@@ -40,7 +40,7 @@ from muphrid.graph.content import image_blocks, text_content
 from muphrid.graph.prompts import PHASE_PROMPTS as _PHASE_PROMPTS
 from muphrid.graph.prompts import SYSTEM_BASE as _SYSTEM_BASE
 from muphrid.graph.registry import all_tools, tools_for_phase
-from muphrid.graph.state import AstroState, HITLPayload, ProcessingPhase, Variant
+from muphrid.graph.state import AstroState, HITLPayload, ProcessingPhase, Variant, VisualRef
 
 logger = logging.getLogger(__name__)
 
@@ -87,22 +87,29 @@ def route_after_phase_router(state: AstroState) -> str:
 
 # ── agent ─────────────────────────────────────────────────────────────────────
 
-# ── VLM image filtering ─────────────────────────────────────────────────────
-# VLM images are scoped to the active HITL conversation only. Once the human
-# approves and the agent moves on, ALL images are stripped from the view sent
-# to the LLM. The agent goes back to data-only. State keeps everything
-# (full audit trail) — this is a view filter, not a mutation.
+# ── VLM view construction ───────────────────────────────────────────────────
+# State owns visibility. state.visual_context is the live working set of
+# images the agent should see; the helpers below build an ephemeral
+# multimodal HumanMessage from that list at every model.invoke call.
+# Messages stay text-only — they are the audit trail, not the visual context.
 #
-# During an active HITL exchange (feedback → re-call → feedback → ...), the
-# images accumulate naturally because hitl_check keeps injecting them. The
-# _in_active_hitl flag checks whether the most recent messages look like an
-# ongoing HITL conversation (multimodal HumanMessage as the last message).
-# If so, images are preserved. If not, they're all stripped.
+# Writers to visual_context:
+#   - variant_snapshot   → mirrors variant_pool (source="hitl_variant")
+#   - promote_variant    → drops hitl_variant entries, keeps approved as
+#                          source="phase_carry"
+#   - present_images     → replaces source="present_images" entries
+#   - advance_phase      → clears the list
+#
+# The helpers in this section never mutate state; they read it and return
+# a new message list to pass to the model.
 
 
 def _strip_vlm_images(messages: list) -> list:
     """
-    Strip ALL image content blocks from multimodal HumanMessages.
+    Strip ALL image content blocks from multimodal HumanMessages. Defensive
+    against legacy state or any path that injected images directly into
+    messages — the canonical source is now state.visual_context.
+
     Returns a new list — does not mutate the originals.
     """
     result = []
@@ -120,7 +127,7 @@ def _last_phase_boundary_index(messages: list) -> int:
     past the last successful advance_phase ToolMessage. Returns 0 if no
     successful advance_phase is in the history.
 
-    Shared by _prune_phase_analysis and _apply_vlm_retention_policy.
+    Used by _prune_phase_analysis (the only remaining message-walking helper).
     """
     boundary = 0
     for i, msg in enumerate(messages):
@@ -131,75 +138,6 @@ def _last_phase_boundary_index(messages: list) -> int:
         ):
             boundary = i + 1
     return boundary
-
-
-def _current_hitl_gate_start(messages: list, phase_start: int) -> int:
-    """
-    Return the index of the first message in the current HITL gate.
-
-    A "gate" is bounded by either the phase boundary or the most recent
-    HumanMessage tagged with additional_kwargs={"event": "gate_closed"}
-    (written by promote_variant and the bare-approval path in hitl_check
-    when a HITL gate resolves). Walks backward from the end down to
-    phase_start. If a gate-close marker is found, the gate starts at
-    that_index + 1. Otherwise the gate starts at phase_start.
-    """
-    for i in range(len(messages) - 1, phase_start - 1, -1):
-        msg = messages[i]
-        if isinstance(msg, HumanMessage):
-            kwargs = getattr(msg, "additional_kwargs", None) or {}
-            if kwargs.get("event") == "gate_closed":
-                return i + 1
-    return phase_start
-
-
-def _is_vlm_hitl_message(msg) -> bool:
-    """
-    True if msg is a multimodal HumanMessage tagged as a HITL VLM injection
-    (label prefix [VLM-HITL]). Used by the retention policy to identify
-    messages that must always be pinned during an active HITL gate.
-    """
-    if not isinstance(msg, HumanMessage):
-        return False
-    if not isinstance(msg.content, list):
-        return False
-    for block in msg.content:
-        if isinstance(block, dict) and block.get("type") == "text":
-            return str(block.get("text", "")).startswith("[VLM-HITL]")
-    return False
-
-
-def _replace_with_placeholder(msg: HumanMessage, placeholder: str) -> HumanMessage:
-    """
-    Build a new HumanMessage with all image_url blocks removed and a static
-    placeholder text appended. Preserves any existing text. Pure constructor.
-    """
-    existing_text = text_content(msg.content)
-    combined = f"{existing_text}\n{placeholder}" if existing_text else placeholder
-    return HumanMessage(content=combined)
-
-
-def _trim_message_images(
-    msg: HumanMessage, keep_newest: int, placeholder: str
-) -> HumanMessage:
-    """
-    Build a new HumanMessage that keeps only the newest `keep_newest` image
-    blocks (last in list order) and drops the older ones. Appends a static
-    placeholder text noting how many were dropped. Pure constructor.
-    """
-    if not isinstance(msg.content, list):
-        return msg
-    text_blocks = [b for b in msg.content if isinstance(b, dict) and b.get("type") == "text"]
-    img_blks = image_blocks(msg.content)
-    n_total = len(img_blks)
-    if keep_newest >= n_total:
-        return msg
-    kept_imgs = img_blks[n_total - keep_newest:] if keep_newest > 0 else []
-    new_blocks: list[dict] = []
-    new_blocks.extend(text_blocks)
-    new_blocks.extend(kept_imgs)
-    new_blocks.append({"type": "text", "text": placeholder})
-    return HumanMessage(content=new_blocks)
 
 
 _ANALYSIS_TOOLS = {"analyze_image", "analyze_frames"}
@@ -239,244 +177,165 @@ def _prune_phase_analysis(messages: list) -> list:
     return result
 
 
-def _in_active_hitl(messages: list) -> bool:
+def _variants_to_refs(state: AstroState) -> list[VisualRef]:
     """
-    Check if the conversation is in an active HITL feedback loop.
+    Project the current variant_pool into a list of VisualRefs the VLM can
+    consume. variant_pool is the source of truth for HITL gate variants;
+    this function does the on-demand FITS→JPG resolution for any variant
+    whose preview_path isn't already populated. Variants whose previews
+    can't be resolved are dropped silently.
 
-    True when the last message is a multimodal HumanMessage (VLM feedback
-    just injected by hitl_check). This means the agent is about to respond
-    to human feedback with the image visible — keep all images.
+    Pure-ish: only filesystem reads (preview generation is cached on disk
+    via generate_preview's `expected` lookup), no state mutation.
     """
-    if not messages:
-        return False
-    last = messages[-1]
-    return isinstance(last, HumanMessage) and bool(image_blocks(last.content))
+    pool = state.get("variant_pool", []) or []
+    if not pool:
+        return []
+    working_dir = state.get("dataset", {}).get("working_dir", "")
+    is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
+    refs: list[VisualRef] = []
+    for v in pool:
+        preview = _resolve_variant_preview(v, working_dir, is_linear)
+        if preview is None:
+            continue
+        refs.append(VisualRef(
+            path=preview,
+            label=v.get("label") or v.get("id", "variant"),
+            source="hitl_variant",
+            phase=v.get("phase", ""),
+        ))
+    return refs
 
 
-def _recent_present_images(messages: list) -> bool:
+def _select_visible_refs(state: AstroState) -> list[VisualRef]:
     """
-    Check if the most recent ToolMessage is a present_images result.
-    Used to decide whether to inject VLM images for autonomous inspection.
-    """
-    for msg in reversed(messages):
-        if isinstance(msg, ToolMessage):
-            return msg.name == "present_images"
-        if isinstance(msg, AIMessage):
-            continue  # Skip the AI message that made the tool call
-        break
-    return False
+    Pick the images the agent should see right now. Combines two state
+    sources:
 
+      - state.variant_pool   → projected to VisualRefs at view-build time
+                                (the canonical store for active HITL variants)
+      - state.visual_context → present_images and phase_carry entries
 
-def _inject_present_images_vlm(
-    messages: list, working_dir: str, is_linear: bool
-) -> HumanMessage | None:
-    """
-    Extract image paths from the most recent present_images ToolMessage,
-    convert FITS to JPG previews, and build a VLM HumanMessage.
-    """
-    from muphrid.tools.utility.t22_generate_preview import generate_preview
-
-    for msg in reversed(messages):
-        if isinstance(msg, ToolMessage) and msg.name == "present_images":
-            try:
-                result = json.loads(text_content(msg.content))
-                if result.get("status") != "presented":
-                    return None
-                raw_paths = [img["path"] for img in result.get("images", []) if img.get("path")]
-            except (json.JSONDecodeError, TypeError, KeyError):
-                return None
-
-            # Convert FITS → JPG previews
-            preview_paths: list[str] = []
-            for img in raw_paths:
-                p = Path(img)
-                if p.suffix.lower() in (".fit", ".fits", ".fts") and working_dir:
-                    preview_dir = Path(working_dir) / "previews"
-                    expected = preview_dir / f"preview_{p.stem}.jpg"
-                    if expected.exists():
-                        preview_paths.append(str(expected))
-                    else:
-                        try:
-                            prev = generate_preview(
-                                working_dir=working_dir,
-                                fits_path=str(p),
-                                format="jpg",
-                                quality=95,
-                                auto_stretch_linear=is_linear,
-                            )
-                            preview_paths.append(prev["preview_path"])
-                        except Exception as e:
-                            logger.warning(f"VLM preview failed for {p.name}: {e}")
-                elif p.exists():
-                    preview_paths.append(str(p))
-
-            if preview_paths:
-                return _make_vlm_message(
-                    preview_paths,
-                    "Visual inspection of presented images",
-                    vlm_role="autonomous",
-                )
-            return None
-        break
-    return None
-
-
-# ── VLM retention policy ─────────────────────────────────────────────────────
-#
-# Single source of truth for "what images can the agent see right now".
-# Mode-aware:
-#
-#   neither       → strip everything (current behavior)
-#   vlm_hitl only → during active HITL: pin current gate's [VLM-HITL] messages
-#                   and strip everything else.
-#                   outside HITL: strip everything (no leakage past gate).
-#   vlm_autonomous → phase-scoped sliding window with optional HITL pinning:
-#       - prior-phase images released to placeholder text
-#       - current HITL gate's [VLM-HITL] messages pinned (uncapped)
-#       - other multimodal HumanMessages bounded by vlm_window_cap()
-#
-# Pure function: returns a new list, never mutates messages or state.
-# Only rewrites HumanMessages — ToolMessages (including the cache_control
-# advance_phase marker set above in agent_node) are never touched.
-
-_VLM_PLACEHOLDER_PRIOR_PHASE = (
-    "[VLM: image released — belonged to a completed phase]"
-)
-_VLM_PLACEHOLDER_WINDOW = (
-    "[VLM: image released by sliding-window retention policy]"
-)
-
-
-def _vlm_trim_placeholder(kept: int, total: int) -> str:
-    return f"[VLM: kept newest {kept} of {total} images; older ones released by retention policy]"
-
-
-def _apply_vlm_retention_policy(messages: list, raw_messages: list) -> list:
-    """
-    Apply the VLM image retention policy to the message list passed to the
-    model. See module-level comment above for the full policy spec.
+    Mode dispatch:
+      - Both modes off → empty (no images at all)
+      - vlm_hitl only  → only the variant_pool projection. Outside an active
+                         gate variant_snapshot/promote_variant leave the pool
+                         empty, so this naturally returns nothing — no
+                         leakage between gates.
+      - vlm_autonomous (± vlm_hitl) → variant_pool projection + visual_context,
+                         capped to vlm_window_cap() from the newest end, with
+                         the gate-overflow exception: if the variant_pool alone
+                         exceeds the cap, show the full pool and drop other
+                         sources (so the human's referenced variant is always
+                         resolvable on the agent side).
     """
     hitl_on = vlm_hitl()
     auto_on = vlm_autonomous()
-
-    # Both modes off → strip everything (legacy behavior).
     if not hitl_on and not auto_on:
-        return _strip_vlm_images(messages)
+        return []
 
-    in_active_hitl = _in_active_hitl(raw_messages)
+    variant_refs = _variants_to_refs(state)
 
-    # ── Mode A: vlm_hitl only ────────────────────────────────────────────
-    # Outside HITL: strip everything (no leakage past gate).
-    # Inside HITL: pin current gate's [VLM-HITL] messages, strip the rest.
+    # Mode A: vlm_hitl only — show only active HITL variants from the pool.
+    # present_images / phase_carry entries require autonomous mode to be
+    # visible because they persist outside HITL conversations.
     if hitl_on and not auto_on:
-        if not in_active_hitl:
-            return _strip_vlm_images(messages)
+        return variant_refs
 
-        phase_start = _last_phase_boundary_index(messages)
-        gate_start = _current_hitl_gate_start(messages, phase_start)
-        pinned_indices = {
-            i for i in range(gate_start, len(messages))
-            if _is_vlm_hitl_message(messages[i])
-        }
-
-        result: list = []
-        for i, msg in enumerate(messages):
-            if i in pinned_indices:
-                result.append(msg)
-            elif isinstance(msg, HumanMessage) and image_blocks(msg.content):
-                result.append(_replace_with_placeholder(msg, _VLM_PLACEHOLDER_WINDOW))
-            else:
-                result.append(msg)
-        logger.debug(
-            f"vlm_retention(hitl-only): pinned={len(pinned_indices)} "
-            f"gate_start={gate_start} phase_start={phase_start}"
-        )
-        return result
-
-    # ── Mode B/C: vlm_autonomous on (with or without vlm_hitl) ───────────
-    # The autonomous present_images injection (if any) was already appended
-    # to `messages` by agent_node before calling this helper, so it shows up
-    # as the newest message and is naturally counted in the window pass.
-    #
-    # The cap is a HARD total ceiling on visible images. The single exception
-    # is "gate overflow": when the active HITL gate alone exceeds the cap,
-    # the gate is shown in full (so the user can reference any variant in
-    # Gradio) but no remaining budget is granted to older non-gate images.
-    # In all other cases HITL gate images count against the cap like any
-    # other multimodal HumanMessage.
-
-    phase_start = _last_phase_boundary_index(messages)
-    gate_start = _current_hitl_gate_start(messages, phase_start)
-
-    # Identify HITL gate messages and their total image count.
-    hitl_gate_indices: set[int] = (
-        {
-            i for i in range(gate_start, len(messages))
-            if _is_vlm_hitl_message(messages[i])
-        }
-        if hitl_on
-        else set()
-    )
-    hitl_gate_image_count = sum(
-        len(image_blocks(messages[i].content)) for i in hitl_gate_indices
-    )
+    # Mode B/C: vlm_autonomous on. Combine pool + visual_context (other
+    # sources), placing variants at the end so they're treated as newest by
+    # the cap logic.
+    other_refs = list(state.get("visual_context", []) or [])
+    combined = other_refs + variant_refs
 
     cap = vlm_window_cap()
+    if len(variant_refs) > cap:
+        # Gate overflow: pool alone exceeds cap → show the full pool, drop
+        # other sources so the user can reference any variant in Gradio.
+        return variant_refs
+    if len(combined) <= cap:
+        return combined
+    # Hard cap: keep newest `cap` entries (last in list order)
+    return combined[-cap:]
 
-    # Gate-overflow exception: only when the active HITL gate alone exceeds
-    # the cap. In that case pin the gate (zero remaining budget for older
-    # images). Otherwise the gate counts against the cap normally.
-    gate_overflow = hitl_gate_image_count > cap
-    pinned_indices: set[int] = hitl_gate_indices if gate_overflow else set()
-    remaining = 0 if gate_overflow else cap
 
-    # Phase-release pass: strip image blocks from any pre-phase HumanMessage,
-    # leave a placeholder so the agent knows visual context existed there.
-    result = list(messages)
-    for i in range(phase_start):
-        msg = result[i]
-        if isinstance(msg, HumanMessage) and image_blocks(msg.content):
-            result[i] = _replace_with_placeholder(msg, _VLM_PLACEHOLDER_PRIOR_PHASE)
+def _format_variant_pool_for_prompt(variant_pool: list[Variant]) -> str:
+    """
+    Render the current variant_pool as a markdown section to inject into the
+    system prompt. Surfaces variant ids, labels, and key metrics so the agent
+    can reason about what's available and call commit_variant by id without
+    needing a query tool. Returns "" if the pool is empty (no section added).
 
-    # Sliding window pass: walk reverse from end down to phase_start, count
-    # images, keep newest until cap is exhausted, strip older ones. Pinned
-    # messages (gate overflow only) skip the budget entirely.
-    kept_count = 0
-    stripped_count = 0
-    for i in range(len(result) - 1, phase_start - 1, -1):
-        if i in pinned_indices:
-            continue
-        msg = result[i]
-        if not isinstance(msg, HumanMessage):
-            continue
-        n_imgs = len(image_blocks(msg.content))
-        if n_imgs == 0:
-            continue
-        if remaining >= n_imgs:
-            remaining -= n_imgs
-            kept_count += n_imgs
-            continue
-        if remaining > 0:
-            keep = remaining
-            result[i] = _trim_message_images(
-                msg, keep_newest=keep, placeholder=_vlm_trim_placeholder(keep, n_imgs)
-            )
-            kept_count += keep
-            stripped_count += (n_imgs - keep)
-            remaining = 0
-        else:
-            result[i] = _replace_with_placeholder(msg, _VLM_PLACEHOLDER_WINDOW)
-            stripped_count += n_imgs
+    The agent's view of state goes through messages, not state directly. This
+    helper is the bridge: state.variant_pool → text in the system prompt.
+    """
+    if not variant_pool:
+        return ""
 
-    pinned_image_count = sum(
-        len(image_blocks(result[i].content)) for i in pinned_indices
-    )
+    lines = [
+        "## Active variant pool",
+        "",
+        "You have produced the following variants in the current HITL gate. "
+        "Each is a concrete result on disk; these are your candidates to "
+        "carry forward. In autonomous mode, call `commit_variant(variant_id=...)` "
+        "to lock in your choice and clear the rest. In HITL mode, the human "
+        "approves via Gradio.",
+        "",
+    ]
+    for v in variant_pool:
+        vid = v.get("id", "?")
+        label = v.get("label") or v.get("tool_name", "?")
+        # Show a small slice of decision-relevant metrics inline
+        metric_strs: list[str] = []
+        metrics = v.get("metrics", {}) or {}
+        for key in (
+            "gradient_magnitude", "snr_estimate", "background_flatness",
+            "current_fwhm", "current_noise", "star_count",
+        ):
+            val = metrics.get(key)
+            if val is None:
+                continue
+            if isinstance(val, float):
+                metric_strs.append(f"{key}={val:.3f}")
+            else:
+                metric_strs.append(f"{key}={val}")
+        suffix = f"  ({', '.join(metric_strs)})" if metric_strs else ""
+        lines.append(f"- **{vid}** — {label}{suffix}")
+    return "\n".join(lines)
+
+
+def _build_vlm_view(state: AstroState, messages: list) -> list:
+    """
+    Construct the message list to pass to model.invoke. Strips any historical
+    image blocks (defensive) and appends a single fresh multimodal HumanMessage
+    built from state.visual_context (filtered by mode and cap).
+
+    This is the only function in agent_node that decides what the VLM sees.
+    """
+    if not (vlm_hitl() or vlm_autonomous()):
+        return _strip_vlm_images(messages)
+
+    refs = _select_visible_refs(state)
+    cleaned = _strip_vlm_images(messages)
+    if not refs:
+        return cleaned
+
+    paths = [r["path"] for r in refs]
+    label_summary = ", ".join(r.get("label", "") for r in refs[:6])
+    if len(refs) > 6:
+        label_summary += f", … ({len(refs)} total)"
+    label = f"Current visual context: {label_summary}"
+    vlm_msg = _make_vlm_message(paths, label)
+    if vlm_msg is None:
+        return cleaned
+
     logger.debug(
-        f"vlm_retention(auto): cap={cap} kept={kept_count} pinned={pinned_image_count} "
-        f"stripped={stripped_count} gate_overflow={gate_overflow} "
-        f"gate_imgs={hitl_gate_image_count} gate_start={gate_start} phase_start={phase_start}"
+        f"vlm_view: showing {len(refs)} image(s) "
+        f"({sum(1 for r in refs if r.get('source') == 'hitl_variant')} hitl_variant, "
+        f"{sum(1 for r in refs if r.get('source') == 'present_images')} present_images, "
+        f"{sum(1 for r in refs if r.get('source') == 'phase_carry')} phase_carry)"
     )
-    return result
+    return cleaned + [vlm_msg]
 
 
 # ── Stuck-loop detection ──────────────────────────────────────────────────────
@@ -697,15 +556,27 @@ def make_agent_node(model_factory):
         phase_prompt = _PHASE_PROMPTS.get(phase, "")
         system = f"{_SYSTEM_BASE}\n\n{phase_prompt}"
 
+        # Surface state.variant_pool to the agent via the system prompt.
+        # The pool is dynamic (changes turn to turn), so it lives in a
+        # SEPARATE content block from the cached system prompt — the cached
+        # prefix stays byte-stable while the pool section refreshes each turn.
+        variant_pool_section = _format_variant_pool_for_prompt(
+            state.get("variant_pool", []) or []
+        )
+
         # Anthropic prompt caching: use content blocks with cache_control
         # so the stable prefix is cached across calls within a phase.
         # additional_kwargs doesn't work — must use inline content blocks.
         _is_anthropic = _check_anthropic(model)
 
         if _is_anthropic:
-            messages = [SystemMessage(content=[
+            system_blocks: list[dict] = [
                 {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}},
-            ])] + raw_messages
+            ]
+            if variant_pool_section:
+                # Uncached: regenerated each turn from live state
+                system_blocks.append({"type": "text", "text": variant_pool_section})
+            messages = [SystemMessage(content=system_blocks)] + raw_messages
 
             # Mark the last successful advance_phase as a cache boundary so
             # all completed-phase messages are cached alongside the system prompt.
@@ -733,25 +604,13 @@ def make_agent_node(model_factory):
                     ]
                     break
         else:
-            messages = [SystemMessage(content=system)] + raw_messages
+            full_system = system
+            if variant_pool_section:
+                full_system = f"{system}\n\n{variant_pool_section}"
+            messages = [SystemMessage(content=full_system)] + raw_messages
 
-        # VLM scoping: see _apply_vlm_retention_policy for the full policy.
-        # First, optionally inject the autonomous present_images result so it
-        # becomes the newest message (and is naturally counted by the window
-        # pass inside the policy helper).
-        if (
-            vlm_autonomous()
-            and _recent_present_images(raw_messages)
-            and not _in_active_hitl(raw_messages)
-        ):
-            working_dir = state.get("dataset", {}).get("working_dir", "")
-            is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
-            vlm_msg = _inject_present_images_vlm(raw_messages, working_dir, is_linear)
-            if vlm_msg:
-                messages.append(vlm_msg)
-                logger.info("VLM autonomous: injecting present_images for visual inspection")
-
-        messages = _apply_vlm_retention_policy(messages, raw_messages)
+        # VLM view: state.visual_context owns visibility. See _build_vlm_view.
+        messages = _build_vlm_view(state, messages)
 
         # Prune analysis outputs from completed phases — the model's reasoning
         # captured the conclusions; raw JSON is dead weight after phase ends.
@@ -852,29 +711,25 @@ def make_action_node():
 # ── VLM image injection ──────────────────────────────────────────────────────
 
 
-def _make_vlm_message(
-    image_paths: list[str], label: str, vlm_role: str = "hitl"
-) -> HumanMessage | None:
+def _make_vlm_message(image_paths: list[str], label: str) -> HumanMessage | None:
     """
     Build a multimodal HumanMessage with base64-encoded preview images.
 
-    Converts FITS to JPG previews first. Returns None if no valid images.
-    Images must be JPG/PNG — raw FITS cannot be base64-encoded for LLMs.
+    Pure encoding helper — takes resolved JPG/PNG paths and produces a
+    LangChain content-block list wrapped in a HumanMessage. Skips raw FITS
+    (cannot be base64-encoded for vision models). Returns None if no valid
+    images were encoded.
 
-    The vlm_role parameter ("hitl" or "autonomous") tags the message via
-    the leading text-block prefix ([VLM-HITL] or [VLM-AUTO]). The retention
-    policy in _apply_vlm_retention_policy reads this prefix to decide which
-    multimodal HumanMessages must be pinned during an active HITL gate.
+    Called by _build_vlm_view at every model.invoke. The label is the only
+    text the agent sees alongside the images.
     """
-    tag = "[VLM-HITL]" if vlm_role == "hitl" else "[VLM-AUTO]"
-    content: list[dict] = [{"type": "text", "text": f"{tag} {label}"}]
+    content: list[dict] = [{"type": "text", "text": f"[VLM] {label}"}]
     has_image = False
 
     for img_path in image_paths:
         p = Path(img_path)
         if not p.exists():
             continue
-        # Only encode rendered formats — skip raw FITS
         if p.suffix.lower() in (".fit", ".fits", ".fts"):
             continue
         mime = mimetypes.guess_type(str(p))[0] or "image/jpeg"
@@ -888,69 +743,6 @@ def _make_vlm_message(
     if not has_image:
         return None
     return HumanMessage(content=content)
-
-
-def _collect_hitl_images(messages: list, working_dir: str, is_linear: bool) -> list[str]:
-    """
-    Collect all image paths relevant to the current HITL conversation:
-    - Images from the HITL-triggering tool
-    - Images from any present_images calls during the conversation
-
-    Returns preview JPG paths (FITS converted via generate_preview).
-    """
-    from muphrid.tools.utility.t22_generate_preview import generate_preview
-
-    raw_paths: list[str] = []
-
-    # Walk backward from the end to collect images in the current HITL exchange
-    for msg in reversed(messages):
-        if isinstance(msg, ToolMessage):
-            try:
-                result = json.loads(text_content(msg.content))
-                if isinstance(result, dict):
-                    # present_images results
-                    if msg.name == "present_images" and result.get("status") == "presented":
-                        for img in result.get("images", []):
-                            if img.get("path"):
-                                raw_paths.append(img["path"])
-                    # HITL-triggering tool results
-                    elif msg.name in TOOL_TO_HITL:
-                        for key in ("output_path", "result_path", "stretched_image_path",
-                                    "starless_image_path", "preview_path", "mask_path"):
-                            if path := result.get(key):
-                                raw_paths.append(path)
-                        break  # Stop at the HITL trigger
-            except (json.JSONDecodeError, TypeError):
-                pass
-        elif isinstance(msg, HumanMessage):
-            # Hit a human message before finding the trigger — stop
-            break
-
-    # Convert FITS to JPG previews
-    preview_paths: list[str] = []
-    for img in raw_paths:
-        p = Path(img)
-        if p.suffix.lower() in (".fit", ".fits", ".fts") and working_dir:
-            preview_dir = Path(working_dir) / "previews"
-            expected = preview_dir / f"preview_{p.stem}.jpg"
-            if expected.exists():
-                preview_paths.append(str(expected))
-            else:
-                try:
-                    result = generate_preview(
-                        working_dir=working_dir,
-                        fits_path=str(p),
-                        format="jpg",
-                        quality=95,
-                        auto_stretch_linear=is_linear,
-                    )
-                    preview_paths.append(result["preview_path"])
-                except Exception as e:
-                    logger.warning(f"VLM preview generation failed for {p.name}: {e}")
-        elif p.exists():
-            preview_paths.append(str(p))
-
-    return preview_paths
 
 
 # ── variant_snapshot ──────────────────────────────────────────────────────────
@@ -1193,6 +985,41 @@ def _validate_variant_pool(pool: list[Variant]) -> tuple[list[Variant], list[str
     return kept, dropped
 
 
+def _resolve_variant_preview(
+    variant: Variant, working_dir: str, is_linear: bool
+) -> str | None:
+    """
+    Return a JPG/PNG preview path for a variant. Prefers variant.preview_path
+    when present and existing on disk; falls back to generating a preview from
+    the FITS file via generate_preview. Returns None if neither works.
+    """
+    preview = variant.get("preview_path")
+    if preview and Path(preview).exists():
+        return preview
+    fits_path = variant.get("file_path")
+    if not fits_path or not Path(fits_path).exists():
+        return None
+    if not working_dir:
+        return None
+    from muphrid.tools.utility.t22_generate_preview import generate_preview
+    p = Path(fits_path)
+    expected = Path(working_dir) / "previews" / f"preview_{p.stem}.jpg"
+    if expected.exists():
+        return str(expected)
+    try:
+        result = generate_preview(
+            working_dir=working_dir,
+            fits_path=fits_path,
+            format="jpg",
+            quality=95,
+            auto_stretch_linear=is_linear,
+        )
+        return result.get("preview_path")
+    except Exception as e:
+        logger.warning(f"variant preview generation failed for {p.name}: {e}")
+        return None
+
+
 def variant_snapshot(state: AstroState) -> dict[str, Any]:
     """
     Detect HITL-mapped tool executions in the latest action result and
@@ -1282,7 +1109,9 @@ def variant_snapshot(state: AstroState) -> dict[str, Any]:
 
     # Persist the pool whenever it changed for any reason: new captures OR
     # dangling-entry pruning. Otherwise the next invocation would re-prune
-    # the same dangling entries.
+    # the same dangling entries. variant_pool is the single source of truth
+    # for HITL gate variants; _select_visible_refs reads it directly when
+    # building the VLM view, so there is no separate mirror to maintain.
     if snapshotted_any or pool_changed:
         return {"variant_pool": new_pool}
     return {}
@@ -1299,61 +1128,95 @@ def find_variant_in_pool(pool: list[Variant], variant_id: str) -> Variant | None
     return None
 
 
-def promote_variant(
-    state: AstroState, variant_id: str, rationale: str | None = None
-) -> dict[str, Any] | None:
+def build_variant_promotion_update(
+    state: AstroState, variant_id: str
+) -> tuple[Variant, dict[str, Any]] | None:
     """
-    Promote a pool variant to the current image and clear the pool.
+    Compute the state mutations for promoting a variant from variant_pool.
+    Pure-ish function (one filesystem read for preview resolution); does not
+    construct any messages — callers add the appropriate message wrapper for
+    their context (HumanMessage for HITL approval, ToolMessage for autonomous
+    commit_variant).
 
-    This is the single source of truth for "approving a variant" — used by
-    hitl_check on human approval and reusable from a future autonomous-mode
-    commit_variant tool. Pure function over state: returns the dict update
-    that should be merged into AstroState. Returns None if the variant_id
-    isn't in the pool (caller decides how to surface the error).
-
-    State changes:
+    Returns (variant, update_dict) on success, or None if the id isn't in
+    the pool. The update dict contains:
       - paths.current_image := variant.file_path
       - variant_pool := []
-      - active_hitl := False
-      - messages: append a HumanMessage announcing the approval (with
-        rationale if supplied) so the agent's next turn sees the commit
+      - visual_context := <existing> + phase_carry entry for the approved variant
 
-    Note: this is a backend state mutation that happens during HITL resume,
-    not via a tool call. It's the one place where current_image can move to
-    a non-most-recent file. The agent doesn't track "last tool output" beyond
-    what's in messages, so its next tool call will read the promoted file
-    correctly.
+    Shared by promote_variant (HITL) and the commit_variant tool (autonomous).
     """
     pool = state.get("variant_pool", []) or []
     variant = find_variant_in_pool(pool, variant_id)
     if variant is None:
         return None
 
-    # Build the approval text the agent will see on its next turn
+    paths = dict(state.get("paths", {}) or {})
+    paths["current_image"] = variant["file_path"]
+
+    # Append a phase_carry entry to visual_context so the agent retains a
+    # visual anchor on what it chose to keep. Other entries are preserved.
+    working_dir = state.get("dataset", {}).get("working_dir", "")
+    is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
+    phase_value = state.get("phase")
+    if hasattr(phase_value, "value"):
+        phase_value = phase_value.value
+    existing_visual = list(state.get("visual_context", []) or [])
+    approved_preview = _resolve_variant_preview(variant, working_dir, is_linear)
+    if approved_preview:
+        existing_visual.append(VisualRef(
+            path=approved_preview,
+            label=f"Carried forward: {variant.get('label') or variant['id']}",
+            source="phase_carry",
+            phase=str(phase_value) if phase_value else "",
+        ))
+
+    update: dict[str, Any] = {
+        "paths": paths,
+        "variant_pool": [],
+        "visual_context": existing_visual,
+    }
+    return variant, update
+
+
+def promote_variant(
+    state: AstroState, variant_id: str, rationale: str | None = None
+) -> dict[str, Any] | None:
+    """
+    Promote a pool variant to the current image and clear the pool. Used by
+    hitl_check on human approval. Wraps build_variant_promotion_update with
+    HITL-specific extras: appends a HumanMessage announcing the approval
+    (so the agent's next turn sees the commit) and clears active_hitl.
+
+    Returns the dict update for AstroState, or None if variant_id isn't in
+    the pool (caller decides how to surface the error).
+
+    Note: this is a backend state mutation that happens during HITL resume,
+    not via a tool call. It's the one place where current_image can move to
+    a non-most-recent file via the human-approval path. The agent doesn't
+    track "last tool output" beyond what's in messages, so its next tool call
+    will read the promoted file correctly.
+    """
+    result = build_variant_promotion_update(state, variant_id)
+    if result is None:
+        return None
+    variant, update = result
+
     approval_lines = [f"Approved {variant['id']} ({variant['label']})."]
     if rationale:
         approval_lines.append(f"Rationale: {rationale}")
     approval_lines.append("Continue to the next step.")
     approval_text = "\n".join(approval_lines)
 
-    paths = dict(state.get("paths", {}) or {})
-    paths["current_image"] = variant["file_path"]
+    update["active_hitl"] = False
+    update["messages"] = [HumanMessage(content=approval_text)]
 
     logger.info(
         f"promote_variant: {variant['id']} → current_image "
         f"({Path(variant['file_path']).name})"
         + (f" with rationale" if rationale else "")
     )
-
-    return {
-        "paths": paths,
-        "variant_pool": [],
-        "active_hitl": False,
-        "messages": [HumanMessage(
-            content=approval_text,
-            additional_kwargs={"event": "gate_closed"},
-        )],
-    }
+    return update
 
 
 # ── hitl_check ────────────────────────────────────────────────────────────────
@@ -1560,22 +1423,12 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         variant_pool=payload_pool,
     )
 
-    # VLM during HITL: inject base64 preview images so the agent can see
-    # what it's discussing with the human.
+    # VLM visibility is state-driven. variant_snapshot has already updated
+    # variant_pool, and the next agent_node call will project it (plus any
+    # visual_context entries) through _select_visible_refs into a fresh
+    # multimodal view. No VLM injection happens in this node — messages
+    # stay text-only.
     vlm_messages: list = []
-    if vlm_hitl():
-        working_dir = state.get("dataset", {}).get("working_dir", "")
-        is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
-        preview_paths = _collect_hitl_images(messages, working_dir, is_linear)
-        if preview_paths:
-            vlm_msg = _make_vlm_message(
-                preview_paths,
-                f"Current result from {tool_name}",
-                vlm_role="hitl",
-            )
-            if vlm_msg:
-                vlm_messages = [vlm_msg]
-                logger.info(f"VLM HITL: injecting {len(preview_paths)} images")
 
     logger.info(f"HITL interrupt: {cfg['title']} (tool: {tool_name})")
     response = interrupt(payload)
@@ -1632,13 +1485,16 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         # Long-term memory extraction (v1: HITL-only)
         _extract_hitl_memories(state, messages, tool_name, note)
 
+        # Bare approval (CLI / fallback) — drop hitl_variant entries from
+        # visual_context. No specific variant was named, so nothing to carry
+        # forward as phase_carry.
+        existing_visual = list(state.get("visual_context", []) or [])
+        non_hitl = [r for r in existing_visual if r.get("source") != "hitl_variant"]
         return {
             "active_hitl": False,
             "variant_pool": [],
-            "messages": vlm_messages + [HumanMessage(
-                content=approval_text,
-                additional_kwargs={"event": "gate_closed"},
-            )],
+            "visual_context": non_hitl,
+            "messages": vlm_messages + [HumanMessage(content=approval_text)],
         }
 
     # Human gave feedback — keep in HITL loop
