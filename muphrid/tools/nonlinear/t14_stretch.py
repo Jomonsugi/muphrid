@@ -433,6 +433,9 @@ def stretch_image(
             "pre_stretch_image": metadata.get("pre_stretch_image", state["paths"]["current_image"]),
             "stretch_variants": {**_stretch_variants, output_suffix: _args_fingerprint},
         },
+        # Stretch output is always non-linear — mark it so downstream
+        # consumers (e.g. export_final) use the correct ICC source profile.
+        "metrics": {**state.get("metrics", {}), "is_linear_estimate": False},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })
 

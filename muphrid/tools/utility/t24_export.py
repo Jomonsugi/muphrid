@@ -262,6 +262,14 @@ def export_final(
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"]["current_image"]
 
+    # Auto-detect source profile from image linearity when the caller used
+    # the default.  After stretching the data is non-linear — assigning
+    # sRGBlinear would re-apply gamma on top of the stretch, washing out
+    # the image.  sRGB tells Siril the data is already gamma-encoded.
+    is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
+    if source_profile == "sRGBlinear" and not is_linear:
+        source_profile = "sRGB"
+
     if formats is None:
         formats = [FormatSpec(**f) for f in DEFAULT_FORMATS]
 

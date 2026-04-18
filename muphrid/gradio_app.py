@@ -364,6 +364,10 @@ async def _stream_graph(
     interrupt_payload = None
     active_hitl = False
 
+    # Snapshot gallery content before streaming so we can detect whether
+    # present_images updated it during this round.
+    gallery_before_stream = list(gallery_images)
+
     async for chunk in graph.astream(stream_input, config=config, stream_mode="updates"):
         result, active_hitl = _parse_stream_chunks(
             chunk, chat_messages, activity_log, gallery_images,
@@ -384,14 +388,24 @@ async def _stream_graph(
         # variant approval, so this naturally reflects the current gate.
         variant_pool = list(interrupt_payload.get("variant_pool", []) or [])
 
-        # Populate gallery from images_from_tool ONLY if present_images didn't
-        # already populate it during streaming. The agent's curated comparison
-        # set (with proper labels) takes precedence over the auto-extracted
-        # tool outputs. Without this guard, the post-stream block would clobber
-        # the agent's 3-image comparison with a generic 2-image "Variant N"
-        # list pulled from images_from_tool, dropping any non-output reference
-        # images (e.g. the original / pre-gradient image).
-        if images and working_dir and not gallery_images:
+        # Keep the gallery in sync with the variant panel. If the agent
+        # called present_images during this stream, its curated comparison
+        # set (which may include reference images like the original) takes
+        # precedence. Otherwise, populate the gallery directly from the
+        # variant pool so the viewer matches the Approve buttons below.
+        # This covers the silent-reexecution / backstop case where the
+        # agent never narrated or presented images.
+        gallery_refreshed = (gallery_images != gallery_before_stream)
+
+        if variant_pool and working_dir and not gallery_refreshed:
+            variant_paths = [v["file_path"] for v in variant_pool if v.get("file_path")]
+            if variant_paths:
+                preview_paths = _convert_fits_to_preview(variant_paths, working_dir, is_linear)
+                gallery_images.clear()
+                for v, p in zip(variant_pool, preview_paths):
+                    if Path(p).exists():
+                        gallery_images.append((p, f"{v['id']} — {v.get('label', '')}"))
+        elif images and working_dir and not gallery_images:
             preview_paths = _convert_fits_to_preview(images, working_dir, is_linear)
             if gallery_images is None:
                 gallery_images = []
@@ -663,6 +677,11 @@ async def approve_variant_action(
             "role": "user",
             "content": f"Approving **{variant_id}** ({variant_label}).",
         })
+    yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
+
+    # Clear the variant panel immediately so the user sees feedback that
+    # their approval was registered before the backend finishes streaming.
+    variant_pool = []
     yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
 
     sentinel = build_variant_approval(variant_id, rationale.strip())
@@ -1056,8 +1075,9 @@ def build_app() -> gr.Blocks:
                         object_fit="contain",
                         interactive=False,
                     )
+                    gr.Markdown("**Activity Log**")
                     activity = gr.Chatbot(
-                        label="Activity Log",
+                        show_label=False,
                         height=300,
                         buttons=[],
                     )
