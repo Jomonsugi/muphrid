@@ -1,15 +1,10 @@
 """
 T16 — curves_adjust
 
-Fine-tune brightness, contrast, and per-channel tonal balance using Siril's
-Midtone Transfer Function (MTF) or Generalized Hyperbolic Stretch (GHT).
-The primary tool for post-stretch tonal refinement.
+Apply brightness, contrast, and per-channel tonal adjustments via Siril's
+Midtone Transfer Function (mtf) or Generalized Hyperbolic Stretch (ght).
 
-Backend: Siril CLI — `mtf` (midtone transfer function) or `ght` with targeted
-B/SP parameters for specific tonal ranges.
-
-Apply to the starless image (post T15) to avoid star color bloat.
-The agent may apply multiple passes with progressively refined parameters.
+Backend: Siril CLI — `mtf` or `ght`.
 """
 
 from __future__ import annotations
@@ -34,34 +29,30 @@ class MTFOptions(BaseModel):
     black_point: float = Field(
         default=0.0,
         description=(
-            "Low (shadows) clipping point (0–1). "
-            "0.0 = no black point lift. Small values (0.01–0.05) remove "
-            "faint residual sky glow."
+            "Shadow clipping point (0–1). 0.0 = no black-point shift. "
+            "Raising it lifts the black level."
         ),
     )
     midtone: float = Field(
         default=0.5,
         description=(
-            "Midtone transfer point (0–1). The core brightness control. "
-            "0.5 = linear (no change). "
-            "< 0.5 = brightens midtones. > 0.5 = darkens midtones. "
-            "Typical range for brightening: 0.2–0.4."
+            "Midtone transfer point (0–1). 0.5 = linear (no change). "
+            "< 0.5 brightens midtones, > 0.5 darkens midtones."
         ),
     )
     white_point: float = Field(
         default=1.0,
         description=(
-            "High (highlights) clipping point (0–1). "
-            "1.0 = no highlight clip. Reduce only if bright stars are blown out."
+            "Highlight clipping point (0–1). 1.0 = no highlight clip. "
+            "Lower values clip progressively more of the bright end."
         ),
     )
     channels: str = Field(
         default="all",
         description=(
-            "Which channels to apply MTF to. "
-            "all: all channels equally (preserves color balance). "
-            "R, G, B: single channel for targeted color correction. "
-            "RG, RB, GB: two-channel pairs."
+            "Which channels receive the adjustment. "
+            "all: all channels with the same parameters. "
+            "R, G, B: single channel. RG, RB, GB: channel pairs."
         ),
     )
 
@@ -69,24 +60,21 @@ class MTFOptions(BaseModel):
 class GHTCurvesOptions(BaseModel):
     stretch_amount: float = Field(
         description=(
-            "D: stretch strength 0–10. The primary control. "
-            "Use small values (0.3–1.5) for post-stretch refinement — "
-            "not a first-stretch tool."
+            "D: stretch strength (0–10). Primary control."
         ),
     )
     local_intensity: float = Field(
         default=5.0,
         description=(
             "B: tonal focus (-5 to 15). Higher values tightly focus the "
-            "adjustment around symmetry_point. 5–13 for targeted mid-tone boost."
+            "adjustment around symmetry_point."
         ),
     )
     symmetry_point: float = Field(
         default=0.3,
         description=(
-            "SP: the brightness value to target (0–1). "
-            "Set to the median value of the region you want to enhance — "
-            "e.g., the faint outer nebula at 0.1–0.2, bright core at 0.5–0.7."
+            "SP: the brightness value to target (0–1). The adjustment peaks "
+            "at this value."
         ),
     )
     shadow_protection: float = Field(
@@ -114,10 +102,11 @@ class CurvesAdjustInput(BaseModel):
     method: str = Field(
         default="mtf",
         description=(
-            "mtf: Midtone Transfer Function — global brightness and contrast "
-            "adjustment with black/white point control. Simple and reliable. "
-            "ght: Generalized Hyperbolic Stretch applied post-stretch — targeted "
-            "adjustment of a specific brightness range using B and SP parameters."
+            "mtf: Midtone Transfer Function. Global tonal adjustment via "
+            "black-point, midtone, white-point. "
+            "ght: Generalized Hyperbolic Stretch applied post-stretch. "
+            "Non-uniform adjustment concentrated around symmetry_point, "
+            "with separate shadow/highlight protection."
         ),
     )
     mtf_options: MTFOptions = Field(default_factory=MTFOptions)
@@ -162,16 +151,16 @@ def curves_adjust(
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
     """
-    Fine-tune brightness, contrast, and per-channel tonal balance.
+    Apply brightness, contrast, and per-channel tonal adjustments.
 
-    Method guidance:
-    - mtf: simple and reliable. Set midtone < 0.5 to brighten, > 0.5 to darken.
-      Use channels=R/G/B to correct residual color casts.
-    - ght: targeted tonal stretch. Use high local_intensity (B=8–13) and set
-      symmetry_point to the median of the region you want to enhance.
-      Effective for boosting faint outer nebula without saturating bright core.
+    Methods:
+    - mtf: Midtone Transfer Function with black/mid/white points. Global
+      brightness and contrast.
+    - ght: Generalized Hyperbolic Stretch applied post-stretch. B and SP
+      target a specific brightness range instead of stretching globally.
 
-    Multiple passes with small adjustments are better than one large adjustment.
+    channels selects which channels the adjustment applies to (all / R / G /
+    B / RG / RB / GB).
     """
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"]["current_image"]

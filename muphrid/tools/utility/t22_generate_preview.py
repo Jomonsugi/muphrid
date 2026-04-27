@@ -31,6 +31,18 @@ from muphrid.tools._siril import run_siril_script
 
 # ── Core function ──────────────────────────────────────────────────────────────
 
+# Agent-VLM preview defaults. The human-facing preview stays at the larger
+# size for the Gradio panel; the agent gets a smaller sibling so the per-cycle
+# vision token cost stays reasonable when the working image is auto-injected
+# every model.invoke. Roughly 1024px long-side at JPG q=85 ≈ 450–550 vision
+# tokens on Anthropic Claude — enough resolution for the structure-scale
+# judgments astrophotography decisions need (gradient direction, vignetting,
+# nebula shape, color cast, "do these stars look right") without paying for
+# pixel-level detail the analytical metrics cover precisely.
+_AGENT_VLM_WIDTH = 1024
+_AGENT_VLM_QUALITY = 85
+
+
 def generate_preview(
     working_dir: str,
     fits_path: str,
@@ -39,6 +51,7 @@ def generate_preview(
     auto_stretch_linear: bool = True,
     quality: int = 95,
     annotation: str | None = None,
+    write_agent_sidecar: bool = True,
 ) -> dict:
     """
     Generate a preview image from a FITS file.
@@ -60,12 +73,22 @@ def generate_preview(
         JPG compression quality (1–100). Ignored for PNG.
     annotation : str | None
         Optional text label drawn on the preview (e.g. "Variant A: Gentle").
+    write_agent_sidecar : bool
+        When True (default) and format='jpg', also write a smaller
+        `<stem>_vlm.jpg` sidecar at _AGENT_VLM_WIDTH / _AGENT_VLM_QUALITY for
+        the agent's vision input. The sidecar reuses the same Siril output so
+        only the resize/save is repeated. Skipped for PNG output (the agent
+        path always uses JPG) and skipped when the request is itself already
+        smaller than the agent target (no point producing a sidecar that
+        equals the human preview).
 
     Returns
     -------
     dict
-        preview_path : str — absolute path to the generated preview file
-        is_auto_stretched : bool — whether autostretch was applied
+        preview_path           : absolute path to the human-facing preview
+        is_auto_stretched      : whether autostretch was applied
+        agent_preview_path     : absolute path to the agent VLM preview, if
+                                 a sidecar was written; otherwise None
     """
     img_path = Path(fits_path)
     if not img_path.exists():
@@ -101,6 +124,32 @@ def generate_preview(
     final_path = preview_dir / temp_file.name
     _resize_and_annotate(temp_file, final_path, width=width, annotation=annotation)
 
+    # Agent VLM sidecar — produced from the human preview (already on disk),
+    # never re-rendered from FITS. Same colour pipeline, smaller resolution.
+    agent_preview_path: str | None = None
+    if (
+        write_agent_sidecar
+        and format == "jpg"
+        and width > _AGENT_VLM_WIDTH
+    ):
+        try:
+            agent_preview = preview_dir / f"{preview_stem}_vlm.jpg"
+            _resize_to_jpg(
+                src=final_path,
+                dst=agent_preview,
+                width=_AGENT_VLM_WIDTH,
+                quality=_AGENT_VLM_QUALITY,
+            )
+            agent_preview_path = str(agent_preview)
+        except Exception as e:
+            # The human preview is the load-bearing artifact; the sidecar is
+            # an optimization. Don't fail the whole call if it can't be
+            # produced (e.g. PIL import failure on a slim install).
+            import logging
+            logging.getLogger(__name__).warning(
+                f"generate_preview: VLM sidecar write failed (non-fatal): {e}"
+            )
+
     # Clean up temp file if it differs from final path
     if temp_file != final_path and temp_file.exists():
         temp_file.unlink()
@@ -108,7 +157,30 @@ def generate_preview(
     return {
         "preview_path": str(final_path),
         "is_auto_stretched": auto_stretch_linear,
+        "agent_preview_path": agent_preview_path,
     }
+
+
+def _resize_to_jpg(
+    src: Path,
+    dst: Path,
+    width: int,
+    quality: int,
+) -> None:
+    """
+    Resize an existing JPG/PNG to a smaller JPG. Used to produce the agent
+    VLM sidecar from the human-facing preview without re-running Siril.
+    """
+    from PIL import Image
+
+    img = Image.open(src)
+    if img.width > width:
+        ratio = width / img.width
+        new_size = (width, int(img.height * ratio))
+        img = img.resize(new_size, Image.LANCZOS)
+    if img.mode in ("RGBA", "LA"):
+        img = img.convert("RGB")
+    img.save(dst, format="JPEG", quality=quality, optimize=True)
 
 
 def _resize_and_annotate(

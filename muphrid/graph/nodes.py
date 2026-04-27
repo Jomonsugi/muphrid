@@ -34,9 +34,11 @@ from muphrid.graph.hitl import (
     tool_cfg,
     vlm_autonomous,
     vlm_hitl,
+    vlm_phase_eligible,
     vlm_window_cap,
 )
 from muphrid.graph.content import image_blocks, text_content
+from muphrid.graph.prompts import HITL_PARTNER_FRAGMENT as _HITL_PARTNER_FRAGMENT
 from muphrid.graph.prompts import PHASE_PROMPTS as _PHASE_PROMPTS
 from muphrid.graph.prompts import SYSTEM_BASE as _SYSTEM_BASE
 from muphrid.graph.registry import all_tools, tools_for_phase
@@ -207,27 +209,92 @@ def _variants_to_refs(state: AstroState) -> list[VisualRef]:
     return refs
 
 
+def _current_image_ref(state: AstroState) -> VisualRef | None:
+    """
+    Build a VisualRef for the working image's preview, if eligible.
+
+    Auto-projection rules:
+      - The current phase must be in vlm_phase_eligible() — pre-stack phases
+        return None even when paths.current_image happens to point somewhere.
+      - state.paths.current_image must be set; the derived agent-VLM preview
+        (smaller sibling under <working_dir>/previews/) must exist on disk.
+      - We prefer the agent-sized VLM preview (`preview_<stem>_vlm.jpg`) when
+        present — produced at ~1024px / q=85 by t22_generate_preview alongside
+        the human-facing 1920px preview. If only the human preview exists, we
+        fall back to it rather than skipping (correctness over cost).
+
+    Returns None when any precondition fails. The caller decides what to do
+    in that case (typically: just don't include the working image).
+
+    This source projects the agent's qualitative anchor — the "what does the
+    image look like right now" complement to the analytical metrics. The
+    agent retains explicit visual affordances (present_images) regardless of
+    phase eligibility; this only governs the auto-injection.
+    """
+    phase = state.get("phase")
+    if not vlm_phase_eligible(phase):
+        return None
+
+    paths = state.get("paths") or {}
+    current_image = paths.get("current_image")
+    if not current_image:
+        return None
+
+    working_dir = (state.get("dataset") or {}).get("working_dir") or ""
+    stem = Path(current_image).stem
+    preview_dir = Path(working_dir) / "previews" if working_dir else None
+
+    chosen: Path | None = None
+    if preview_dir is not None:
+        vlm_preview = preview_dir / f"preview_{stem}_vlm.jpg"
+        human_preview = preview_dir / f"preview_{stem}.jpg"
+        if vlm_preview.exists():
+            chosen = vlm_preview
+        elif human_preview.exists():
+            chosen = human_preview
+
+    if chosen is None:
+        return None
+
+    phase_val = getattr(phase, "value", phase) or ""
+    return VisualRef(
+        path=str(chosen),
+        label="current working image",
+        source="current_image",
+        phase=str(phase_val),
+    )
+
+
 def _select_visible_refs(state: AstroState) -> list[VisualRef]:
     """
-    Pick the images the agent should see right now. Combines two state
-    sources:
+    Pick the images the agent should see right now. Four sources:
 
-      - state.variant_pool   → projected to VisualRefs at view-build time
-                                (the canonical store for active HITL variants)
-      - state.visual_context → present_images and phase_carry entries
+      - state.variant_pool   → projected to VisualRefs (active decision space
+                                during a HITL gate or sandwich-iteration in
+                                autonomous mode). Source label "hitl_variant".
+      - current_image        → auto-projected anchor produced by
+                                _current_image_ref(state) when vlm_phase_eligible.
+                                Source label "current_image".
+      - state.visual_context → present_images and phase_carry entries the
+                                agent has explicitly chosen to keep visible.
 
-    Mode dispatch:
-      - Both modes off → empty (no images at all)
-      - vlm_hitl only  → only the variant_pool projection. Outside an active
-                         gate variant_snapshot/promote_variant leave the pool
-                         empty, so this naturally returns nothing — no
-                         leakage between gates.
-      - vlm_autonomous (± vlm_hitl) → variant_pool projection + visual_context,
-                         capped to vlm_window_cap() from the newest end, with
-                         the gate-overflow exception: if the variant_pool alone
-                         exceeds the cap, show the full pool and drop other
-                         sources (so the human's referenced variant is always
-                         resolvable on the agent side).
+    Visibility:
+      - vlm_hitl is always True (collaboration requires visual access). The
+        active gate's variant pool is therefore always visible during HITL.
+      - vlm_autonomous controls auto-current-image and the visual_context
+        projection outside HITL. When False, the agent operates on metrics;
+        present_images returns an informative ToolMessage instead of silently
+        adding hidden context.
+
+    Cap: vlm_window_cap() applies to the combined set. The gate-overflow
+    exception remains — if the variant pool alone exceeds the cap, the pool
+    is shown in full and everything else (including the auto-current-image)
+    is dropped, so the human's referenced variant is always resolvable on
+    the agent side.
+
+    Order in the returned list (oldest → newest): visual_context entries,
+    then auto-current-image (anchor), then variant pool (active decision
+    space). The cap takes the newest tail when truncating.
     """
     hitl_on = vlm_hitl()
     auto_on = vlm_autonomous()
@@ -236,17 +303,27 @@ def _select_visible_refs(state: AstroState) -> list[VisualRef]:
 
     variant_refs = _variants_to_refs(state)
 
-    # Mode A: vlm_hitl only — show only active HITL variants from the pool.
-    # present_images / phase_carry entries require autonomous mode to be
-    # visible because they persist outside HITL conversations.
-    if hitl_on and not auto_on:
-        return variant_refs
+    # Auto-current-image is suppressed outside autonomous mode (would otherwise
+    # leak phase_carry-equivalent context across HITL gates without explicit
+    # agent action). HITL-only mode shows the variant pool plus whatever the
+    # gate brings in via state.visual_context.
+    auto_current: VisualRef | None = (
+        _current_image_ref(state) if auto_on else None
+    )
 
-    # Mode B/C: vlm_autonomous on. Combine pool + visual_context (other
-    # sources), placing variants at the end so they're treated as newest by
-    # the cap logic.
     other_refs = list(state.get("visual_context", []) or [])
-    combined = other_refs + variant_refs
+    # Drop any pre-existing entry that would shadow the auto-current-image —
+    # phase_carry / present_images entries pointing at the same path are
+    # redundant when current_image is already projected.
+    if auto_current is not None:
+        other_refs = [r for r in other_refs if r.get("path") != auto_current["path"]]
+
+    # Build the combined view. Order: other (oldest) → auto-current-image →
+    # variants (newest = active decision space).
+    combined: list[VisualRef] = list(other_refs)
+    if auto_current is not None:
+        combined.append(auto_current)
+    combined.extend(variant_refs)
 
     cap = vlm_window_cap()
     if len(variant_refs) > cap:
@@ -329,9 +406,20 @@ def _build_vlm_view(state: AstroState, messages: list) -> list:
     if vlm_msg is None:
         return cleaned
 
+    # Estimated visual payload size, used for token-burn observability.
+    # Accurate for files we just read off disk; for missing files (never
+    # happens after _make_vlm_message succeeds) we fall back to 0.
+    total_bytes = 0
+    for p in paths:
+        try:
+            total_bytes += Path(p).stat().st_size
+        except OSError:
+            pass
+
     logger.debug(
-        f"vlm_view: showing {len(refs)} image(s) "
+        f"vlm_view: showing {len(refs)} image(s), ~{total_bytes // 1024} KB on disk "
         f"({sum(1 for r in refs if r.get('source') == 'hitl_variant')} hitl_variant, "
+        f"{sum(1 for r in refs if r.get('source') == 'current_image')} current_image, "
         f"{sum(1 for r in refs if r.get('source') == 'present_images')} present_images, "
         f"{sum(1 for r in refs if r.get('source') == 'phase_carry')} phase_carry)"
     )
@@ -388,6 +476,67 @@ def _check_phase_tool_limit(messages: list, phase) -> None:
         )
 
 
+# Markers that identify a ToolMessage as a failure. Successful tools return
+# JSON (dict/list) in their content; failing tools yield free-form error text
+# from _format_tool_error or raw exception strings. We check:
+#   1. content is a dict/list with "error" or "success": false
+#   2. OR content is a string that matches any known failure prefix
+# Substring matching is sufficient because _format_tool_error standardizes
+# on these prefixes and SirilError messages contain "siril-cli exited".
+_TOOL_ERROR_MARKERS: tuple[str, ...] = (
+    "Tool '",                 # "Tool 'X' failed ..." from _format_tool_error
+    "Error:",                 # generic error prefix
+    "Error in line ",         # Siril script error
+    "siril-cli exited",       # SirilError
+    "Traceback (most recent", # unraised exceptions leaking through
+    "validation error",       # pydantic validation
+    "FileNotFoundError",      # raised from tool bodies
+    "RuntimeError",           # raised from tool bodies
+    "ValueError",             # raised from tool bodies
+    "with an internal error", # _format_tool_error fallback
+)
+
+
+def _tool_message_is_error(msg, content: str) -> bool:
+    """
+    Classify a ToolMessage as a failure for the stuck-loop detector.
+
+    Trusts `status='error'` when the underlying ToolNode set it (LangChain
+    ≥0.2 does this for raised exceptions). Falls back to content inspection
+    for older versions or custom handlers that only set the content string.
+
+    The JSON path mirrors how successful tools report: JSON-parseable content
+    is almost always success. Non-JSON content that starts with a known error
+    marker is treated as failure.
+    """
+    status = getattr(msg, "status", None)
+    if status == "error":
+        return True
+
+    if not content:
+        return False
+
+    # Successful tools return JSON. If parseable, only treat as error when the
+    # JSON itself declares failure.
+    stripped = content.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            if parsed.get("error"):
+                return True
+            if parsed.get("success") is False:
+                return True
+            return False
+        if parsed is not None:
+            return False
+        # JSON-looking but unparseable — fall through to marker check.
+
+    return any(marker in content for marker in _TOOL_ERROR_MARKERS)
+
+
 def _check_stuck_loop(messages: list) -> None:
     """
     Detect repeated identical tool calls within the current segment.
@@ -405,20 +554,85 @@ def _check_stuck_loop(messages: list) -> None:
     the same parameters with no-op work in between. The counter-based check
     catches this regardless of interleaving.
 
+    Effect-level collapsing: some tools report `"noop": true` in their result
+    JSON to signal that the call produced no state change (currently
+    restore_checkpoint does this when the bookmarked path already equals
+    current_image). Agents in a stuck loop often try *different argument
+    values* — restore_checkpoint("starless_base"), restore_checkpoint("v1"),
+    restore_checkpoint("good") — all noops pointing at the same stale
+    current_image. Args differ, so the args-only fingerprint never trips.
+    To catch this, any tool call whose ToolMessage carries `"noop": true` is
+    fingerprinted by effect (`{name, effect=noop}`) rather than by args, so
+    all such noops for a given tool name share one counter.
+
+    Error-level collapsing: the same class of stuck loop happens when a tool
+    *keeps failing*. The M31 run exhibited this: siril_stack failed on every
+    attempt while select_frames succeeded with varying thresholds between
+    each retry, so the args-only fingerprint never saw two matching args.
+    We now collapse any failing ToolMessage into `{name, effect=error}`
+    regardless of args, which catches the "try three different parameter
+    sets, all produce Siril errors" pattern without tripping on a single
+    transient failure.
+
     Note: the env var name is historical — the semantic is now "max identical
     invocations within the current segment", not "max consecutive".
 
     Calling build_masters(file_type="bias") then build_masters(file_type="dark")
     still passes, because the args differ → distinct fingerprints → distinct
-    counts. Only repeated calls with the *same* args trip the detector.
+    counts. Only repeated calls with the *same* args (or the *same effect,*
+    for noop-reporting tools) trip the detector.
     """
     import json
     import os
     from collections import Counter
 
-    limit = int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "0"))
+    # Resolution order: env var override → processing.toml [limits] → hardcoded.
+    # The CLI path never sets the env var (gradio_app does), so relying solely
+    # on os.environ left the detector disabled for every CLI run, which is how
+    # the M42 Sonnet run was able to retry siril_register a dozen times after
+    # a cfitsio path error without ever tripping the guard. Falling back to
+    # the toml value restores parity between the two entry points.
+    env_limit = os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "")
+    if env_limit:
+        limit = int(env_limit)
+    else:
+        try:
+            from muphrid.config import _pcfg
+            limit = int(_pcfg("limits", "max_consecutive_same_tool", 3))
+        except Exception:
+            # If config loading fails for any reason, fall back to the
+            # hardcoded default rather than silently disabling the detector.
+            limit = 3
     if limit <= 0:
         return
+
+    # First pass: collect tool_call_ids whose result was a no-op or an error.
+    # We key by id so the AIMessage pass can recognize them without walking
+    # messages twice in lockstep. The reverse walk still stops at
+    # advance_phase / HumanMessage boundaries — events outside the current
+    # segment must not leak in.
+    noop_tool_call_ids: set[str] = set()
+    error_tool_call_ids: set[str] = set()
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            if getattr(msg, "name", None) == "advance_phase":
+                break
+            tc_id = getattr(msg, "tool_call_id", None)
+            content = msg.content if isinstance(msg.content, str) else ""
+            if '"noop": true' in content or '"noop":true' in content:
+                # Confirm by parsing — the substring match is a cheap prefilter.
+                try:
+                    parsed = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict) and parsed.get("noop") is True:
+                    if tc_id:
+                        noop_tool_call_ids.add(tc_id)
+            elif tc_id and _tool_message_is_error(msg, content):
+                error_tool_call_ids.add(tc_id)
+            continue
+        if isinstance(msg, HumanMessage):
+            break
 
     counts: Counter[str] = Counter()
     for msg in reversed(messages):
@@ -432,10 +646,34 @@ def _check_stuck_loop(messages: list) -> None:
             break
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tc in msg.tool_calls:
-                fingerprint = json.dumps(
-                    {"name": tc["name"], "args": tc.get("args", {})},
-                    sort_keys=True,
-                )
+                tc_id = tc.get("id")
+                if tc_id in noop_tool_call_ids:
+                    # Effect-level fingerprint: collapse all noop calls to the
+                    # same tool (regardless of args) into one counter. This is
+                    # what catches "try a different checkpoint name each time"
+                    # loops where every attempt resolves to the same file.
+                    fingerprint = json.dumps(
+                        {"name": tc["name"], "effect": "noop"},
+                        sort_keys=True,
+                    )
+                elif tc_id in error_tool_call_ids:
+                    # Error-level fingerprint: collapse all failing calls to
+                    # the same tool into one counter. Catches oscillation like
+                    # select_frames(a) → siril_stack(x, fails) → select_frames(b)
+                    # → siril_stack(y, fails) where args vary on each retry but
+                    # the tool keeps failing. The noop counter protects against
+                    # silent no-op loops; this protects against noisy failure
+                    # loops. Pairs naturally with the existing args-based path
+                    # for successful calls.
+                    fingerprint = json.dumps(
+                        {"name": tc["name"], "effect": "error"},
+                        sort_keys=True,
+                    )
+                else:
+                    fingerprint = json.dumps(
+                        {"name": tc["name"], "args": tc.get("args", {})},
+                        sort_keys=True,
+                    )
                 counts[fingerprint] += 1
         # Text-only AIMessages are part of the segment (analysis between
         # tool calls), they don't reset the counter.
@@ -447,6 +685,35 @@ def _check_stuck_loop(messages: list) -> None:
     most_common, count = counts.most_common(1)[0]
     if count >= limit:
         info = json.loads(most_common)
+        if info.get("effect") == "noop":
+            raise StuckLoopError(
+                f"Agent called '{info['name']}' {count} times with different "
+                f"arguments but every result was a no-op (limit: {limit}) — "
+                f"aborting. The tool keeps resolving to the same underlying "
+                f"state regardless of the argument value, which means the "
+                f"problem is upstream of this tool (e.g. current_image is "
+                f"stale, or the checkpoints all point at the same file). "
+                f"Do not retry with yet another argument — branch: inspect "
+                f"paths.current_image, promote the correct file with a "
+                f"different tool, or send a feedback message to reset the "
+                f"segment. Set MAX_CONSECUTIVE_SAME_TOOL=0 in .env to "
+                f"disable this check."
+            )
+        if info.get("effect") == "error":
+            raise StuckLoopError(
+                f"Agent called '{info['name']}' {count} times and every "
+                f"result was an error (limit: {limit}) — aborting. Varying "
+                f"arguments have not resolved the failure, which means the "
+                f"problem is upstream of this tool's inputs (e.g. the "
+                f"sequence on disk is malformed, a prior step produced "
+                f"inconsistent state, or an environmental precondition is "
+                f"missing). Do not retry '{info['name']}' again with yet "
+                f"another parameter set — inspect the last tool output for "
+                f"the actual error, fix the precondition with a different "
+                f"tool, or send a feedback message to reset the segment. "
+                f"Set MAX_CONSECUTIVE_SAME_TOOL=0 in .env to disable this "
+                f"check."
+            )
         raise StuckLoopError(
             f"Agent called '{info['name']}' {count} times with identical "
             f"arguments {info['args']} within the current segment "
@@ -564,6 +831,13 @@ def make_agent_node(model_factory):
             state.get("variant_pool", []) or []
         )
 
+        # HITL collaboration fragment — appended only when the agent is at an
+        # active HITL gate. Lives in its own dynamic block so the cached
+        # prefix doesn't churn when the gate opens or closes mid-phase.
+        hitl_fragment = (
+            _HITL_PARTNER_FRAGMENT if state.get("active_hitl") else ""
+        )
+
         # Anthropic prompt caching: use content blocks with cache_control
         # so the stable prefix is cached across calls within a phase.
         # additional_kwargs doesn't work — must use inline content blocks.
@@ -576,6 +850,9 @@ def make_agent_node(model_factory):
             if variant_pool_section:
                 # Uncached: regenerated each turn from live state
                 system_blocks.append({"type": "text", "text": variant_pool_section})
+            if hitl_fragment:
+                # Uncached: only present during active HITL conversations
+                system_blocks.append({"type": "text", "text": hitl_fragment})
             messages = [SystemMessage(content=system_blocks)] + raw_messages
 
             # Mark the last successful advance_phase as a cache boundary so
@@ -606,7 +883,9 @@ def make_agent_node(model_factory):
         else:
             full_system = system
             if variant_pool_section:
-                full_system = f"{system}\n\n{variant_pool_section}"
+                full_system = f"{full_system}\n\n{variant_pool_section}"
+            if hitl_fragment:
+                full_system = f"{full_system}\n\n{hitl_fragment}"
             messages = [SystemMessage(content=full_system)] + raw_messages
 
         # VLM view: state.visual_context owns visibility. See _build_vlm_view.
@@ -1143,6 +1422,9 @@ def build_variant_promotion_update(
       - paths.current_image := variant.file_path
       - variant_pool := []
       - visual_context := <existing> + phase_carry entry for the approved variant
+      - metadata.last_committed_variant := {id, file_path}  (race-fix signal:
+        lets commit_variant detect "already promoted via HITL" when the pool
+        has been cleared and return idempotent success instead of an error)
 
     Shared by promote_variant (HITL) and the commit_variant tool (autonomous).
     """
@@ -1175,6 +1457,15 @@ def build_variant_promotion_update(
         "paths": paths,
         "variant_pool": [],
         "visual_context": existing_visual,
+        # metadata is merged via _merge_dicts, so partial updates are safe —
+        # other metadata fields are preserved and only last_committed_variant
+        # is overwritten.
+        "metadata": {
+            "last_committed_variant": {
+                "id": variant["id"],
+                "file_path": variant["file_path"],
+            },
+        },
     }
     return variant, update
 
@@ -1202,7 +1493,19 @@ def promote_variant(
         return None
     variant, update = result
 
-    approval_lines = [f"Approved {variant['id']} ({variant['label']})."]
+    # The HumanMessage is both a narrative cue AND a reset point for
+    # _check_stuck_loop. Make the state change explicit so the agent does not
+    # then call commit_variant to "lock it in" — that would be a redundant
+    # round-trip, and the variant_pool is already empty so commit_variant
+    # would otherwise fall into its error path. commit_variant's
+    # already_committed guard handles this idempotently too, but the clearer
+    # the signal here, the fewer ticks the agent burns.
+    approval_lines = [
+        f"Approved {variant['id']} ({variant['label']}).",
+        "current_image has been updated to the approved variant, the "
+        "variant pool has been cleared, and no further commit call is "
+        "needed — the approval itself is the commit.",
+    ]
     if rationale:
         approval_lines.append(f"Rationale: {rationale}")
     approval_lines.append("Continue to the next step.")

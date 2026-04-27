@@ -1,23 +1,15 @@
 """
 T14 — stretch_image
 
-Transform the image from linear to non-linear (perceptual) brightness space.
-This is the single most impactful step — it makes the invisible faint signal
-visible by applying a non-linear transfer function.
+Apply a non-linear transfer function that transforms the image from linear
+(sensor-space) to non-linear (display-space) brightness.
 
-Backend: Siril CLI — GHS (Generalized Hyperbolic Stretch), arcsinh, or
-autostretch. GHS offers the most control and is preferred.
+Backend: Siril CLI. Methods: GHS (Generalized Hyperbolic Stretch), arcsinh,
+autostretch.
 
-Produce multiple variants using distinct output_suffix values (e.g. 'gentle',
-'moderate', 'aggressive') so the best result can be selected. After stretch,
-the image is non-linear — subsequent linear tools (T09–T13) must not be
-applied.
-
-Key metrics to monitor (from analyze_image after stretch):
-  - clipped_shadows_pct < 0.5% — preserve faint nebulosity
-  - clipped_highlights_pct < 0.1% — avoid burned star cores
-Always use linked stretch (same transfer function across channels) after color
-calibration to preserve white balance.
+Produces variants identified by output_suffix. Each call stretches from the
+same linear master — variants are independent and do not chain. After the
+stretch, the image is non-linear; linear-space tools are no longer valid.
 """
 
 from __future__ import annotations
@@ -43,30 +35,24 @@ from muphrid.tools._siril import fits_has_nan, run_siril_script
 class GHSOptions(BaseModel):
     stretch_amount: float = Field(
         description=(
-            "D: stretch intensity (0–10). The primary control — determines how "
+            "D: stretch intensity (0–10). Primary control — determines how "
             "aggressively the non-linear transfer function redistributes pixel "
-            "values. Higher D moves the histogram further from linear. Choose "
-            "based on how much the histogram needs to shift to reveal the signal "
-            "of interest, then verify with analyze_image."
+            "values. Higher D moves the histogram further from linear."
         ),
     )
     local_intensity: float = Field(
         default=0.0,
         description=(
-            "B: focuses the stretch around the symmetry point (-5 to 15). "
-            "0 = standard exponential stretch. "
-            "Higher values (5–13) create a very targeted stretch around SP — "
-            "useful for brightening specific tonal ranges without affecting others. "
-            "Negative values create a de-focused stretch."
+            "B: focus of the stretch around the symmetry point (-5 to 15). "
+            "0 = standard exponential stretch. Positive values tighten the "
+            "stretch around SP. Negative values de-focus it."
         ),
     )
     symmetry_point: float = Field(
         default=0.0,
         description=(
-            "SP: the brightness level where the stretch adds the most contrast "
-            "(0–1). Set SP to the region of the histogram where your signal of "
-            "interest lives. 0.0 targets the darkest values. Use analyze_image "
-            "histogram data to identify where the signal sits."
+            "SP: the brightness level (0–1) at which the stretch adds the "
+            "most contrast. 0.0 targets the darkest values."
         ),
     )
     shadow_protection: float = Field(
@@ -81,27 +67,24 @@ class GHSOptions(BaseModel):
         default=1.0,
         description=(
             "HP: pixels above this value are stretched linearly instead of "
-            "non-linearly (0–1). Prevents bright pixels from clipping and "
-            "star cores from bloating. 1.0 = no protection. Lower HP to "
-            "protect more of the bright end. Check clipped_highlights_pct "
-            "in analyze_image to decide whether HP needs adjusting."
+            "non-linearly (0–1). 1.0 = no protection. Lower HP stretches "
+            "less of the bright end non-linearly."
         ),
     )
     color_model: str = Field(
         default="human",
         description=(
-            "human: preserves human color perception (L*a*b* lightness) — recommended "
-            "for color images after color calibration. "
+            "human: L*a*b* lightness-weighted (preserves perceived color). "
             "even: equal weights across channels. "
-            "independent: each channel processed independently — use only if you "
-            "intentionally want to alter white balance."
+            "independent: each channel processed independently (can shift "
+            "white balance)."
         ),
     )
     channels: str = Field(
         default="all",
         description=(
-            "Which channels to apply the stretch to. "
-            "all: all channels (default, use for linked stretch). "
+            "Which channels receive the stretch. "
+            "all: all channels with the same parameters (linked stretch). "
             "R, G, B: single channel. RG, RB, GB: channel pairs."
         ),
     )
@@ -111,7 +94,7 @@ class GHSOptions(BaseModel):
             "How out-of-range values are handled after stretch. "
             "'clip': hard clip to [0,1]. "
             "'rescale': rescale to fit. "
-            "'rgbblend': blend RGB to preserve color (default, recommended). "
+            "'rgbblend': blend RGB to preserve color. "
             "'globalrescale': rescale uniformly across all channels."
         ),
     )
@@ -122,21 +105,20 @@ class AsinhOptions(BaseModel):
         default=100.0,
         description=(
             "Stretch strength (1–1000). Higher values produce a stronger "
-            "non-linear lift of faint signal. The effect depends on the data — "
-            "verify with analyze_image after applying."
+            "non-linear transfer response."
         ),
     )
     black_point_offset: float = Field(
         default=0.0,
         description=(
-            "Normalized offset (0–1) applied to the black point before stretching. "
-            "Small positive values (0.0–0.05) lift the black level slightly."
+            "Normalized offset (0–1) applied to the black point before "
+            "stretching."
         ),
     )
     color_model: str = Field(
         default="human",
         description=(
-            "human: preserves L*a*b* lightness (recommended for color). "
+            "human: L*a*b* lightness-weighted. "
             "default: simple channel mean for luminance calculation."
         ),
     )
@@ -168,8 +150,9 @@ class AutostretchOptions(BaseModel):
     linked: bool = Field(
         default=True,
         description=(
-            "Linked stretch: apply same parameters to all channels. "
-            "Always use True after color calibration to preserve white balance."
+            "True: apply identical parameters to all channels (linked "
+            "stretch — preserves channel ratios). False: each channel "
+            "computed independently (can shift white balance)."
         ),
     )
 
@@ -178,10 +161,11 @@ class StretchImageInput(BaseModel):
     method: str = Field(
         default="ghs",
         description=(
-            "ghs: Generalized Hyperbolic Stretch — preferred for fine control. "
-            "asinh: Arcsinh stretch — simpler, smooth shadow lifting. "
-            "autostretch: Automatic histogram-based stretch — safe fallback / "
-            "quick first look. Use linked=True to preserve color balance."
+            "ghs: Generalized Hyperbolic Stretch — parametric transfer with "
+            "five controls (see GHSOptions). "
+            "asinh: Arcsinh transfer function (see AsinhOptions). "
+            "autostretch: Siril automatic histogram-based stretch (see "
+            "AutostretchOptions)."
         ),
     )
     ghs_options: GHSOptions | None = Field(
@@ -193,10 +177,9 @@ class StretchImageInput(BaseModel):
     output_suffix: str = Field(
         default="stretch",
         description=(
-            "Suffix appended to the output filename stem. "
-            "Use descriptive names when producing variants: 'gentle', 'moderate', "
-            "'aggressive'. Allows the agent to produce multiple variants without "
-            "overwriting each other."
+            "Suffix appended to the output filename stem. Each distinct "
+            "suffix yields an independent variant file; identical suffix "
+            "with identical parameters is rejected as a duplicate."
         ),
     )
 
@@ -272,23 +255,21 @@ def stretch_image(
     """
     Apply a non-linear stretch to the linear FITS image.
 
-    Transforms linear (un-stretched) data into perceptual brightness space,
-    making faint signal visible. All variants stretch from the same linear
-    master — they are independent, not chained.
+    Transforms linear (sensor-space) data into non-linear (display-space)
+    brightness. All variants stretch from the same linear master — they are
+    independent, not chained.
 
     Each call produces a variant with an auto-generated name from the method
-    and parameters (e.g. ghs_d25_b0_sp009). The result includes the variant
-    name and file path. To compare variants, call present_images with the
-    paths from each result.
-
-    Use select_stretch_variant to choose the best variant as the active image.
+    and parameters (e.g. ghs_d25_b0_sp009) unless output_suffix is set. The
+    result includes the variant name and file path. Use select_stretch_variant
+    to promote a variant to the active image.
 
     Methods:
-    - ghs: most control — five parameters shape the transfer function.
-      Choose parameters based on the histogram and verify with analyze_image.
-    - autostretch: automatic histogram-based stretch — useful as a quick
-      first look to understand the data before switching to GHS.
-    - asinh: smooth shadow lifting without harsh highlight compression.
+    - ghs: Generalized Hyperbolic Stretch. Five parameters shape the transfer
+      function (see GHSOptions).
+    - asinh: arcsinh transfer function (see AsinhOptions).
+    - autostretch: Siril automatic histogram-based stretch (see
+      AutostretchOptions).
     """
     working_dir = state["dataset"]["working_dir"]
     metadata = state.get("metadata", {})
@@ -351,8 +332,7 @@ def stretch_image(
 
     if method == "ghs" and ghs_options is None:
         raise ValueError(
-            "ghs_options.stretch_amount is required for method=ghs. "
-            "Provide a stretch_amount (e.g., 2.5 for a moderate first stretch)."
+            "ghs_options.stretch_amount is required for method=ghs."
         )
 
     stem = img_path.stem

@@ -14,9 +14,24 @@
 # and overrides them at runtime via checkboxes.
 
 autonomous = false
-vlm_hitl = false         # when true, agent sees all images (base64) during HITL conversations
-vlm_autonomous = false   # when true, agent can visually inspect images outside of HITL via present_images
-vlm_retention_max_images = 8   # max images retained in agent view (excluding active HITL gate, which is always shown)
+
+# ── VLM (vision) defaults ─────────────────────────────────────────────────────
+# vlm_hitl is intentionally not a user toggle: HITL is collaboration mode, and
+# collaboration on images requires the model to see what the human is
+# referencing. The graph forces vlm_hitl=true regardless of any value set here.
+#
+# vlm_autonomous controls whether the agent has visual access OUTSIDE active
+# HITL gates. Default true: post-stacking phases auto-include the current
+# working image as a visual anchor so the agent can pair quantitative metrics
+# with a qualitative gut-check. Disabling it is supported but not advised —
+# the agent still reasons from analyze_image metrics, and present_images
+# returns an informative ToolMessage so the agent knows visual access is off.
+#
+# vlm_retention_max_images is the sliding-window cap on images carried in the
+# agent's view per cycle. Active HITL gate variants are always visible above
+# this cap; the cap applies to everything else.
+vlm_autonomous = true
+vlm_retention_max_images = 8
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 

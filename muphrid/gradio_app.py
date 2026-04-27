@@ -52,7 +52,6 @@ from muphrid.graph.graph import build_graph
 from muphrid.graph.hitl import (
     build_variant_approval,
     set_autonomous,
-    set_vlm_hitl,
     set_vlm_autonomous,
     set_vlm_retention_max,
     set_memory_enabled,
@@ -109,7 +108,7 @@ def _load_processing_defaults() -> dict:
     per_phase = _pcfg("limits", "per_phase") or {}
     return {
         "llm_model": os.environ.get("LLM_MODEL", "") or _pcfg("model", "default", "moonshotai/Kimi-K2.5"),
-        "recursion_limit": int(os.environ.get("RECURSION_LIMIT", "") or _pcfg("limits", "recursion_limit", 100)),
+        "recursion_limit": int(os.environ.get("RECURSION_LIMIT", "") or _pcfg("limits", "recursion_limit", 200)),
         "max_tools_per_phase": int(os.environ.get("MAX_TOOLS_PER_PHASE", "") or _pcfg("limits", "max_tools_per_phase", 30)),
         "max_consecutive_same_tool": int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "") or _pcfg("limits", "max_consecutive_same_tool", 3)),
         "max_autonomous_nudges": int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "") or _pcfg("limits", "max_autonomous_nudges", 2)),
@@ -522,7 +521,7 @@ async def start_session(
 
         # Build config
         config = {"configurable": {"thread_id": thread_id}}
-        recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
+        recursion_limit = int(os.environ.get("RECURSION_LIMIT", "200"))
         if recursion_limit > 0:
             config["recursion_limit"] = recursion_limit
 
@@ -718,7 +717,7 @@ async def resume_session(
         return
 
     config = {"configurable": {"thread_id": resume_id}}
-    recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
+    recursion_limit = int(os.environ.get("RECURSION_LIMIT", "200"))
     if recursion_limit > 0:
         config["recursion_limit"] = recursion_limit
 
@@ -879,17 +878,19 @@ _SESSIONS_INDEX = Path.home() / ".muphrid" / "sessions.json"
 def _build_settings_snapshot() -> dict:
     """Capture current runtime settings into a dict for later diff comparison."""
     from muphrid.graph.hitl import (
-        is_autonomous, is_memory_enabled, vlm_hitl, vlm_autonomous,
+        is_autonomous, is_memory_enabled, vlm_autonomous,
         vlm_window_cap, TOOL_TO_HITL, is_enabled,
     )
     return {
         "model": os.environ.get("LLM_MODEL", ""),
         "autonomous": is_autonomous(),
         "memory": is_memory_enabled(),
-        "vlm_hitl": vlm_hitl(),
+        # vlm_hitl is always True (collaboration requires it). Kept in the
+        # snapshot dict for backward-compat / display.
+        "vlm_hitl": True,
         "vlm_autonomous": vlm_autonomous(),
         "vlm_retention_max_images": vlm_window_cap(),
-        "recursion_limit": int(os.environ.get("RECURSION_LIMIT", "100")),
+        "recursion_limit": int(os.environ.get("RECURSION_LIMIT", "200")),
         "max_tools_per_phase": int(os.environ.get("MAX_TOOLS_PER_PHASE", "30")),
         "max_consecutive_same_tool": int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "3")),
         "max_autonomous_nudges": int(os.environ.get("MAX_AUTONOMOUS_NUDGES", "2")),
@@ -1229,16 +1230,15 @@ def build_app() -> gr.Blocks:
             )
             gr.Markdown("### VLM (Visual Language Model)")
             gr.Markdown(
-                "When enabled, preview images are injected as base64 into the agent's "
-                "context so it can visually reason about results."
-            )
-            vlm_hitl = gr.Checkbox(
-                label="VLM during HITL (agent sees images during human review)",
-                value=hitl_defaults.get("vlm_hitl", False),
+                "Preview images are injected as base64 into the agent's context so "
+                "it can visually reason about results. VLM is always on during HITL "
+                "conversations — collaboration on images requires the model to see "
+                "what you're referencing. The autonomous toggle controls whether "
+                "the agent has visual access outside HITL gates as well."
             )
             vlm_present = gr.Checkbox(
-                label="VLM autonomous (agent can visually inspect images outside of HITL)",
-                value=hitl_defaults.get("vlm_autonomous", False),
+                label="VLM autonomous (agent sees the working image outside of HITL too)",
+                value=hitl_defaults.get("vlm_autonomous", True),
             )
             vlm_retention = gr.Number(
                 label="VLM retention cap (images)",
@@ -1248,8 +1248,8 @@ def build_app() -> gr.Blocks:
                 maximum=64,
                 info=(
                     "Sliding-window cap on the number of images retained in the agent's "
-                    "view. Only applies when VLM autonomous is on. The active HITL gate "
-                    "is always shown in addition to this cap."
+                    "view. Active HITL gate variants are always shown in addition to "
+                    "this cap."
                 ),
             )
             gr.Markdown("### Long-Term Memory")
@@ -1320,7 +1320,13 @@ def build_app() -> gr.Blocks:
                     label="Recursion limit",
                     value=env_defaults["recursion_limit"],
                     precision=0,
-                    info="Max LangGraph node transitions per stream() call. ~4 per tool call.",
+                    info=(
+                        "Max LangGraph node transitions per stream() call. "
+                        "~4 ticks per tool call plus ~6–10 extra per HITL gate "
+                        "and ~4 per feedback round. 200 covers a typical run "
+                        "with 4–6 gates and some iteration; bump to 300 for "
+                        "heavy iteration."
+                    ),
                 )
                 max_tools_phase = gr.Number(
                     label="Max tools per phase (default)",
@@ -1373,7 +1379,6 @@ def build_app() -> gr.Blocks:
 
         # Settings applied reactively via .change() — immediate effect
         autonomous_mode.change(fn=lambda v: set_autonomous(v), inputs=[autonomous_mode])
-        vlm_hitl.change(fn=lambda v: set_vlm_hitl(v), inputs=[vlm_hitl])
         vlm_present.change(fn=lambda v: set_vlm_autonomous(v), inputs=[vlm_present])
         vlm_retention.change(fn=lambda v: set_vlm_retention_max(int(v)), inputs=[vlm_retention])
         memory_enabled.change(fn=_on_memory_toggle, inputs=[memory_enabled])

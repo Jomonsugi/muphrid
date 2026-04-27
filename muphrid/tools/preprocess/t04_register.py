@@ -47,7 +47,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
-from muphrid.tools._siril import run_siril_script
+from muphrid.tools._siril import run_siril_script, siril_script_path
 
 
 # ── Star detection configuration ──────────────────────────────────────────────
@@ -394,20 +394,30 @@ class SirilRegisterInput(BaseModel):
 # ── Output parsing ─────────────────────────────────────────────────────────────
 
 def _parse_register_output(stdout: str) -> dict:
-    """Extract registration metrics from Siril stdout."""
+    """
+    Extract registration metrics from Siril stdout.
+
+    IMPORTANT: counts returned from this function are supplementary
+    diagnostics — they MUST NOT be used as the authoritative signal that
+    registration succeeded. Siril's phrasing for per-image registration
+    lines varies across versions and datasets; a regex miss drops the
+    count to zero and the agent interprets that as "nothing registered,
+    retry." Ground truth is whether the registered sequence exists on
+    disk (see _count_registered_files).
+    """
     metrics: dict = {}
 
     reg_match = re.search(
         r"(\d+)\s+(?:images?\s+)?(?:frame[s]?\s+)?registered", stdout, re.IGNORECASE
     )
     if reg_match:
-        metrics["registered_count"] = int(reg_match.group(1))
+        metrics["registered_count_from_stdout"] = int(reg_match.group(1))
 
     fail_match = re.search(
         r"(\d+)\s+(?:images?\s+)?(?:frame[s]?\s+)?(?:failed|not registered)",
         stdout, re.IGNORECASE,
     )
-    metrics["failed_count"] = int(fail_match.group(1)) if fail_match else 0
+    metrics["failed_count_from_stdout"] = int(fail_match.group(1)) if fail_match else 0
 
     ref_match = re.search(r"convergence.*image\s+(\d+)", stdout, re.IGNORECASE)
     if ref_match:
@@ -420,6 +430,42 @@ def _parse_register_output(stdout: str) -> dict:
         metrics["star_detection_count"] = len(counts)
 
     return metrics
+
+
+def _count_registered_files(working_dir: Path, registered_seq: str) -> int:
+    """
+    Ground-truth success check: count the per-frame output FITS files Siril
+    wrote for the registered sequence, or probe the consolidated fitseq.
+
+    Siril `seqapplyreg` with prefix `r_` produces files like
+    `r_pp_lights_00001.fit`, plus a `r_pp_lights.seq` sequence index. In
+    fitseq mode it produces a single consolidated `r_pp_lights.fit`.
+
+    Returns 0 only when Siril really produced nothing — independent of
+    stdout wording drift.
+    """
+    wd = Path(working_dir)
+    per_frame = sorted(wd.glob(f"{registered_seq}_*.fit")) + sorted(
+        wd.glob(f"{registered_seq}_*.fits")
+    )
+    if per_frame:
+        return len(per_frame)
+
+    from astropy.io import fits as _fits
+    consolidated = wd / f"{registered_seq}.fit"
+    if not consolidated.exists():
+        consolidated = wd / f"{registered_seq}.fits"
+    if consolidated.exists():
+        try:
+            with _fits.open(str(consolidated)) as hdul:
+                return sum(
+                    1 for hdu in hdul
+                    if hdu.data is not None and hdu.data.size > 0
+                )
+        except Exception:
+            return 1
+
+    return 0
 
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
@@ -503,7 +549,17 @@ def siril_register(
     if no_starlist:
         reg_parts.append("-nostarlist")
     if disto is not None:
-        reg_parts.append(f"-disto={disto}")
+        # Siril syntax: -disto=image | -disto=master | -disto=file <path>
+        # When a file path is supplied, rewrite it to a whitespace-free
+        # reference (relative-to-working-dir or symlinked basename) so
+        # Siril's tokenizer doesn't split on spaces in the dataset root.
+        if disto.startswith("file "):
+            path_part = disto[len("file "):].strip().strip('"').strip("'")
+            reg_parts.append(
+                f"-disto=file {siril_script_path(path_part, working_dir)}"
+            )
+        else:
+            reg_parts.append(f"-disto={disto}")
 
     if not two_pass:
         interp_map = {
@@ -520,7 +576,7 @@ def siril_register(
             if drizzle_kernel:
                 reg_parts.append(f"-kernel={drizzle_kernel}")
             if drizzle_flat:
-                reg_parts.append(f"-flat={drizzle_flat}")
+                reg_parts.append(f"-flat={siril_script_path(drizzle_flat, working_dir)}")
 
     commands.append(" ".join(reg_parts))
 
@@ -553,7 +609,7 @@ def siril_register(
             if drizzle_kernel:
                 apply_parts.append(f"-kernel={drizzle_kernel}")
             if drizzle_flat:
-                apply_parts.append(f"-flat={drizzle_flat}")
+                apply_parts.append(f"-flat={siril_script_path(drizzle_flat, working_dir)}")
 
         if filters is not None:
             parsed_filters = (
@@ -571,9 +627,39 @@ def siril_register(
     output_prefix = prefix if prefix else "r_"
     registered_seq = f"{output_prefix}{calibrated_sequence}"
 
+    # Ground truth: count the registered output files on disk. Matches the
+    # pattern established by t03_calibrate (see its _count_calibrated_files).
+    # Prior to this, registered_count came from a stdout regex, and a regex
+    # miss on a new dataset would surface as registered_count=0 in the
+    # ToolMessage — indistinguishable from a real failure and a direct
+    # trigger for agent retry loops.
+    wd = Path(working_dir)
+    actual_count = _count_registered_files(wd, registered_seq)
+
+    if actual_count == 0:
+        tail = result.stdout[-1200:] if result.stdout else "<empty>"
+        raise RuntimeError(
+            f"siril_register: no registered output files matching "
+            f"'{registered_seq}*' in {working_dir}. register/seqapplyreg "
+            f"did not produce per-frame files or a consolidated fitseq. "
+            f"Check findstar tuning, min_pairs, transformation, and input "
+            f"sequence integrity. Commands run: {commands}\n"
+            f"Stdout tail:\n{tail}"
+        )
+
+    stdout_count = metrics.get("registered_count_from_stdout")
+    count_mismatch_note: str | None = None
+    if stdout_count is not None and stdout_count != actual_count:
+        count_mismatch_note = (
+            f"Siril stdout reported {stdout_count} registered images but "
+            f"{actual_count} output files were written. Using disk count "
+            f"as authoritative."
+        )
+
     summary = {
         "registered_sequence": registered_seq,
         "calibrated_sequence": calibrated_sequence,
+        "registered_count": actual_count,
         **metrics,
         "settings": {
             "two_pass": two_pass,
@@ -585,6 +671,8 @@ def siril_register(
             "drizzle": drizzle,
         },
     }
+    if count_mismatch_note:
+        summary["note"] = count_mismatch_note
 
     return Command(update={
         "paths": {**state["paths"], "registered_sequence": registered_seq},

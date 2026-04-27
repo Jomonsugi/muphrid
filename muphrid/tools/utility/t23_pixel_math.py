@@ -24,14 +24,18 @@ Siril pm notes:
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Annotated
 
 import numpy as np
 from astropy.io import fits
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
@@ -185,7 +189,8 @@ def pixel_math(
     rescale_high: float = 1.0,
     nosum: bool = True,
     state: Annotated[AstroState, InjectedState] = None,
-) -> dict:
+    tool_call_id: Annotated[str, InjectedToolCallId] = "",
+) -> Command:
     """
     General-purpose pixel math using Siril's PixelMath engine.
 
@@ -193,13 +198,20 @@ def pixel_math(
     - Masked application: "$processed$ * $mask$ + $original$ * (1 - $mask$)"
     - Weighted star recombination: "$starless$ + $starmask$ * 0.8"
     - Channel extraction: "$image$[R]" (where Siril channels are indexed)
-    - HDR blending: "$bright$ * 0.3 + "$mid$ * 0.7"
+    - HDR blending: "$bright$ * 0.3 + $mid$ * 0.7"
 
     All image variable stems must exist as FITS files in working_dir.
     The result image is saved to working_dir/{output_stem}.fit.
 
     Validate expression syntax before calling — the agent should check that
     all $variable$ names correspond to known image files.
+
+    Post-condition: paths.current_image is updated to the result file, and
+    paths.previous_image records what current_image was before this call.
+    This matches the post-condition contract for every other image-modifying
+    tool. If you intended to produce an intermediate file without promoting
+    it to current_image, call save_checkpoint BEFORE pixel_math and
+    restore_checkpoint AFTER — the result file stays on disk either way.
     """
     working_dir = state["dataset"]["working_dir"]
     _stems, expression, auto_broadcast = _validate_and_broadcast(expression, working_dir)
@@ -224,7 +236,22 @@ def pixel_math(
             f"pixel_math: Siril did not produce expected output: {wd / out_stem}.fit"
         )
 
-    return {
+    prev_current = state["paths"].get("current_image")
+    summary = {
         "result_image_path": str(output_path),
+        "current_image": str(output_path),
+        "previous_image": prev_current,
+        "expression": expression,
         "auto_broadcast": auto_broadcast,
     }
+    return Command(update={
+        "paths": {
+            **state["paths"],
+            "current_image": str(output_path),
+            "previous_image": prev_current,
+        },
+        "messages": [ToolMessage(
+            content=json.dumps(summary, indent=2, default=str),
+            tool_call_id=tool_call_id,
+        )],
+    })

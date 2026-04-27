@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 
 from muphrid.equipment import resolve_pixel_size, resolve_target_coords
 from muphrid.graph.state import AstroState
-from muphrid.tools._siril import SirilError, run_siril_script
+from muphrid.tools._siril import SirilError, run_siril_script, siril_script_path
 from muphrid.tools.linear.t10_color_calibrate import _parse_plate_solve_result
 
 
@@ -208,6 +208,9 @@ def build_platesolve_cmd(
     if search_radius is not None:
         parts.append(f"-radius={search_radius}")
     if save_disto is not None:
+        # save_disto is expected to be pre-sanitized by the caller via
+        # siril_script_path() so it contains no whitespace. Builder stays
+        # pure (no working_dir dependency).
         parts.append(f"-disto={save_disto}")
     if limitmag is not None:
         parts.append(f"-limitmag={limitmag}")
@@ -315,6 +318,13 @@ def plate_solve(
     if resolved_coords is None and target_name:
         resolved_coords = resolve_target_coords(target_name)
 
+    # Rewrite save_disto to a whitespace-free reference before building the
+    # command. Siril's tokenizer splits on whitespace and would truncate
+    # any unsanitized path that lives under a dataset root with spaces.
+    safe_save_disto = (
+        siril_script_path(save_disto, working_dir) if save_disto else None
+    )
+
     cmd = build_platesolve_cmd(
         focal_length_mm=focal_length_mm,
         pixel_size_um=resolved_px_um,
@@ -324,7 +334,7 @@ def plate_solve(
         downscale=downscale,
         sip_order=sip_order,
         search_radius=search_radius,
-        save_disto=save_disto,
+        save_disto=safe_save_disto,
         limitmag=limitmag,
         catalog=catalog,
         no_crop=no_crop,

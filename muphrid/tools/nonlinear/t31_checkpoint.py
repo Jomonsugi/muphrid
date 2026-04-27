@@ -1,14 +1,22 @@
 """
 T31 — save_checkpoint / restore_checkpoint
 
-Non-destructive iteration for the NONLINEAR phase. Every tool reads
-current_image, processes it, and updates current_image to the output.
-When the agent iterates (trying different curves parameters), each call
-chains cumulatively — 4 attempts = 4 baked-in passes degrading the image.
+Within-phase image-state bookmarks. Image-modifying tools read
+current_image, write a new FITS, and promote the new path to
+current_image. Calling the same tool repeatedly therefore chains
+cumulatively — each call processes the previous output, not the
+original input.
 
-Checkpoints let the agent bookmark the current image at any point and
-restore to it later. Checkpoint files are the actual FITS already
-produced by tools — no file copies, just path bookmarks.
+save_checkpoint records a name → current_image path mapping in
+metadata.checkpoints. The checkpoint is a pointer to a FITS that
+already exists on disk; no copy is made.
+
+restore_checkpoint sets paths.current_image to the recorded path,
+making the next image-modifying tool read from the bookmarked file.
+The displaced FITS remains on disk and is still recoverable from
+prior tool output messages.
+
+Available in every phase. Naming is the agent's choice.
 """
 
 from __future__ import annotations
@@ -28,9 +36,9 @@ from pydantic import BaseModel, Field
 class SaveCheckpointInput(BaseModel):
     name: str = Field(
         description=(
-            "A short, descriptive name for this checkpoint. Use names that "
-            "describe the processing state: 'starless_base', 'after_curves', "
-            "'pre_saturation', 'curves_v2_good'."
+            "Identifier for this checkpoint. Used as the lookup key in "
+            "restore_checkpoint(name=...). If the name already exists in "
+            "metadata.checkpoints, the prior entry is overwritten."
         ),
     )
 
@@ -51,21 +59,14 @@ def save_checkpoint(
     state: Annotated[dict, InjectedState] = None,
 ) -> Command:
     """
-    Bookmark the current image as a named checkpoint.
+    Record current_image under a name in metadata.checkpoints.
 
-    Saves a reference to current_image under a descriptive name. Does NOT
-    copy the file — the checkpoint is a pointer to the FITS that already
-    exists on disk.
+    The checkpoint stores the FITS path, not the file contents — no copy
+    is made. Restoring this checkpoint later sets current_image back to
+    the recorded path.
 
-    When to checkpoint:
-    - After star_removal produces a clean starless image
-    - After a curves/saturation/contrast pass you are satisfied with
-    - Before any experimental adjustment you might want to undo
-
-    The rule: if you would regret losing the current image state, checkpoint it.
-
-    If a checkpoint with the same name exists, it is overwritten — this lets
-    you update a checkpoint after re-doing a step.
+    Returns the saved name and the full set of currently-bookmarked
+    checkpoints. Re-using an existing name overwrites the prior entry.
     """
     current_image = state["paths"].get("current_image")
 
@@ -111,19 +112,19 @@ def restore_checkpoint(
     state: Annotated[dict, InjectedState] = None,
 ) -> Command:
     """
-    Restore the working image to a previously saved checkpoint.
+    Set current_image to the FITS path stored under `name` in
+    metadata.checkpoints.
 
-    Sets current_image to the checkpointed path. The next tool call will
-    read from that image instead of the most recent output.
+    The next image-modifying tool will read from the restored path. The
+    FITS that was current at restore time is unaffected — it remains on
+    disk and recoverable through prior tool output messages or by saving
+    a checkpoint pointing at it before this call.
 
-    Use this when:
-    - A curves/saturation pass degraded the image — go back and retry
-    - Multiple chained adjustments went wrong — restore to before the first bad one
-    - You want to try a different processing path from a branch point
-
-    After restoring, the previous current_image file still exists on disk.
-    If you checkpointed it, you can switch back. If you didn't, the file
-    is still there but you need the path from the tool output history.
+    Side effects on a real (non-noop) restore: any outstanding regression
+    warnings are cleared and metadata.last_analysis_snapshot is reset, so
+    the next analyze_image call establishes a fresh baseline against the
+    restored state. The noop branch (checkpoint and current_image already
+    point at the same file) leaves state unchanged.
     """
     checkpoints = state.get("metadata", {}).get("checkpoints") or {}
 
@@ -156,17 +157,55 @@ def restore_checkpoint(
             )],
         })
 
+    # `noop` tells the agent whether this restore actually changed state. The
+    # common failure mode it detects: a checkpoint was saved at a moment when
+    # current_image was stale (e.g. a sibling-writing tool did not promote its
+    # output), so the bookmark and the live current_image already point at the
+    # same file. Restoring to it is a no-op — any tool call after this restore
+    # will produce the same output as before, and the agent will keep looping
+    # unless it sees this signal and branches (fresh checkpoint from the
+    # correct starting path, or a different tool).
+    prev_current = state["paths"].get("current_image")
+    try:
+        noop = (
+            prev_current is not None
+            and Path(prev_current).resolve() == Path(restore_path).resolve()
+        )
+    except OSError:
+        noop = prev_current == restore_path
+
     summary = {
         "restored": name,
         "current_image": Path(restore_path).name,
-        "previous_image": Path(state["paths"]["current_image"]).name if state["paths"].get("current_image") else None,
+        "previous_image": Path(prev_current).name if prev_current else None,
+        "noop": noop,
         "all_checkpoints": {k: Path(v).name for k, v in checkpoints.items()},
     }
+    if noop:
+        summary["note"] = (
+            "Restore was a no-op — the checkpoint and the live current_image "
+            "already resolved to the same file, so no state changed. This "
+            "happens when a checkpoint was saved against a current_image that "
+            "did not advance (for example, a sibling-writing tool whose output "
+            "was not promoted to current_image). Re-running the same restore "
+            "will produce the same no-op result."
+        )
 
-    return Command(update={
+    # On a real restore (not the noop branch), any outstanding regression
+    # warnings and the stored analysis snapshot are about the state that
+    # was just replaced — they no longer describe the live current_image.
+    # Clear them so the next analyze_image establishes a fresh baseline
+    # against the restored state. The noop case leaves everything as-is
+    # (no state actually changed).
+    update: dict = {
         "paths": {**state["paths"], "current_image": restore_path},
         "messages": [ToolMessage(
             content=json.dumps(summary, indent=2),
             tool_call_id=tool_call_id,
         )],
-    })
+    }
+    if not noop:
+        update["regression_warnings"] = []
+        update["metadata"] = {"last_analysis_snapshot": None}
+
+    return Command(update=update)

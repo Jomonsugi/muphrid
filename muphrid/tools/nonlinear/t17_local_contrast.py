@@ -1,20 +1,11 @@
 """
 T17 — local_contrast_enhance
 
-Enhance fine detail and local contrast in nebulosity and galaxy structure
-without affecting global brightness. Three complementary methods: CLAHE
-(adaptive histogram equalization), unsharp mask, or wavelet sharpening.
+Local-contrast and fine-detail enhancement. Four methods: CLAHE (adaptive
+histogram equalization), unsharp mask, wavelet (per-scale reconstruction),
+and edge-preserving filter (bilateral / guided).
 
-Backend: Siril CLI — `clahe`, `unsharp`, or `wavelet` + `wrecons`.
-
-Apply to the starless image only (post T15). Stars are added back later via
-T19 — processing on a starless image prevents star-halo artefacts from
-local contrast enhancement.
-
-Wavelet sharpening offers the most surgical control: boost fine-scale detail
-layers (1–2) while leaving coarse structure layers (3–5) and the residual
-untouched. CLAHE is effective but can amplify noise — always apply after
-noise reduction.
+Backend: Siril CLI — `clahe`, `unsharp`, `wavelet` + `wrecons`, `epf`.
 """
 
 from __future__ import annotations
@@ -40,17 +31,16 @@ class ClaheOptions(BaseModel):
     clip_limit: float = Field(
         default=2.0,
         description=(
-            "Contrast limiting threshold. Higher = stronger enhancement but "
-            "more noise amplification. "
-            "1.5–2.5 for most images. Reduce to 1.0–1.5 for noisy data."
+            "Contrast-limiting threshold. Higher values permit stronger "
+            "local contrast enhancement and also amplify noise proportionally."
         ),
     )
     tile_size: int = Field(
         default=8,
         description=(
-            "Size of the histogram equalization tiles (in pixels). "
-            "Smaller = more local adaptation (good for fine structure). "
-            "Larger = more global. 8–16 is the typical range."
+            "Edge length of the histogram-equalization tile grid in pixels. "
+            "Smaller = more local adaptation. Larger = closer to global "
+            "equalization."
         ),
     )
 
@@ -59,19 +49,17 @@ class UnsharpOptions(BaseModel):
     sigma: float = Field(
         default=2.0,
         description=(
-            "Gaussian blur sigma for the unsharp mask. Controls which spatial "
-            "frequencies are enhanced. "
-            "1.0–2.0: fine detail (star halos, nebula filaments). "
-            "3.0–5.0: medium structure. "
-            "Higher values affect larger-scale structure."
+            "Gaussian blur sigma for the unsharp mask. Controls which "
+            "spatial frequencies the mask enhances — smaller sigma "
+            "targets finer-scale detail."
         ),
     )
     amount: float = Field(
         default=0.3,
         description=(
-            "Blend factor for the sharpening effect. "
+            "Blend factor for the sharpening: "
             "out = in * (1 + amount) + blurred * (-amount). "
-            "0.1–0.3: gentle. 0.4–0.8: moderate. > 1.0: aggressive (ringing risk)."
+            "Values above ~1.0 introduce visible ringing at edges."
         ),
     )
 
@@ -80,28 +68,24 @@ class WaveletOptions(BaseModel):
     num_layers: int = Field(
         default=5,
         description=(
-            "Number of wavelet decomposition layers. "
-            "Each layer represents a finer spatial scale. "
-            "5 is standard; 4 for smaller images, 6 for very large images."
+            "Number of wavelet decomposition layers. Each layer represents "
+            "a finer spatial scale."
         ),
     )
     algorithm: str = Field(
         default="bspline",
         description=(
             "Decomposition algorithm. "
-            "bspline (type=2): smoother, better for nebula structure. "
-            "linear (type=1): à trous algorithm, sharper but more ringing risk."
+            "bspline (type=2): B-spline wavelets — smoother response. "
+            "linear (type=1): à trous algorithm — sharper response, more "
+            "ringing."
         ),
     )
     layer_weights: list[float] = Field(
         description=(
             "Reconstruction weights for each layer (num_layers + 1 values). "
             "Layers ordered finest to coarsest: [layer1, layer2, ..., residual]. "
-            "1.0 = unchanged, > 1.0 = sharpen/boost that scale, < 1.0 = suppress. "
-            "Choose based on the target structure and what analyze_image shows: "
-            "fine-grained structure (filaments, dust lanes) lives in layers 1-2; "
-            "medium structure (spiral arms, nebula shells) in layers 2-3; "
-            "large structure (galaxy halo, diffuse emission) in layers 4+. "
+            "1.0 = unchanged, > 1.0 = boost that scale, < 1.0 = suppress. "
             "The residual (last value) is the smooth background."
         ),
     )
@@ -111,59 +95,55 @@ class EpfOptions(BaseModel):
     guided: bool = Field(
         default=False,
         description=(
-            "False: bilateral filter — edge-aware smoothing using -si= and -ss=. "
-            "True: guided filter — uses -sc= parameter only (si/ss are ignored). "
-            "Guided is excellent for color denoising guided by luminance."
+            "False: bilateral filter — uses -si= and -ss=. "
+            "True: guided filter — uses -sc= only (si/ss ignored). "
+            "guide_image_stem may supply an external guide."
         ),
     )
     diameter: int = Field(
         default=5,
         description=(
-            "Filter kernel diameter in pixels (-d=). "
-            "Bilateral: 3–7 for noise smoothing; 9–15 for aggressive. "
-            "Values > 20 are computationally expensive. "
+            "Filter kernel diameter in pixels (-d=). Larger values are "
+            "progressively more expensive; values > 20 become very slow. "
             "0 = auto-compute from spatial_sigma."
         ),
     )
     intensity_sigma: float = Field(
         default=0.02,
         description=(
-            "Bilateral only (-si=). Intensity sigma for 32-bit images (0.0–1.0). "
-            "Controls tonal range over which the filter smooths. "
-            "0.01–0.02: tight edge preservation. 0.05–0.1: stronger smoothing. "
+            "Bilateral only (-si=). Intensity sigma for 32-bit images "
+            "(0.0–1.0). Tonal-range scale over which the filter smooths. "
             "Ignored when guided=True."
         ),
     )
     spatial_sigma: float = Field(
         default=0.02,
         description=(
-            "Bilateral only (-ss=). Spatial sigma for 32-bit images (0.0–1.0). "
-            "Controls spatial extent of filter influence. "
+            "Bilateral only (-ss=). Spatial sigma for 32-bit images "
+            "(0.0–1.0). Spatial extent of filter influence. "
             "Ignored when guided=True."
         ),
     )
     guided_sigma: float = Field(
         default=0.04,
         description=(
-            "Guided filter only (-sc=). Controls the guided filter's smoothing "
-            "strength. For 32-bit images: 0.0–1.0 range. "
-            "0.01–0.03: subtle smoothing. 0.04–0.1: moderate. 0.1+: aggressive. "
-            "Ignored when guided=False."
+            "Guided filter only (-sc=). Smoothing strength for 32-bit "
+            "images (0.0–1.0 range). Ignored when guided=False."
         ),
     )
     mod: float = Field(
         default=0.8,
         description=(
-            "Blend strength of the filtered result (-mod=, 0.0–1.0). "
-            "1.0: full filter. 0.0: no effect."
+            "Blend fraction of the filtered result with input (-mod=, "
+            "0.0–1.0). 1.0 = full filter output, 0.0 = no effect."
         ),
     )
     guide_image_stem: str | None = Field(
         default=None,
         description=(
-            "FITS stem of guide image for guided filter (-guideimage=). "
-            "Guide must have same dimensions as input. "
-            "Null = self-guided (most common)."
+            "FITS stem of an external guide image for the guided filter "
+            "(-guideimage=). Must share dimensions with the input. "
+            "None = self-guided."
         ),
     )
 
@@ -172,15 +152,13 @@ class LocalContrastInput(BaseModel):
     method: str = Field(
         default="wavelet",
         description=(
-            "wavelet: per-scale sharpening — best control, recommended for nebulae "
-            "and galaxy structure. Surgically targets specific spatial scales. "
-            "edge_preserve: edge-preserving bilateral/guided filter (epf) — "
-            "structure-safe noise smoothing, excellent for cleaning residual noise "
-            "in background and faint regions without blurring nebula edges. "
-            "clahe: adaptive histogram equalization — effective for revealing faint "
-            "nebula structure but amplifies noise; apply after edge_preserve. "
-            "unsharp: Gaussian unsharp mask — gentle, fast, good starting point "
-            "or combined with edge_preserve for a sharpen-then-smooth workflow."
+            "wavelet: per-scale reconstruction. Independent weights per spatial "
+            "scale via layer_weights. "
+            "edge_preserve: edge-preserving bilateral or guided filter (epf). "
+            "Smooths while preserving edges. "
+            "clahe: Contrast-Limited Adaptive Histogram Equalization. Per-tile "
+            "local contrast boost; amplifies noise as a side-effect. "
+            "unsharp: Gaussian unsharp mask."
         ),
     )
     clahe_options: ClaheOptions = Field(default_factory=ClaheOptions)
@@ -202,17 +180,18 @@ def local_contrast_enhance(
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
     """
-    Enhance local contrast and fine detail in nebulosity/galaxy structure.
+    Enhance local contrast and fine detail.
 
-    Method guidance:
-    - wavelet: surgical control per spatial scale. Default layer_weights are all
-      1.0 (passthrough — no effect). Set weights > 1.0 on fine layers to sharpen.
-      Do NOT use on star fields or globular clusters — wavelet sharpening enhances
-      star halos. Use unsharp or clahe for those targets instead.
-    - clahe: effective for revealing faint nebula structure but amplifies noise.
-      Use clip_limit 1.5–2.0.
-    - unsharp: simplest and gentlest. Good for star fields, mild enhancement,
-      or as a first pass before more aggressive wavelet processing.
+    Methods:
+    - wavelet: decomposes the image into num_layers scales and reconstructs
+      with per-layer weights. layer_weights of all 1.0 is a passthrough.
+    - edge_preserve: bilateral (guided=False) or guided (guided=True) filter
+      via Siril `epf`. Smooths while preserving edges.
+    - clahe: Siril `clahe`. Per-tile adaptive histogram equalization.
+    - unsharp: Siril `unsharp`. Gaussian unsharp mask.
+
+    All methods operate on paths.current_image and write a _lce suffixed
+    output.
     """
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"]["current_image"]

@@ -48,7 +48,7 @@ from muphrid.tools._sensor import (
     flat_siril_norm_thresholds,
     read_frame_exif,
 )
-from muphrid.tools._siril import SirilError, run_siril_script
+from muphrid.tools._siril import SirilError, run_siril_script, siril_script_path
 from muphrid.tools.preprocess.t02b_convert_sequence import _convert_to_sequence
 
 
@@ -261,7 +261,11 @@ def _compute_diagnostics(
     except Exception as e:
         warnings.append(f"Could not read master FITS for diagnostics: {e}")
 
-    # ── Parse rejection counts from Siril output ──────────────────────────
+    # ── Parse rejection counts from Siril output (diagnostic only) ────────
+    # These regex matches are best-effort. The authoritative success signal
+    # is the master FITS on disk, checked by the caller. If the regex fails,
+    # rejection_rate stays None so the agent can distinguish "0% rejection"
+    # from "rate unknown" — only the former warrants clean-run confidence.
     stacked_match  = re.search(r"(\d+)\s+frame[s]?\s+stacked",  siril_stdout, re.IGNORECASE)
     rejected_match = re.search(r"(\d+)\s+frame[s]?\s+rejected", siril_stdout, re.IGNORECASE)
     if stacked_match:
@@ -269,8 +273,10 @@ def _compute_diagnostics(
     if rejected_match:
         quality_flags["frames_rejected"] = int(rejected_match.group(1))
 
-    rejection_rate = quality_flags.get("frames_rejected", 0) / max(frame_count, 1)
-    quality_flags["rejection_rate"] = rejection_rate
+    if "frames_rejected" in quality_flags and frame_count > 0:
+        quality_flags["rejection_rate"] = quality_flags["frames_rejected"] / frame_count
+    else:
+        quality_flags["rejection_rate"] = None
 
     # ── Type-specific quality checks ──────────────────────────────────────
 
@@ -372,9 +378,12 @@ def _compute_diagnostics(
                 )
 
     # ── Universal: high rejection rate ────────────────────────────────────
-    if rejection_rate > 0.40:
+    # Read from quality_flags (not a stale local) so we correctly treat the
+    # None case as "unknown" and skip the warning rather than tripping on it.
+    rej_rate = quality_flags.get("rejection_rate")
+    if rej_rate is not None and rej_rate > 0.40:
         quality_issues.append(
-            f"Rejection rate ({rejection_rate:.0%}) exceeds 40% — "
+            f"Rejection rate ({rej_rate:.0%}) exceeds 40% — "
             f"majority of frames are outliers; possible capture issue."
         )
 
@@ -444,10 +453,18 @@ def build_masters(
     )
 
     # ── Step 2: For flats, calibrate (bias-subtract) before stacking ──────
+    # master_bias_path is an absolute filesystem path that may contain spaces
+    # (e.g. a dataset rooted at "/Users/x/COCOON NEBULA/..."). Siril's script
+    # tokenizer splits on whitespace BEFORE honoring quotes, so quoting the
+    # path doesn't help — we have to hand Siril a whitespace-free reference.
+    # siril_script_path returns a relative name when the file is inside
+    # working_dir (master_bias always is), otherwise symlinks it under a
+    # clean name in working_dir and returns the basename.
     stack_seq = seq_name
     if ft == "flat" and master_bias_path:
+        bias_ref = siril_script_path(master_bias_path, wdir)
         run_siril_script(
-            [f"calibrate {seq_name} -bias={master_bias_path} -fitseq"],
+            [f"calibrate {seq_name} -bias={bias_ref} -fitseq"],
             working_dir=str(wdir),
             timeout=300,
         )
@@ -513,7 +530,14 @@ def build_masters(
                 f"{len(per_frame)} frames, median range {min(unique)}–{max(unique)} ADU"
             )
 
-    result = {
+    # Build the result. The tool is IDEMPOTENT — calling it again with the
+    # same (file_type, stack_method, rejection_method, rejection_sigma) writes
+    # exactly the same master_fits. Quality issues are data problems, not
+    # parameter problems, so they cannot be resolved by re-invoking this tool
+    # with identical args. The `status` + `next_action` fields make this
+    # explicit so the agent doesn't interpret quality_issues as "retry".
+    result: dict = {
+        "status": "success",
         "file_type": ft,
         "master_path": str(master_fits),
         "frame_count": len(input_files),
@@ -523,6 +547,22 @@ def build_masters(
         result["per_frame_summary"] = per_frame_summary
     if issues:
         result["quality_issues"] = issues
+        result["next_action"] = (
+            f"The master_{ft} was created at {master_fits} but the input "
+            f"frames have data-level problems (see quality_issues). This tool "
+            f"is IDEMPOTENT — calling build_masters again with the same "
+            f"file_type will produce an identical master with identical "
+            f"issues, because the problem is in the input frames, not the "
+            f"tool parameters. Your options, in order of preference: "
+            f"(1) proceed to build the next master type and let calibration "
+            f"fall back (e.g. skip bias subtraction from darks/flats if bias "
+            f"is bad); (2) call advance_phase with a reason explaining the "
+            f"calibration limitation; (3) enter a HITL conversation via a "
+            f"text-only response to ask the user whether to skip this "
+            f"calibration step or abort. Do NOT re-invoke build_masters with "
+            f"the same file_type unless you are changing stack_method, "
+            f"rejection_method, or rejection_sigma."
+        )
     if warns:
         result["warnings"] = warns
 

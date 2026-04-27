@@ -31,6 +31,7 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from muphrid.graph.hitl import vlm_autonomous
 from muphrid.graph.state import AstroState, VisualRef
 
 logger = logging.getLogger(__name__)
@@ -120,8 +121,19 @@ def present_images(
             )],
         })
 
+    # Honesty about visual access. When vlm_autonomous is off and the call
+    # is happening outside an active HITL gate, the images won't actually
+    # reach the model's view — _select_visible_refs will skip them. Tell
+    # the agent so it can adjust reasoning instead of expecting visualization
+    # that won't materialize. The state side-effect (visual_context update)
+    # still happens — when an HITL gate opens later, those references can
+    # become visible via the gate's visibility rules.
+    state = state or {}
+    in_hitl = bool(state.get("active_hitl"))
+    visual_will_render = in_hitl or vlm_autonomous()
+
     # Build the result the presenter layer reads from the ToolMessage stream
-    result = {
+    result: dict = {
         "status": "presented",
         "title": title,
         "description": description,
@@ -131,10 +143,19 @@ def present_images(
         ],
         "count": len(valid_images),
     }
+    if not visual_will_render:
+        result["status"] = "presented_text_only"
+        result["visual_access"] = (
+            "Visual access is disabled outside HITL gates (vlm_autonomous=false). "
+            "These image paths exist on disk but will not be rendered into my "
+            "view. Reason from analyze_image metrics for the decision; the human "
+            "will see the images in the Gradio panel and can comment on them. "
+            "When an HITL gate opens, these references will become visible "
+            "automatically."
+        )
 
     # Build new visual_context: replace previous present_images entries with
     # this call's set; preserve other sources (hitl_variant, phase_carry).
-    state = state or {}
     working_dir = state.get("dataset", {}).get("working_dir", "")
     is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
     phase_value = state.get("phase")

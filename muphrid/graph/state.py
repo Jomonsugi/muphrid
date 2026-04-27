@@ -100,6 +100,38 @@ class Metadata(TypedDict):
     pixel_size_um:      float | None
     checkpoints:        dict[str, str] | None  # agent-named image state bookmarks
 
+    # Last variant committed to current_image — set by both HITL promote_variant
+    # and the autonomous commit_variant tool. Lets commit_variant detect the
+    # "already committed via HITL" race (variant_pool is empty but the variant
+    # was promoted) and return idempotent success instead of a confusing error.
+    # Keys: {"id": str, "file_path": str}. None before any commit.
+    last_committed_variant: dict | None
+
+    # Snapshot of the metrics dict from the most recent analyze_image call.
+    # Persists across tool calls so the next analyze_image can compare
+    # current measurements against it and surface regression_warnings.
+    # Updated by analyze_image on every successful run; cleared by phase
+    # transitions (baselines don't carry across phases — different metrics
+    # become meaningful in different phases).
+    last_analysis_snapshot: dict | None
+
+    # Phase-boundary state snapshots, keyed by ProcessingPhase value.
+    # Written by advance_phase as the pipeline transitions: the snapshot
+    # under key X represents the working state at the moment the pipeline
+    # entered phase X (= the end of the prior phase). rewind_phase reads
+    # these to restore the working state when the agent decides a phase
+    # mistake originated upstream. See PhaseSnapshot for the captured
+    # field set.
+    phase_checkpoints: dict[str, "PhaseSnapshot"] | None
+
+    # Per-target rewind counter. rewind_phase increments the count for the
+    # target phase on every successful rewind and refuses when the count
+    # is already ≥ 1. The first rewind to a phase is the safety net; a
+    # second would suggest a structural problem the framework can't fix
+    # on its own — the agent is expected to surface that situation rather
+    # than loop on rewinds.
+    phase_rewind_counts: dict[str, int] | None
+
 
 class FrameMetrics(TypedDict, total=False):
     fwhm:             float | None
@@ -162,6 +194,19 @@ class Metrics(TypedDict):
     # Contrast (p95 - p5 luminance range)
     contrast_ratio:      float | None
 
+    # Structured additions from analyze_image. See T20 docstring for the
+    # full definition of each. All optional so legacy callers keep working.
+    pixel_coverage:        dict | None            # total / n_valid / valid_pct / etc.
+    clipping_per_channel:  dict | None            # per-channel clip staircase at chosen thresholds
+    mode_estimate:         dict | None            # histogram-peak per channel + luminance
+    background_quadrants:  dict | None            # per-quadrant bg/noise/valid
+    wavelet_noise_scales:  list | None            # noise at multiple wavelet scales
+    channel_snr:           dict | None            # per-channel P95 / MAD SNR
+    star_distribution:     dict | None            # FWHM/peak/roundness percentiles
+    bg_box_size:           int | None             # Background2D tile size actually used
+    histogram:             dict | None            # per-channel percentile summary
+    analyze_params:        dict | None            # echoed call parameters for reproducibility
+
 
 class AcquisitionMeta(TypedDict):
     target_name:      str | None
@@ -211,6 +256,79 @@ class ReportEntry(TypedDict):
     outcome:        str          # "success" | "degraded" | "error" | "reverted"
     outcome_detail: str          # brief summary of what changed or went wrong
     timestamp:      str          # ISO 8601
+
+
+class PhaseSnapshot(TypedDict):
+    """
+    A frozen slice of working state captured at a phase boundary.
+
+    Written by advance_phase into metadata.phase_checkpoints[<new_phase>]
+    at the moment the pipeline transitions: the snapshot under key X
+    represents "the state at the start of phase X" (equivalently, the
+    end of the prior phase). rewind_phase reads these to roll the
+    working state back to a known-good boundary when the agent decides
+    a phase-level mistake originated upstream.
+
+    Captured fields are everything that defines the working "scratchpad"
+    of the pipeline at a moment in time. The narrative — messages,
+    processing_report, processing_log.md — is intentionally NOT captured;
+    it stays append-only across rewinds so the agent (and any later
+    reviewer) can see what the abandoned phase tried and why it was
+    abandoned. metadata.phase_checkpoints itself is also excluded from
+    the metadata snapshot to avoid recursive growth across rewinds.
+
+    Field semantics:
+      paths              — full PathState dict (current_image, sequence
+                            chain, masters, mask, preview pointers, etc.)
+      metrics            — full Metrics dict
+      metadata           — Metadata dict minus phase_checkpoints and
+                            last_analysis_snapshot (which is itself a
+                            transient analyze_image baseline)
+      regression_warnings — pending warnings at the moment of advance
+      variant_pool       — typically empty (advance_phase clears it)
+                            but captured for safety
+      visual_context     — typically empty (advance_phase clears it)
+                            but captured for safety
+      captured_at        — ISO 8601 timestamp
+      captured_from_phase — the phase that just ended, for diagnostics
+    """
+    paths:                dict
+    metrics:              dict
+    metadata:             dict
+    regression_warnings:  list
+    variant_pool:         list
+    visual_context:       list
+    captured_at:          str
+    captured_from_phase:  str
+
+
+class RegressionWarning(TypedDict):
+    """
+    An image-quality metric that worsened between two analyze_image calls.
+
+    Written by analyze_image when a current measurement has degraded vs the
+    baseline in metadata.last_analysis_snapshot. Informational — the agent
+    reads these to decide whether to revert (restore_checkpoint / rewind_phase)
+    or accept the tradeoff. Nothing in the framework blocks on their presence.
+
+    Lifecycle:
+      - Emitted by analyze_image when a metric breaks the configured
+        deterioration threshold for its direction.
+      - Cleared individually when a subsequent analyze_image shows the metric
+        has returned within tolerance of the warning's own baseline value.
+      - Cleared en-masse by restore_checkpoint, rewind_phase, and advance_phase
+        (the current-phase warnings are finalized into processing_log.md at
+        the advance moment, then state starts fresh in the new phase).
+    """
+    metric:           str               # canonical metric key, e.g. "clipped_highlights_pct"
+    baseline:         float | int | None # value at the baseline analyze_image
+    current:          float | int | None # value at the detecting analyze_image
+    delta:            float              # signed change (current − baseline)
+    relative_delta:   float | None       # (current − baseline) / baseline, when baseline ≠ 0
+    direction:        str                # "worse" — always, since only worsening triggers a warning
+    summary:          str                # "Highlight clipping rose 0.1% → 3.2% (+3.1%)"
+    phase_origin:     str                # ProcessingPhase at detection time
+    detected_at:      str                # ISO 8601 timestamp
 
 
 class VisualRef(TypedDict):
@@ -394,6 +512,17 @@ class AstroState(TypedDict):
     # See VisualRef for source semantics.
     visual_context: list[VisualRef]
 
+    # Active regression warnings — metrics that worsened between the baseline
+    # analyze_image and the most recent one. Informational: the agent reads
+    # these to decide whether to revert or accept. The framework surfaces
+    # them in advance_phase's response and writes them into processing_log.md
+    # at phase transitions but never blocks on them. Managed by analyze_image
+    # (emit, auto-clear-on-recovery), restore_checkpoint / rewind_phase
+    # (clear on rollback), and advance_phase (clear on transition after
+    # logging). Default LangGraph "replace" semantics — producers return the
+    # full new list each call. See RegressionWarning for entry shape.
+    regression_warnings: list[RegressionWarning]
+
 
 # ── Factory ────────────────────────────────────────────────────────────────────
 
@@ -435,6 +564,10 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             focal_length_mm=None,
             pixel_size_um=None,
             checkpoints=None,
+            last_committed_variant=None,
+            last_analysis_snapshot=None,
+            phase_checkpoints=None,
+            phase_rewind_counts=None,
         ),
         metrics=Metrics(
             frame_stats={},
@@ -463,6 +596,17 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             fwhm_std=None,
             median_star_peak_ratio=None,
             contrast_ratio=None,
+            # Structured additions — see T20 docstring.
+            pixel_coverage=None,
+            clipping_per_channel=None,
+            mode_estimate=None,
+            background_quadrants=None,
+            wavelet_noise_scales=None,
+            channel_snr=None,
+            star_distribution=None,
+            bg_box_size=None,
+            histogram=None,
+            analyze_params=None,
         ),
         history=[],
         processing_report=[],
@@ -471,6 +615,7 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
         active_hitl=False,
         variant_pool=[],
         visual_context=[],
+        regression_warnings=[],
     )
 
 

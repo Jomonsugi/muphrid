@@ -10,6 +10,9 @@ See graph_design.md for the full architecture.
 
 from __future__ import annotations
 
+import logging
+import os
+
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 
@@ -27,32 +30,69 @@ from muphrid.graph.nodes import (
 from muphrid.graph.registry import tools_for_phase
 from muphrid.graph.state import AstroState, ProcessingPhase
 
+logger = logging.getLogger(__name__)
+
 
 # ── Model factory ─────────────────────────────────────────────────────────────
+
+
+def _current_model_fingerprint() -> tuple[str, str]:
+    """
+    Fingerprint for detecting mid-session model/provider changes.
+
+    The Gradio app mutates LLM_MODEL / LLM_PROVIDER via _apply_ui_settings
+    AFTER the graph has been built, so the factory has to notice the change
+    at session start and rebuild — otherwise calls continue to target the
+    originally-bound client regardless of what the UI shows.
+    """
+    return (
+        os.environ.get("LLM_MODEL", ""),
+        os.environ.get("LLM_PROVIDER", ""),
+    )
 
 
 def _make_model_factory(base_model=None):
     """
     Return a callable that produces a model with phase-appropriate tools bound.
 
-    The base model is created once. For each phase, we call .bind_tools()
-    with that phase's tool list. This is the dynamic tool binding pattern
-    from the LangGraph docs.
-    """
-    if base_model is None:
-        base_model = make_llm()
+    The base model is created lazily and re-created whenever the LLM_MODEL /
+    LLM_PROVIDER env vars change since the last build. This is critical for
+    Gradio — the app builds the graph once at startup, but the user can
+    switch models mid-session via the dropdown. Without env-fingerprint
+    invalidation, `base_model` would stay frozen to whatever make_llm()
+    resolved at graph build time.
 
-    # Cache bound models per phase to avoid re-binding on every call
-    _cache: dict[ProcessingPhase, object] = {}
+    When `base_model` is passed explicitly (e.g. tests), invalidation is
+    disabled — the caller owns the lifecycle.
+    """
+    pinned = base_model  # explicit override → no invalidation
+    state: dict = {
+        "base_model": pinned,
+        "fingerprint": _current_model_fingerprint() if pinned is None else None,
+        "cache": {},
+    }
 
     def model_for_phase(phase: ProcessingPhase):
-        if phase not in _cache:
+        # If no explicit override, check whether env vars have changed since
+        # we last built the base model. Rebuild + invalidate per-phase cache
+        # if so. Cheap comparison on two strings each call.
+        if pinned is None:
+            current_fp = _current_model_fingerprint()
+            if state["base_model"] is None or current_fp != state["fingerprint"]:
+                if state["base_model"] is not None:
+                    logger.info(
+                        f"LLM rebind: {state['fingerprint']} → {current_fp}"
+                    )
+                state["base_model"] = make_llm()
+                state["fingerprint"] = current_fp
+                state["cache"] = {}
+
+        cache = state["cache"]
+        if phase not in cache:
             tools = tools_for_phase(phase)
-            if tools:
-                _cache[phase] = base_model.bind_tools(tools)
-            else:
-                _cache[phase] = base_model
-        return _cache[phase]
+            base = state["base_model"]
+            cache[phase] = base.bind_tools(tools) if tools else base
+        return cache[phase]
 
     return model_for_phase
 

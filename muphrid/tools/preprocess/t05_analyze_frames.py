@@ -334,9 +334,53 @@ def analyze_frames(
             f"Ensure calibration (T03) and registration (T04) completed."
         )
 
+    # Artifact-based validation (mirrors t03_calibrate / t04_register):
+    # the .seq file existing is necessary but not sufficient. A zero-byte
+    # or malformed .seq silently yields an all-null summary; surface that
+    # explicitly so the agent has a clear signal instead of stale metrics.
+    seq_size = seq_path.stat().st_size
+    if seq_size == 0:
+        raise RuntimeError(
+            f"analyze_frames: Sequence file {seq_path} is empty (0 bytes). "
+            f"Calibration (T03) or registration (T04) did not write frame "
+            f"data. Re-run the upstream preprocessing step and verify the "
+            f"input frames are intact."
+        )
+
     seq_data = _parse_seq_file(seq_path)
+
+    # The S-line defines the sequence header (n_frames). If it is missing or
+    # malformed, the .seq file is not a real Siril sequence — likely the
+    # wrong path or a corrupted write. Disk existence already confirmed.
+    if seq_data["n_frames"] == 0:
+        head = seq_path.read_text(encoding="utf-8", errors="replace")[:400]
+        raise RuntimeError(
+            f"analyze_frames: Sequence file {seq_path} has no valid header "
+            f"(S-line with n_frames). File may be corrupted or truncated. "
+            f"Re-run calibration/registration. First 400 chars:\n{head}"
+        )
+
     frame_metrics = _build_frame_metrics(seq_data)
     summary = _compute_summary(frame_metrics, seq_data)
+
+    # Attach an actionable hint when registration data is absent so the
+    # agent has a concrete next step rather than a null-valued blob. This
+    # is the expected "re-run T04 with tuned findstar" path, not a hard
+    # fail — the tool completes successfully and the agent decides.
+    if not summary["has_registration_data"]:
+        summary = {
+            **summary,
+            "hint": (
+                "No registration data in the .seq file — Siril's findstar "
+                "likely failed to detect stars during T04 registration. "
+                "Re-run siril_register with tuned parameters: lower threshold "
+                "(e.g. threshold=0.8), increased radius (e.g. radius=10), "
+                "and relax=True. Star-sparse fields may also need minstars "
+                "lowered (e.g. minstars=20). The .seq header parsed fine "
+                f"({summary['frame_count']} frames), so the sequence itself "
+                f"is valid — only the registration pass needs rerunning."
+            ),
+        }
 
     import json
     return Command(update={

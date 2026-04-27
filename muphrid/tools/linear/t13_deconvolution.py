@@ -44,7 +44,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
-from muphrid.tools._siril import fits_has_nan, run_siril_script
+from muphrid.tools._siril import fits_has_nan, run_siril_script, siril_script_path
 
 
 # ── Pydantic input schemas ────────────────────────────────────────────────────
@@ -272,6 +272,9 @@ def _build_makepsf_stars(opts: StarsPsfOptions, cfg: PsfConfig) -> str:
     if cfg.psf_kernel_size is not None:
         cmd += f" -ks={cfg.psf_kernel_size}"
     if cfg.save_psf:
+        # cfg.save_psf is expected pre-sanitized by the caller (whitespace
+        # stripped via siril_script_path). Siril's tokenizer can't handle
+        # quoted paths with spaces, so rewriting happens at the caller.
         cmd += f" -savepsf={cfg.save_psf}"
     return cmd
 
@@ -323,6 +326,7 @@ def _build_makepsf_manual(opts: ManualPsfOptions, cfg: PsfConfig) -> str:
 def _build_rl_cmd(opts: RLOptions, loadpsf: str | None = None) -> str:
     cmd = f"rl -iters={opts.iterations}"
     if loadpsf:
+        # loadpsf expected pre-sanitized via siril_script_path by the caller.
         cmd += f" -loadpsf={loadpsf}"
     if opts.regularization == "total_variation":
         cmd += f" -tv -alpha={opts.alpha}"
@@ -426,15 +430,21 @@ def deconvolution(
 
     commands: list[str] = [f"load {stem}"]
 
+    # Rewrite PSF-save path (if any) to a whitespace-free reference so the
+    # Siril command line is safe regardless of dataset-root naming. Mutating
+    # psf_config.save_psf is safe — it's a per-call pydantic model instance.
+    if psf_config.save_psf:
+        psf_config.save_psf = siril_script_path(psf_config.save_psf, working_dir)
+
     loadpsf_path: str | None = None
 
     if psf_source == "loadpsf" and psf_file:
-        loadpsf_path = psf_file
+        loadpsf_path = siril_script_path(psf_file, working_dir)
     elif psf_source == "from_file" and psf_file:
         psf_p = Path(psf_file)
         if not psf_p.exists():
             raise FileNotFoundError(f"PSF file not found: {psf_file}")
-        commands.append(f"makepsf load {psf_p.name}")
+        commands.append(f"makepsf load {siril_script_path(psf_p, working_dir)}")
     elif psf_source == "blind":
         commands.append(_build_makepsf_blind(blind_psf_options, psf_config))
     elif psf_source == "manual":

@@ -6,13 +6,17 @@ Combine accepted registered frames into a single high-SNR master light.
 Frame exclusion mechanism:
     Siril's stack command operates on the *selected* frames in a .seq file.
     This tool:
-      1. Parses the .seq file to build a filename→index map.
-      2. Emits `unselect <seq> 1 <N>` to deselect all frames (1-based).
-      3. Emits `select <seq> <idx+1> <idx+1>` for each accepted frame.
+      1. Parses the .seq file to build a filenum → 1-based-position map.
+      2. Emits `unselect <seq> 1 <nb_images>` to deselect all frames.
+      3. Emits `select <seq> <pos> <pos>` for each accepted frame whose
+         filenum could be mapped to an included I-line position.
       4. Runs `stack` — only selected frames are included.
 
-    IMPORTANT: Siril 1.4 select/unselect use 1-based indexing at runtime,
-    verified by ground-truth testing against Siril 1.4.2.
+    IMPORTANT: Siril 1.4 `select` expects the 1-based POSITION of the frame
+    within the .seq I-line ordering, NOT the filenum from the I-line. These
+    coincide when filenums are dense 0-based (the common case), but can
+    diverge when registration drops frames or when filenums are 1-based.
+    Using position directly is always correct. Verified against Siril 1.4.2.
 
 Siril docs:
     stack seqname { sum | min | max } [-output_norm] [-out=] [-maximize] [-upscale] [-32b]
@@ -32,7 +36,9 @@ Siril docs:
 from __future__ import annotations
 
 import json
+import logging
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 
@@ -45,6 +51,9 @@ from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
 from muphrid.tools._siril import run_siril_script
+
+
+logger = logging.getLogger(__name__)
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -191,18 +200,47 @@ class SirilStackInput(BaseModel):
 
 # ── .seq parser ────────────────────────────────────────────────────────────────
 
-def _parse_seq_file(seq_path: Path) -> tuple[dict[str, int], int]:
+@dataclass
+class _SeqIndex:
+    """Parsed .seq metadata needed to build valid select commands.
+
+    Siril's `select seq from to` uses 1-based *position in the sequence*, NOT
+    the filenum from the I-line. These only coincide when filenums are dense
+    and 0-based (the usual case for pp_*/r_pp_* sequences produced by Siril
+    1.4). M31's run exposed a case where that assumption broke: the agent
+    generated a `select seq N N` whose N was rejected by Siril because the
+    frame had been dropped or renumbered after registration.
+
+    Fields:
+        n_images:    nb_images from S-line (total frames in sequence).
+        n_selected:  nb_selected from S-line (frames with selection flag on).
+        filenum_to_pos:  str(filenum) → 1-based position in I-line order.
+                         Only includes I-lines whose `included` flag == 1.
+                         An index here is always a valid `select` target.
     """
-    Parse a Siril .seq file and return ({frame_key: frame_index}, n_frames).
+    n_images: int = 0
+    n_selected: int = 0
+    filenum_to_pos: dict[str, int] = field(default_factory=dict)
+
+
+def _parse_seq_file(seq_path: Path) -> _SeqIndex:
     """
-    name_to_index: dict[str, int] = {}
-    n_frames = 0
+    Parse a Siril .seq file and return indexing data safe for `select`.
+
+    The returned ``filenum_to_pos`` maps each INCLUDED frame's filenum (as
+    string, matching the key format used by analyze_frames / select_frames)
+    to its 1-based position in I-line order. That position is what Siril's
+    ``select`` expects — regardless of whether filenums are 0-based, 1-based,
+    dense, or sparse.
+    """
+    idx = _SeqIndex()
 
     try:
         lines = seq_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        return name_to_index, n_frames
+        return idx
 
+    position = 0  # 1-based after increment
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -210,44 +248,120 @@ def _parse_seq_file(seq_path: Path) -> tuple[dict[str, int], int]:
 
         if stripped.startswith("S "):
             s_match = re.match(
-                r"S\s+'?([^']+?)'?\s+(\d+)\s+(\d+)",
+                r"S\s+'?([^']+?)'?\s+(\d+)\s+(\d+)\s+(\d+)",
                 stripped,
             )
             if s_match:
-                n_frames = int(s_match.group(3))
+                idx.n_images = int(s_match.group(3))
+                idx.n_selected = int(s_match.group(4))
 
         elif stripped.startswith("I "):
             parts = stripped.split()
             if len(parts) >= 2:
                 filenum = int(parts[1])
-                name_to_index[str(filenum)] = filenum
+                # included flag is column 3 when present; default to 1 so we
+                # gracefully handle older Siril variants that omit it.
+                included = int(parts[2]) if len(parts) >= 3 else 1
+                position += 1
+                if included:
+                    idx.filenum_to_pos[str(filenum)] = position
 
-    return name_to_index, n_frames
+    return idx
+
+
+def _parse_stacked_count(stdout: str) -> int | None:
+    """
+    Extract frame count from Siril's stack stdout (diagnostic, not authoritative).
+
+    Siril 1.4 emits variations like:
+        "Stacking 47 images"
+        "Computing stack with 47 images"
+        "log: Pixel-by-pixel rejection applied on 47 images"
+        "log: Average stacking of 47 images"
+
+    Returns None if no recognizable count is found — the master FITS existing
+    is the real success signal, this is for mismatch detection.
+    """
+    if not stdout:
+        return None
+
+    patterns = [
+        r"[Ss]tacking\s+(\d+)\s+image",
+        r"[Ss]tack(?:ing)?\s+(?:of\s+)?(\d+)\s+image",
+        r"rejection\s+applied\s+on\s+(\d+)\s+image",
+        r"with\s+(\d+)\s+image",
+    ]
+    for pat in patterns:
+        m = re.search(pat, stdout)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                continue
+    return None
 
 
 def _build_selection_commands(
     seq_name: str,
-    n_frames: int,
+    seq_index: _SeqIndex,
     accepted_frames: list[str],
-    name_to_index: dict[str, int],
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """
     Generate unselect-all + select-accepted Siril commands.
 
-    Siril 1.4 select/unselect use 1-based indexing at runtime.
-    The .seq file's I-line filenum is 0-based.
+    Uses 1-based position in the .seq I-line order (what Siril's ``select``
+    command actually validates against), not the filenum. This handles the
+    edge cases where registration renumbered / dropped frames:
+
+      * Frame keys in ``accepted_frames`` come from analyze_frames, which
+        parses the *calibrated* sequence. After registration, some frames
+        may be dropped or renumbered in the registered sequence. Any frame
+        whose filenum is not present in ``seq_index.filenum_to_pos`` is
+        silently absent from the stack — the agent sees that mismatch via
+        ``count_mismatch_note`` but the stack itself still completes.
+
+      * Position bounds are clamped to ``[1, seq_index.n_images]``. Any
+        accepted frame that would produce an out-of-range position is
+        skipped with a diagnostic rather than emitting a command Siril
+        would reject (the M31 stuck-loop trigger).
+
+    Returns:
+        (commands, skipped_keys):
+            commands     — the Siril ssf lines to emit.
+            skipped_keys — accepted_frames entries we could not map, so the
+                           caller can surface them in the tool summary.
     """
-    cmds: list[str] = [f"unselect {seq_name} 1 {n_frames}"]
+    upper = seq_index.n_images if seq_index.n_images > 0 else 10_000_000
+    cmds: list[str] = [f"unselect {seq_name} 1 {upper}"]
+    skipped: list[str] = []
 
     for filename in accepted_frames:
         key = Path(filename).stem if "." in filename else filename
-        idx = name_to_index.get(key)
-        if idx is None:
-            idx = name_to_index.get(filename)
-        if idx is not None:
-            cmds.append(f"select {seq_name} {idx + 1} {idx + 1}")
+        position = seq_index.filenum_to_pos.get(key)
+        if position is None:
+            position = seq_index.filenum_to_pos.get(filename)
 
-    return cmds
+        if position is None:
+            skipped.append(filename)
+            logger.warning(
+                "t07_stack: accepted frame %r not found in %s — registration "
+                "may have dropped it.",
+                filename, seq_name,
+            )
+            continue
+
+        if position < 1 or position > upper:
+            skipped.append(filename)
+            logger.warning(
+                "t07_stack: position %d for frame %r out of range [1, %d] "
+                "in %s — skipping.",
+                position, filename, upper, seq_name,
+            )
+            continue
+
+        cmds.append(f"select {seq_name} {position} {position}")
+
+    return cmds, skipped
 
 
 # ── Siril method maps ──────────────────────────────────────────────────────────
@@ -351,13 +465,36 @@ def siril_stack(
     wdir = Path(working_dir)
     seq_path = wdir / f"{registered_sequence}.seq"
 
-    name_to_index, n_frames = _parse_seq_file(seq_path)
-    if n_frames == 0:
-        n_frames = max(name_to_index.values()) + 1 if name_to_index else len(accepted_frames)
+    seq_index = _parse_seq_file(seq_path)
+    # If the S-line is missing (parser couldn't read or it's corrupted) we
+    # fall back to a permissive upper bound derived from the I-lines so the
+    # unselect still covers every known frame.
+    if seq_index.n_images == 0 and seq_index.filenum_to_pos:
+        seq_index.n_images = max(seq_index.filenum_to_pos.values())
+    if seq_index.n_images == 0:
+        seq_index.n_images = len(accepted_frames)
 
-    selection_cmds = _build_selection_commands(
-        registered_sequence, n_frames, accepted_frames, name_to_index
+    selection_cmds, skipped_frames = _build_selection_commands(
+        registered_sequence, seq_index, accepted_frames
     )
+
+    # Safety: if no frames could be mapped we'd end up stacking all of them
+    # (the unselect-then-no-select combination leaves Siril with nothing
+    # selected, and stack on an empty selection behaves erratically). Fail
+    # loudly with an actionable message instead of producing junk output.
+    if len(selection_cmds) == 1:  # only the unselect survived
+        raise RuntimeError(
+            f"siril_stack: none of the {len(accepted_frames)} accepted frames "
+            f"could be mapped to positions in {registered_sequence}.seq "
+            f"(sequence has {seq_index.n_images} frames, {seq_index.n_selected} "
+            f"with selection flag, {len(seq_index.filenum_to_pos)} included in "
+            f"I-lines). The accepted frame keys from analyze_frames do not "
+            f"match any filenum in the registered sequence — this indicates "
+            f"registration dropped every frame, or analyze_frames was run "
+            f"against a different sequence. Re-run siril_register and "
+            f"analyze_frames, then retry select_frames + siril_stack. "
+            f"Skipped sample: {skipped_frames[:5]}"
+        )
 
     # ── Build stack command ───────────────────────────────────────────────
     siril_type = _STACK_TYPE_MAP.get(stack_method, "rej")
@@ -425,11 +562,29 @@ def siril_stack(
             f"Siril stdout:\n{result.stdout[-1000:]}"
         )
 
+    # Artifact-based verification: the master FITS existing is authoritative
+    # for "stack produced output". Supplement with stdout parse so the agent
+    # can see whether Siril actually used all the frames it was told to, vs
+    # silently skipping some. Mismatch vs accepted_frames_count is a signal
+    # worth surfacing but not failing on (Siril may reject at stack time for
+    # technical reasons unrelated to the agent's selection logic).
+    stacked_count_from_stdout = _parse_stacked_count(result.stdout)
+    count_mismatch_note = None
+    if stacked_count_from_stdout is not None and stacked_count_from_stdout != len(accepted_frames):
+        count_mismatch_note = (
+            f"Siril stacked {stacked_count_from_stdout} frames but {len(accepted_frames)} "
+            f"were selected. Some frames may have been rejected during stacking (e.g. "
+            f"too few stars for normalization, dimensional mismatch). Check Siril output."
+        )
+
     summary = {
         "output_path": str(master_path),
         "registered_sequence": registered_sequence,
         "accepted_frames_count": len(accepted_frames),
-        "total_frames_in_seq": n_frames,
+        "stacked_count_from_stdout": stacked_count_from_stdout,
+        "total_frames_in_seq": seq_index.n_images,
+        "frames_in_seq_selected_flag": seq_index.n_selected,
+        "skipped_accepted_frames": skipped_frames,
         "settings": {
             "stack_method": stack_method,
             "rejection_method": rejection_method,
@@ -440,6 +595,14 @@ def siril_stack(
             "output_name": output_name,
         },
     }
+    if count_mismatch_note:
+        summary["count_mismatch_note"] = count_mismatch_note
+    if skipped_frames:
+        summary["skipped_note"] = (
+            f"{len(skipped_frames)} accepted frame(s) were not present in the "
+            f"registered sequence — likely dropped during registration. This "
+            f"is informational, not an error."
+        )
 
     return Command(update={
         "paths": {**state["paths"], "current_image": str(master_path)},

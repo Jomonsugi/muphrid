@@ -36,7 +36,6 @@ _CFG = _load_config()
 
 # Runtime overrides — CLI/Gradio can override toml settings.
 _RUNTIME_AUTONOMOUS: bool = False
-_RUNTIME_VLM_HITL: bool | None = None
 _RUNTIME_VLM_AUTONOMOUS: bool | None = None
 _RUNTIME_VLM_RETENTION_MAX: int | None = None
 _RUNTIME_MEMORY_ENABLED: bool = False
@@ -46,12 +45,6 @@ def set_autonomous(value: bool) -> None:
     """Called by the CLI/app to override the toml autonomous flag."""
     global _RUNTIME_AUTONOMOUS
     _RUNTIME_AUTONOMOUS = value
-
-
-def set_vlm_hitl(value: bool) -> None:
-    """Called by the app to override the toml vlm_hitl flag."""
-    global _RUNTIME_VLM_HITL
-    _RUNTIME_VLM_HITL = value
 
 
 def set_vlm_autonomous(value: bool) -> None:
@@ -98,31 +91,35 @@ def is_autonomous() -> bool:
 
 
 def vlm_hitl() -> bool:
-    """Check if VLM is enabled during HITL conversations."""
-    if _RUNTIME_VLM_HITL is not None:
-        return _RUNTIME_VLM_HITL
-    return _CFG.get("vlm_hitl", False)
+    """
+    VLM access during HITL conversations.
+
+    Always True — collaboration is the entire point of HITL, and collaboration
+    over images requires the model to see what the human is referencing. There
+    is no user toggle for this; the toml ignores any value, the Gradio settings
+    panel does not expose it. The retention cap and the autonomous-mode toggle
+    remain user-controllable.
+    """
+    return True
 
 
 def vlm_autonomous() -> bool:
     """Check if VLM is enabled outside HITL (agent self-inspection)."""
     if _RUNTIME_VLM_AUTONOMOUS is not None:
         return _RUNTIME_VLM_AUTONOMOUS
-    return _CFG.get("vlm_autonomous", False)
+    return _CFG.get("vlm_autonomous", True)
 
 
 def vlm_window_cap() -> int:
     """
     Hard total cap on images retained in the agent's view per agent_node call.
 
-    Applies when vlm_autonomous is on; vlm_hitl alone uses gate-only
-    visibility (no persistence outside the active gate).
-
-    HITL gate images count against this cap like any other multimodal
-    HumanMessage. The single exception is "gate overflow": when the active
-    HITL gate alone contains more images than the cap, the gate is shown in
-    full (so the user can reference any variant they see in Gradio) and no
-    remaining budget is granted to older non-gate images. Effective ceiling:
+    Applies whenever the VLM view is being built. HITL gate variants count
+    against this cap like any other source. The single exception is "gate
+    overflow": when the active HITL gate alone contains more images than the
+    cap, the gate is shown in full (so the user can reference any variant
+    they see in Gradio) and no remaining budget is granted to older non-gate
+    images. Effective ceiling:
 
         max(cap, |images in current HITL gate|)
 
@@ -137,6 +134,40 @@ def vlm_window_cap() -> int:
         except ValueError:
             pass
     return int(_CFG.get("vlm_retention_max_images", 8))
+
+
+# ── Phase eligibility for auto-current-image projection ──────────────────────
+# Only the auto-current-image source consults this. Explicit visual
+# affordances — present_images, variant_pool, phase_carry — bypass it: the
+# agent retains full visual access on demand in any phase if it decides the
+# image will inform a decision the metrics cannot.
+
+_VLM_AUTO_PHASES = frozenset({
+    "stacking",   # current_image becomes meaningful after siril_stack
+    "linear",
+    "stretch",
+    "nonlinear",
+    "review",
+    "export",
+})
+
+
+def vlm_phase_eligible(phase) -> bool:
+    """
+    True when the auto-current-image source should project a preview.
+
+    INGEST/CALIBRATION/REGISTRATION/ANALYSIS return False — current_image
+    either does not exist yet (pre-stack) or pixel inspection adds nothing
+    over the analytical metrics. STACKING onward returns True.
+
+    Affordances the agent invokes deliberately (present_images, variant
+    capture during a HITL-mapped tool, phase-carry from a prior promotion)
+    are not gated by this — the agent's explicit choice always wins.
+    """
+    val = getattr(phase, "value", phase)
+    if not isinstance(val, str):
+        return False
+    return val in _VLM_AUTO_PHASES
 
 
 # ── Tool name → HITL config key mapping ──────────────────────────────────────

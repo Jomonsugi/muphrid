@@ -35,6 +35,13 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 from scipy.ndimage import gaussian_filter, sobel
 
+from muphrid.graph.regression import (
+    detect_regressions,
+    filter_resolved,
+    format_warnings,
+    merge_warnings,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,15 +52,123 @@ class AnalyzeImageInput(BaseModel):
         default=True,
         description=(
             "Run star detection via photutils IRAFStarFinder. "
-            "Returns count, median_fwhm, median_roundness. "
+            "Returns count, median_fwhm, median_roundness, and (when "
+            "star_distribution=True) FWHM/peak/roundness percentiles. "
             "Set False for speed when star metrics are not needed."
         ),
     )
     compute_histogram: bool = Field(
         default=True,
         description=(
-            "Compute per-channel histogram summary stats (percentiles). "
+            "Compute per-channel histogram summary stats (percentiles p1-p99). "
             "Used to detect clipping and assess stretch completeness."
+        ),
+    )
+    shadow_thresholds: list[float] | None = Field(
+        default=None,
+        description=(
+            "List of shadow clip thresholds (in [0,1]) at which to report the "
+            "percentage of pixels at or below that value, per channel. "
+            "None uses the defaults [0.0, 0.001, 0.01, 0.05]. "
+            "Examples of useful custom lists: "
+            "[0.0] for pure hard-black count; "
+            "[0.0, 0.002, 0.01, 0.05, 0.1] for a fine staircase when you "
+            "suspect black-point placement is the cause of an SNR anomaly; "
+            "thresholds derived from `current_background` or `current_noise` "
+            "(e.g., bg_level ± k·noise) to characterize how much of the frame "
+            "sits inside the noise floor. No warnings are issued — the agent "
+            "reads the staircase and reasons about it."
+        ),
+    )
+    highlight_thresholds: list[float] | None = Field(
+        default=None,
+        description=(
+            "List of highlight clip thresholds (in [0,1]) at which to report the "
+            "percentage of pixels at or above that value, per channel. "
+            "None uses the defaults [0.95, 0.99, 0.999, 1.0]. "
+            "Useful custom lists: [0.999, 1.0] for a strict burned-star check; "
+            "[0.8, 0.9, 0.95, 0.99, 1.0] to assess how aggressive a stretch was; "
+            "per-channel imbalance shows up when one channel saturates before others."
+        ),
+    )
+    valid_pixel_min: float = Field(
+        default=0.0,
+        description=(
+            "Lower bound (exclusive) for the 'valid pixel' mask used in noise, "
+            "background, and SNR computations. Pixels with lum <= this value "
+            "are excluded. Default 0.0 rejects zero-padded registration borders "
+            "and calibration-clipped pixels (PixInsight-style zero rejection). "
+            "Raise slightly (e.g. 0.0001) to exclude the very bottom of the "
+            "noise floor when analyzing stacks with visible pedestal noise; "
+            "lower to -0.001 to include genuine negative residuals from "
+            "background subtraction."
+        ),
+    )
+    valid_pixel_max: float = Field(
+        default=0.999,
+        description=(
+            "Upper bound (exclusive) for the valid pixel mask. Pixels with "
+            "lum >= this value are excluded as saturated. Default 0.999 "
+            "matches PixInsight. Lower to 0.95 when you want to exclude the "
+            "knee of a strong stretch from noise/background measurements; "
+            "raise to 1.001 to include everything (rarely useful)."
+        ),
+    )
+    quadrant_analysis: bool = Field(
+        default=True,
+        description=(
+            "Compute per-quadrant background median, MAD noise, and valid-"
+            "pixel share. Four quadrants: top_left, top_right, bottom_left, "
+            "bottom_right. Exposes asymmetric gradient / vignetting / light "
+            "pollution — if one quadrant's median is notably higher or "
+            "noisier than the others, flat-fielding or background removal "
+            "is likely incomplete. Cheap; disable only for minimum-cost runs."
+        ),
+    )
+    compute_mode: bool = Field(
+        default=True,
+        description=(
+            "Estimate the mode (histogram peak) of each channel and the "
+            "luminance. On linear data the mode is effectively the black "
+            "point — where most pixels are sitting. Divergence between "
+            "mode and median indicates distribution shape (heavy-tailed "
+            "from stars/nebula versus symmetric noise). After stretching "
+            "the mode tracks where the midtone was placed."
+        ),
+    )
+    star_distribution: bool = Field(
+        default=True,
+        description=(
+            "When detect_stars is True, also report FWHM, peak, and roundness "
+            "percentiles (p10/p50/p90) across detected stars rather than only "
+            "the median. Surfaces PSF field uniformity: wide FWHM spread → "
+            "position-dependent aberrations; high roundness spread → tracking "
+            "errors or mount flex. Low extra cost once stars are detected."
+        ),
+    )
+    wavelet_scales: int = Field(
+        default=3,
+        description=(
+            "Number of wavelet scales for multi-scale noise estimation. "
+            "Scale 1 = finest (pixel-scale shot/read noise, same as the "
+            "existing `wavelet_noise` scalar). Each successive scale is "
+            "~2x coarser. 3 scales is enough to distinguish pixel-scale "
+            "noise from low-frequency pattern noise (walking, banding, "
+            "residual gradient). Set 1 to match the legacy single-scale "
+            "output; 5 for very detailed structured-noise profiling."
+        ),
+        ge=1,
+        le=6,
+    )
+    background_box_size: int | None = Field(
+        default=None,
+        description=(
+            "Override the auto-selected Background2D tile size (pixels). "
+            "None uses max(32, min(256, min(H,W)//10)). Smaller boxes "
+            "capture finer-scale gradients but can over-fit stars/nebula; "
+            "larger boxes produce smoother background models. Useful when "
+            "the default gives a visibly wrong background level on a "
+            "specific image."
         ),
     )
 
@@ -137,7 +252,7 @@ def _robust_stats(channel: np.ndarray) -> dict:
     }
 
 
-def _background_estimate(lum: np.ndarray) -> dict:
+def _background_estimate(lum: np.ndarray, box_size: int | None = None) -> dict:
     """
     Estimate 2D background level and noise using photutils Background2D.
 
@@ -148,7 +263,9 @@ def _background_estimate(lum: np.ndarray) -> dict:
     sigma_clip=None prevents the convergence-to-zero bug that affects
     sigma-clipped stats on near-zero linear data.
 
-    Returns bg_level, bg_noise, and the 2D bg_map for gradient analysis.
+    Returns bg_level, bg_noise, the chosen box_size, and the 2D bg_map
+    for gradient analysis. If box_size is provided it is used verbatim
+    (clamped to [16, min(H,W)//2]); otherwise the auto heuristic is used.
     """
     try:
         from photutils.background import (
@@ -158,7 +275,11 @@ def _background_estimate(lum: np.ndarray) -> dict:
         )
 
         h, w = lum.shape
-        box_size = max(32, min(256, min(h, w) // 10))
+        if box_size is None:
+            box_size = max(32, min(256, min(h, w) // 10))
+        else:
+            # Clamp to a sane range; Background2D crashes if box > image.
+            box_size = max(16, min(box_size, max(16, min(h, w) // 2)))
 
         bkg = Background2D(
             lum,
@@ -170,11 +291,13 @@ def _background_estimate(lum: np.ndarray) -> dict:
         bg_level = float(bkg.background_median)
         bg_noise = float(bkg.background_rms_median)
         bg_map = bkg.background
+        used_box = int(box_size)
     except Exception as e:
         logger.warning(f"Background2D failed ({e}), using MAD fallback")
         bg_level = float(np.median(lum))
         bg_noise = float(mad_std(lum))
         bg_map = None
+        used_box = 0
 
     # Fallback: if Background2D returned zero noise (shouldn't happen
     # with trimmed data, but safety net)
@@ -190,6 +313,7 @@ def _background_estimate(lum: np.ndarray) -> dict:
         "bg_level": bg_level,
         "bg_noise": bg_noise,
         "bg_map": bg_map,
+        "box_size": used_box,
     }
 
 
@@ -218,12 +342,13 @@ def _wavelet_noise(lum: np.ndarray) -> float:
         else:
             lum_padded = lum
 
-        # Stationary wavelet transform — first level detail coefficients
+        # Stationary wavelet transform — first level detail coefficients.
+        # With trim_approx=True, pywt returns:
+        #   [cAn, (cHn, cVn, cDn), ..., (cH1, cV1, cD1)]
+        # so coeffs[0] is the approximation and coeffs[-1] is the finest
+        # (scale-1) detail tuple we want here.
         coeffs = pywt.swt2(lum_padded, wavelet="bior1.3", level=1, trim_approx=True)
-        # coeffs[0] = (cH, cV, cD) — horizontal, vertical, diagonal details
-        detail_h = coeffs[0][0]
-        detail_v = coeffs[0][1]
-        detail_d = coeffs[0][2]
+        detail_h, detail_v, detail_d = coeffs[-1]
 
         # Combine all detail orientations for robust noise estimate
         all_details = np.concatenate([
@@ -302,11 +427,181 @@ def _flatness_score(
 
 
 def _clipping(channel: np.ndarray) -> tuple[float, float]:
-    """Return (shadows_pct, highlights_pct) clipping percentages."""
+    """Return (shadows_pct, highlights_pct) clipping percentages at 0.001/0.999.
+
+    Preserved for the legacy flat `clipped_shadows_pct` / `clipped_highlights_pct`
+    fields. For richer reporting use `_clipping_at_thresholds` below.
+    """
     total = channel.size
     shadows_pct = float(np.sum(channel <= 0.001) / total * 100)
     highlights_pct = float(np.sum(channel >= 0.999) / total * 100)
     return shadows_pct, highlights_pct
+
+
+def _clipping_at_thresholds(
+    channel: np.ndarray,
+    shadow_thresholds: list[float],
+    highlight_thresholds: list[float],
+) -> dict:
+    """
+    Percentage of pixels at or below each shadow threshold and at or above
+    each highlight threshold.
+
+    Returns a dict like:
+      {
+        "shadow_le_0.0":   x,    # pct at or below 0.0 (hard black)
+        "shadow_le_0.001": x,
+        "shadow_le_0.01":  x,
+        "highlight_ge_0.95":  x,
+        "highlight_ge_0.99":  x,
+        "highlight_ge_1.0":   x, # pct at or above 1.0 (hard white)
+      }
+
+    No judgment — the agent interprets these values in context. A short Fuji
+    frame legitimately has 50%+ shadow clip at the noise floor; a stretched
+    M31 stack should have <1% — both use the same data, the agent decides.
+    """
+    total = channel.size
+    result: dict = {}
+    for t in shadow_thresholds:
+        key = f"shadow_le_{t:g}"
+        result[key] = float(np.sum(channel <= t) / total * 100)
+    for t in highlight_thresholds:
+        key = f"highlight_ge_{t:g}"
+        result[key] = float(np.sum(channel >= t) / total * 100)
+    return result
+
+
+def _mode_estimate(channel: np.ndarray, bins: int = 4096) -> float:
+    """
+    Estimate the mode of the channel distribution — the effective black-point
+    location for linear data, or the peak of the midtone for stretched data.
+
+    Uses a histogram with 4096 bins over the observed min..max range. The
+    returned value is the midpoint of the bin with the highest count. Robust
+    to outliers; no smoothing (caller can reason about bin noise via percentiles).
+    """
+    c_min = float(np.min(channel))
+    c_max = float(np.max(channel))
+    if c_max <= c_min:
+        return c_min
+    counts, edges = np.histogram(channel, bins=bins, range=(c_min, c_max))
+    peak_idx = int(np.argmax(counts))
+    return float((edges[peak_idx] + edges[peak_idx + 1]) / 2)
+
+
+def _quadrant_background(
+    lum: np.ndarray, valid_mask: np.ndarray | None = None
+) -> dict:
+    """
+    Per-quadrant median luminance, MAD noise, and valid-pixel share.
+
+    Splits the frame into 2×2 quadrants — top_left, top_right, bottom_left,
+    bottom_right — and reports each quadrant's background median (P25 of
+    valid pixels within the quadrant), MAD noise, and valid-pixel fraction.
+    Asymmetric values indicate gradient, vignetting, or asymmetric light
+    pollution. Symmetric values indicate a flat field.
+
+    All stats are computed over valid pixels only (or all pixels if no mask).
+    """
+    h, w = lum.shape
+    mid_h = h // 2
+    mid_w = w // 2
+    regions = {
+        "top_left":     (slice(0, mid_h),     slice(0, mid_w)),
+        "top_right":    (slice(0, mid_h),     slice(mid_w, w)),
+        "bottom_left":  (slice(mid_h, h),     slice(0, mid_w)),
+        "bottom_right": (slice(mid_h, h),     slice(mid_w, w)),
+    }
+    out: dict = {}
+    for name, (ry, rx) in regions.items():
+        sub = lum[ry, rx]
+        if valid_mask is not None:
+            sub_mask = valid_mask[ry, rx]
+            sub_valid = sub[sub_mask]
+            valid_share = float(np.sum(sub_mask) / sub.size) if sub.size else 0.0
+        else:
+            sub_valid = sub
+            valid_share = 1.0
+
+        if sub_valid.size >= 16:
+            out[name] = {
+                "bg_p25":    float(np.percentile(sub_valid, 25)),
+                "median":    float(np.median(sub_valid)),
+                "mad_std":   float(mad_std(sub_valid)) if sub_valid.size >= 2 else 0.0,
+                "valid_pct": round(valid_share * 100, 3),
+            }
+        else:
+            out[name] = {
+                "bg_p25": None, "median": None, "mad_std": None,
+                "valid_pct": round(valid_share * 100, 3),
+            }
+    return out
+
+
+def _wavelet_noise_multiscale(lum: np.ndarray, n_scales: int = 3) -> list[float]:
+    """
+    Wavelet noise estimate at multiple scales (scales 1..n).
+
+    Scale 1 isolates fine-grained pixel noise (same as `_wavelet_noise`).
+    Successive scales capture progressively coarser variation — scale 2 is
+    ~2x pixel separation, scale 3 is ~4x, etc.
+
+    Interpretation: if noise[1] >> noise[2], the image is dominated by
+    shot noise / read noise (typical of well-calibrated single frames).
+    If noise[2] and noise[3] are comparable to noise[1], there is
+    structured noise at those spatial scales — walking, banding, pattern
+    noise, or residual gradients.
+    """
+    try:
+        import pywt
+
+        out: list[float] = []
+        h, w = lum.shape
+        pad_h = (2 ** n_scales) - (h % (2 ** n_scales))
+        pad_w = (2 ** n_scales) - (w % (2 ** n_scales))
+        pad_h = 0 if pad_h == (2 ** n_scales) else pad_h
+        pad_w = 0 if pad_w == (2 ** n_scales) else pad_w
+        lum_p = (np.pad(lum, ((0, pad_h), (0, pad_w)), mode="reflect")
+                 if (pad_h or pad_w) else lum)
+
+        coeffs = pywt.swt2(
+            lum_p, wavelet="bior1.3", level=n_scales, trim_approx=True
+        )
+        # With trim_approx=True, pywt returns:
+        #   [cAn, (cHn, cVn, cDn), ..., (cH1, cV1, cD1)]
+        # i.e. coeffs[0] is the coarsest approximation (not a tuple), and
+        # coeffs[1..n_scales] are detail tuples ordered coarsest → finest.
+        # Iterate in reverse so out[0] = scale 1 (finest, pixel-scale noise).
+        for detail in reversed(coeffs[1:]):
+            cH, cV, cD = detail
+            all_details = np.concatenate([cH.ravel(), cV.ravel(), cD.ravel()])
+            out.append(float(np.median(np.abs(all_details)) * 1.4826))
+        return out
+    except Exception as e:
+        logger.warning(f"Multi-scale wavelet noise failed ({e})")
+        return []
+
+
+def _channel_snr_estimates(
+    r: np.ndarray, g: np.ndarray, b: np.ndarray, valid_mask: np.ndarray | None
+) -> dict:
+    """
+    Per-channel SNR: P95 of valid pixels / MAD of valid pixels.
+
+    Gives R/G/B an independent SNR number so the agent can see when one
+    channel is much noisier than another (common with light pollution
+    filters or bandpass imaging). Complements global `snr_estimate`.
+    """
+    def one(ch: np.ndarray) -> float:
+        vals = ch[valid_mask] if valid_mask is not None else ch
+        if vals.size < 2:
+            return 0.0
+        noise = float(mad_std(vals))
+        if noise <= 0:
+            return 0.0
+        return float(np.percentile(vals, 95) / noise)
+    return {"red": one(r), "green": one(g), "blue": one(b)}
 
 
 def _histogram_percentiles(channel: np.ndarray) -> dict:
@@ -421,13 +716,22 @@ def _empty_star_result() -> dict:
 
 
 def _detect_stars_full(
-    lum: np.ndarray, bg_level: float, bg_noise: float
+    lum: np.ndarray,
+    bg_level: float,
+    bg_noise: float,
+    include_distribution: bool = True,
 ) -> dict:
     """
     Star detection using MAD-based threshold.
 
     Uses bg_level for background subtraction and bg_noise for the detection
     threshold, avoiding sigma-clipped stats that collapse on linear data.
+
+    When include_distribution is True (default), also returns FWHM / peak /
+    roundness percentile triples (p10, p50, p90) over all detected stars,
+    and their std. This exposes PSF uniformity across the field — tight
+    percentile spread = uniform optics, wide spread = position-dependent
+    aberrations, coma, or tracking drift.
     """
     try:
         from photutils.detection import IRAFStarFinder
@@ -451,17 +755,34 @@ def _detect_stars_full(
 
         fwhm_arr = np.array(sources["fwhm"])
         peak_arr = np.array(sources["peak"])
+        round_arr = np.abs(np.array(sources["roundness"]))
 
-        return {
+        result = {
             "count": len(sources),
             "median_fwhm": float(np.median(fwhm_arr)),
-            "median_roundness": float(
-                np.median(np.abs(sources["roundness"]))
-            ),
+            "median_roundness": float(np.median(round_arr)),
             "fwhm_std": float(np.std(fwhm_arr)),
             "median_star_peak_ratio": float(np.median(peak_arr))
             / (bg_noise + 1e-9),
         }
+        if include_distribution:
+            result["star_distribution"] = {
+                "fwhm_p10": float(np.percentile(fwhm_arr, 10)),
+                "fwhm_p50": float(np.percentile(fwhm_arr, 50)),
+                "fwhm_p90": float(np.percentile(fwhm_arr, 90)),
+                "peak_p10": float(np.percentile(peak_arr, 10)),
+                "peak_p50": float(np.percentile(peak_arr, 50)),
+                "peak_p90": float(np.percentile(peak_arr, 90)),
+                "roundness_p10": float(np.percentile(round_arr, 10)),
+                "roundness_p50": float(np.percentile(round_arr, 50)),
+                "roundness_p90": float(np.percentile(round_arr, 90)),
+                "roundness_std": float(np.std(round_arr)),
+                "peak_over_noise_p10": float(np.percentile(peak_arr, 10))
+                / (bg_noise + 1e-9),
+                "peak_over_noise_p90": float(np.percentile(peak_arr, 90))
+                / (bg_noise + 1e-9),
+            }
+        return result
     except Exception as e:
         return {
             **_empty_star_result(),
@@ -474,10 +795,23 @@ def _detect_stars_full(
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
+_DEFAULT_SHADOW_THRESHOLDS = [0.0, 0.001, 0.01, 0.05]
+_DEFAULT_HIGHLIGHT_THRESHOLDS = [0.95, 0.99, 0.999, 1.0]
+
+
 @tool(args_schema=AnalyzeImageInput)
 def analyze_image(
     detect_stars: bool = True,
     compute_histogram: bool = True,
+    shadow_thresholds: list[float] | None = None,
+    highlight_thresholds: list[float] | None = None,
+    valid_pixel_min: float = 0.0,
+    valid_pixel_max: float = 0.999,
+    quadrant_analysis: bool = True,
+    compute_mode: bool = True,
+    star_distribution: bool = True,
+    wavelet_scales: int = 3,
+    background_box_size: int | None = None,
     tool_call_id: Annotated[str, InjectedToolCallId] = None,
     state: Annotated[dict, InjectedState] = None,
 ) -> Command:
@@ -540,12 +874,63 @@ def analyze_image(
       positive skewness is characteristic of linear data (most pixels near
       zero with a long tail from stars/nebula).
 
-    **Clipping**
-    - clipped_shadows_pct: percentage of pixels at or below 0.001 (black clip).
+    **Clipping (flat, legacy)**
+    - clipped_shadows_pct: worst-channel percentage at or below 0.001.
       High values in linear data indicate most pixels are at the noise floor —
-      expected for short exposures or uncropped images with borders.
-    - clipped_highlights_pct: percentage of pixels at or above 0.999 (white clip).
+      expected for short exposures or uncropped frames. For fine-grained
+      reasoning, prefer `clipping_per_channel` below.
+    - clipped_highlights_pct: worst-channel percentage at or above 0.999.
       Indicates star cores or bright regions are saturated.
+
+    **Clipping (structured)**
+    - clipping_per_channel: nested dict with four keys (red, green, blue,
+      luminance), each a staircase of percentages at the agent-chosen
+      shadow_thresholds and highlight_thresholds. No thresholds are
+      editorialized — a short Fuji frame legitimately has >50% at the
+      noise floor, a stretched M31 stack should have <1%; both use the
+      same fields and the agent decides what the numbers mean in context.
+      Also includes the exact threshold list used.
+
+    **Pixel Coverage**
+    - pixel_coverage: total pixel count, number valid, percentage valid,
+      number excluded by valid_pixel_min (zero/below-floor) and by
+      valid_pixel_max (saturated), and the exact bounds used. Use this
+      to reason about whether a noise/background number is trustworthy
+      — if valid_pct is low the frame is mostly borders or clipped and
+      spatial stats will be degraded.
+
+    **Mode (per-channel histogram peak)**
+    - mode_estimate: peak of the 4096-bin histogram per channel, plus
+      luminance. On linear data this is effectively the black-point
+      location; on stretched data it tracks midtone placement. When
+      mode ≪ median, the distribution is heavy-tailed from bright
+      structure (stars/nebula). None if compute_mode=False.
+
+    **Background Quadrants**
+    - background_quadrants: per-quadrant P25, median, MAD noise, and
+      valid-pixel share for {top_left, top_right, bottom_left,
+      bottom_right}. Diverging quadrant values indicate gradient,
+      vignetting, or asymmetric light pollution. None if
+      quadrant_analysis=False.
+
+    **Multi-scale Noise**
+    - wavelet_noise_scales: list of noise estimates at successive
+      wavelet scales (scale 1 = pixel-scale, scale N ≈ 2^(N-1) pixels).
+      noise[1] >> noise[2] → dominated by shot/read noise (good). If
+      higher scales are comparable to scale 1, there's structured
+      noise (walking, banding, residual gradient).
+
+    **Per-channel SNR**
+    - channel_snr: {red, green, blue} P95 / MAD std, computed over
+      valid pixels per channel. Surfaces asymmetric noise — useful
+      with narrowband, bandpass filters, or uncalibrated color data.
+
+    **Star Distribution (when detect_stars=True and stars found)**
+    - star_distribution: FWHM / peak / roundness percentile triples
+      (p10, p50, p90) plus std, and peak-over-noise percentiles.
+      Wide FWHM spread = position-dependent aberrations; wide
+      roundness spread = tracking/mount issues. Missing when
+      detect_stars=False or star_distribution=False.
 
     **Contrast**
     - contrast_ratio: P95 - P5 of valid pixel luminance. Measures the usable
@@ -555,6 +940,16 @@ def analyze_image(
     - min, max: absolute extreme values
     - mean, median: central tendency of valid pixels
     - std: MAD-based robust standard deviation
+
+    **Histogram** (when compute_histogram=True)
+    - histogram: per-channel percentile summary (p1, p5, p25, p50,
+      p75, p95, p99) over the full channel (not just valid pixels).
+
+    **Reproducibility**
+    - bg_box_size: tile size Background2D actually used, echoing the
+      auto-selection or the caller's background_box_size override.
+    - analyze_params: the exact parameters this call ran with, so later
+      reasoning can tell whether two snapshots are comparable.
     """
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"].get("current_image")
@@ -597,24 +992,30 @@ def analyze_image(
     # ── PixInsight-aligned: reject zero and saturated pixels ──
     # Zero pixels come from registration borders, calibration clipping,
     # and X-Trans debayering artifacts. Saturated pixels (≥0.999) are
-    # clipped and uninformative. Both are excluded from all statistics,
-    # matching PixInsight's implicit zero/one rejection.
-    valid_mask = (lum > 0) & (lum < 0.999)
-    valid_pct = float(np.sum(valid_mask) / lum.size * 100)
+    # clipped and uninformative. Both are excluded from noise / background
+    # computations by default, matching PixInsight's implicit zero/one
+    # rejection. The bounds are agent-configurable via valid_pixel_min /
+    # valid_pixel_max so short-exposure / heavy-stretch data can be
+    # analyzed with a different notion of "valid".
+    valid_mask = (lum > valid_pixel_min) & (lum < valid_pixel_max)
+    n_valid = int(np.sum(valid_mask))
+    valid_pct = float(n_valid / lum.size * 100)
+    n_zero = int(np.sum(lum <= valid_pixel_min))
+    n_saturated = int(np.sum(lum >= valid_pixel_max))
     logger.info(
         f"analyze_image: {valid_pct:.2f}% valid pixels "
-        f"({np.sum(valid_mask):,} / {lum.size:,})"
+        f"({n_valid:,} / {lum.size:,}, min={valid_pixel_min}, max={valid_pixel_max})"
     )
 
     # If very few valid pixels, the image may be empty or uncropped.
     # Still compute what we can — the agent needs to see the state.
-    has_valid = np.sum(valid_mask) >= 100
+    has_valid = n_valid >= 100
 
     # ── Background estimation on valid pixels ──
     if has_valid:
         if valid_pct > 50:
             # Majority of pixels are valid — Background2D works well
-            bg_est = _background_estimate(lum)
+            bg_est = _background_estimate(lum, box_size=background_box_size)
             bg_level = bg_est["bg_level"]
             bg_noise = bg_est["bg_noise"]
             bg_map = bg_est["bg_map"]
@@ -624,6 +1025,7 @@ def analyze_image(
             bg_level = 0.0
             bg_noise = 0.0
             bg_map = None
+            bg_est = {"bg_level": 0.0, "bg_noise": 0.0, "bg_map": None, "box_size": 0}
 
         # If Background2D returned zeros or was skipped, use valid pixels
         if bg_noise <= 0 or bg_level <= 0:
@@ -634,7 +1036,7 @@ def analyze_image(
         bg_level = 0.0
         bg_noise = 0.0
         bg_map = None
-        bg_est = {"bg_level": 0.0, "bg_noise": 0.0, "bg_map": None}
+        bg_est = {"bg_level": 0.0, "bg_noise": 0.0, "bg_map": None, "box_size": 0}
 
     # ── Wavelet noise (MRS-style, signal-excluded) ──
     w_noise = _wavelet_noise(lum) if has_valid else 0.0
@@ -733,7 +1135,10 @@ def analyze_image(
     star_metrics: dict = _empty_star_result()
     if detect_stars:
         star_metrics = _detect_stars_full(
-            lum, bg_level=bg_level, bg_noise=bg_noise
+            lum,
+            bg_level=bg_level,
+            bg_noise=bg_noise,
+            include_distribution=star_distribution,
         )
 
     # Histogram percentiles
@@ -751,6 +1156,68 @@ def analyze_image(
         contrast_ratio = float(np.percentile(vl, 95) - np.percentile(vl, 5))
     else:
         contrast_ratio = float(np.percentile(lum, 95) - np.percentile(lum, 5))
+
+    # ── New structured fields ───────────────────────────────────────────────
+    # These augment the flat scalars above with richer per-channel and
+    # spatial breakdowns. The agent reads whatever is useful for the
+    # decision at hand; nothing is filtered, no thresholds are applied.
+
+    # Pixel coverage — how much of the frame participated in the analysis.
+    pixel_coverage = {
+        "total":         int(lum.size),
+        "n_valid":       n_valid,
+        "valid_pct":     round(valid_pct, 3),
+        "n_at_or_below_min":   n_zero,
+        "pct_at_or_below_min": round(n_zero / lum.size * 100, 3),
+        "n_at_or_above_max":   n_saturated,
+        "pct_at_or_above_max": round(n_saturated / lum.size * 100, 3),
+        "valid_min": float(valid_pixel_min),
+        "valid_max": float(valid_pixel_max),
+    }
+
+    # Per-channel clipping at user-chosen thresholds.
+    shadow_ts = shadow_thresholds if shadow_thresholds is not None else _DEFAULT_SHADOW_THRESHOLDS
+    highlight_ts = highlight_thresholds if highlight_thresholds is not None else _DEFAULT_HIGHLIGHT_THRESHOLDS
+    clipping_per_channel = {
+        "red":       _clipping_at_thresholds(r, shadow_ts, highlight_ts),
+        "green":     _clipping_at_thresholds(g, shadow_ts, highlight_ts),
+        "blue":      _clipping_at_thresholds(b, shadow_ts, highlight_ts),
+        "luminance": _clipping_at_thresholds(lum, shadow_ts, highlight_ts),
+        "thresholds": {
+            "shadow": list(shadow_ts),
+            "highlight": list(highlight_ts),
+        },
+    }
+
+    # Mode estimate per channel (histogram peak).
+    mode_estimate = None
+    if compute_mode:
+        mode_estimate = {
+            "red":       _mode_estimate(r),
+            "green":     _mode_estimate(g),
+            "blue":      _mode_estimate(b),
+            "luminance": _mode_estimate(lum),
+        }
+
+    # Per-quadrant background.
+    background_quadrants = None
+    if quadrant_analysis:
+        background_quadrants = _quadrant_background(
+            lum, valid_mask=valid_mask if has_valid else None
+        )
+
+    # Multi-scale wavelet noise.
+    wavelet_noise_scales: list[float] = []
+    if wavelet_scales >= 1 and has_valid:
+        wavelet_noise_scales = _wavelet_noise_multiscale(lum, n_scales=wavelet_scales)
+
+    # Per-channel SNR.
+    channel_snr = _channel_snr_estimates(
+        r, g, b, valid_mask=valid_mask if has_valid else None
+    )
+
+    # Background estimator box size actually used (for reproducibility).
+    bg_box_size = int(bg_est.get("box_size", 0))
 
     metrics_update = {
         "current_fwhm": star_metrics.get("median_fwhm"),
@@ -777,17 +1244,79 @@ def analyze_image(
         "fwhm_std": star_metrics.get("fwhm_std"),
         "median_star_peak_ratio": star_metrics.get("median_star_peak_ratio"),
         "contrast_ratio": round(contrast_ratio, 5),
+
+        # ── Structured additions (nested dicts / lists) ──
+        "pixel_coverage":        pixel_coverage,
+        "clipping_per_channel":  clipping_per_channel,
+        "mode_estimate":         mode_estimate,
+        "background_quadrants":  background_quadrants,
+        "wavelet_noise_scales":  wavelet_noise_scales,
+        "channel_snr":           channel_snr,
+        "star_distribution":     star_metrics.get("star_distribution"),
+        "bg_box_size":           bg_box_size,
+        "histogram":             histogram if compute_histogram else None,
+
+        # Echo of the parameters the agent chose, so reasoning over prior
+        # tool calls can see what thresholds produced this snapshot.
+        "analyze_params": {
+            "detect_stars":          detect_stars,
+            "compute_histogram":     compute_histogram,
+            "shadow_thresholds":     list(shadow_ts),
+            "highlight_thresholds":  list(highlight_ts),
+            "valid_pixel_min":       float(valid_pixel_min),
+            "valid_pixel_max":       float(valid_pixel_max),
+            "quadrant_analysis":     quadrant_analysis,
+            "compute_mode":          compute_mode,
+            "star_distribution":     star_distribution,
+            "wavelet_scales":        int(wavelet_scales),
+            "background_box_size":   background_box_size,
+        },
     }
 
+    # ── Regression detection ────────────────────────────────────────────────
+    # Compare this snapshot against metadata.last_analysis_snapshot and carry
+    # any existing pending warnings forward. filter_resolved drops warnings
+    # whose metric has recovered within tolerance of its known-good baseline.
+    # merge_warnings preserves each metric's original baseline when a
+    # regression persists across multiple tool calls, while refreshing the
+    # current/delta fields so summaries reflect the latest measurement.
+    # Everything here is informational — the agent decides what to do.
+    existing_warnings = state.get("regression_warnings") or []
+    baseline_snapshot = (state.get("metadata") or {}).get("last_analysis_snapshot")
+    phase_val = getattr(state.get("phase"), "value", state.get("phase")) or ""
+
+    kept_warnings = filter_resolved(existing_warnings, metrics_update)
+    new_warnings = detect_regressions(
+        metrics_update, baseline_snapshot, phase_val
+    )
+    regression_warnings_next = merge_warnings(
+        kept_warnings, new_warnings, metrics_update
+    )
+
     import json
+
+    # ToolMessage payload: metrics first, then any outstanding regression
+    # warnings as a structured list AND the prose summary. The agent reads
+    # both — the structured list is precise, the summary is scannable.
+    message_payload: dict = {"image": img_path.name, **metrics_update}
+    if regression_warnings_next:
+        message_payload["regression_warnings"] = regression_warnings_next
+        message_payload["regression_summary"] = format_warnings(
+            regression_warnings_next
+        )
 
     return Command(
         update={
             "metrics": {**state["metrics"], **metrics_update},
+            # Replace semantics on the top-level list: pass the full new list.
+            "regression_warnings": regression_warnings_next,
+            # metadata uses _merge_dicts reducer — this only touches the
+            # snapshot field, other metadata values are preserved.
+            "metadata": {"last_analysis_snapshot": metrics_update},
             "messages": [
                 ToolMessage(
                     content=json.dumps(
-                        {"image": img_path.name, **metrics_update},
+                        message_payload,
                         indent=2,
                         default=str,
                     ),

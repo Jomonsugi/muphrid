@@ -39,12 +39,13 @@ from muphrid.graph.state import AstroState
 # ── Selection criteria schema ──────────────────────────────────────────────────
 
 class SelectionCriteria(BaseModel):
-    max_fwhm_sigma: float = Field(
+    max_fwhm_sigma: float | None = Field(
         default=2.0,
         description=(
             "Reject frames with FWHM > median + max_fwhm_sigma × std. "
             "Use 3.0 for small datasets (< 15 subs) to preserve integration time. "
-            "Use 1.5 for excellent seeing when you want only the sharpest frames."
+            "Use 1.5 for excellent seeing when you want only the sharpest frames. "
+            "None = no FWHM threshold (bypass this filter entirely)."
         ),
     )
     max_wfwhm_sigma: float | None = Field(
@@ -55,29 +56,33 @@ class SelectionCriteria(BaseModel):
             "than raw FWHM.  None = no wFWHM filtering (default)."
         ),
     )
-    min_roundness: float = Field(
+    min_roundness: float | None = Field(
         default=0.5,
         description=(
             "Reject frames with roundness below this (0–1). "
             "1.0 = perfect circles. Below 0.6 indicates significant elongation. "
-            "Tighten to 0.7 for quality-focused selection."
+            "Tighten to 0.7 for quality-focused selection. "
+            "None = no roundness threshold (bypass this filter entirely)."
         ),
     )
-    min_star_count: int = Field(
+    min_star_count: int | None = Field(
+        default=None,
         description=(
             "Reject frames with fewer detected stars than this threshold. "
             "Low star count indicates clouds, fog, or detection failure. "
-            "Must be derived from T05 summary.median_star_count — "
-            "set to ~50% of median for a balanced filter that catches "
-            "problem frames without discarding variable-but-valid ones. "
-            "Example: median_star_count=402 → min_star_count=200."
+            "Derive from T05 summary.median_star_count — set to ~50% of "
+            "median for a balanced filter that catches problem frames "
+            "without discarding variable-but-valid ones. "
+            "Example: median_star_count=402 → min_star_count=200. "
+            "None = no star-count threshold (bypass this filter entirely)."
         ),
     )
-    max_background_sigma: float = Field(
+    max_background_sigma: float | None = Field(
         default=3.0,
         description=(
             "Reject frames with background > median + max_background_sigma × std. "
-            "Catches frames affected by passing clouds, moon, or light pollution spikes."
+            "Catches frames affected by passing clouds, moon, or light pollution spikes. "
+            "None = no background threshold (bypass this filter entirely)."
         ),
     )
     min_quality: float | None = Field(
@@ -118,8 +123,17 @@ def _select_frames(
     fwhms = [v["fwhm"] for v in frame_metrics.values() if v.get("fwhm") is not None and v["fwhm"] > 0]
     bgs   = [v["background_lvl"] for v in frame_metrics.values() if v.get("background_lvl") is not None]
 
-    fwhm_threshold = _sigma_threshold(fwhms, criteria.max_fwhm_sigma)
-    bg_threshold   = _sigma_threshold(bgs, criteria.max_background_sigma)
+    # Any None threshold means "bypass this filter". Using +inf for the
+    # comparison keeps the selection loop branchless without leaking the
+    # None type into numeric operations.
+    fwhm_threshold = (
+        _sigma_threshold(fwhms, criteria.max_fwhm_sigma)
+        if criteria.max_fwhm_sigma is not None else float("inf")
+    )
+    bg_threshold = (
+        _sigma_threshold(bgs, criteria.max_background_sigma)
+        if criteria.max_background_sigma is not None else float("inf")
+    )
 
     wfwhm_threshold = float("inf")
     if criteria.max_wfwhm_sigma is not None:
@@ -131,7 +145,18 @@ def _select_frames(
         reasons: list[str] = []
 
         fwhm = metrics.get("fwhm")
-        if fwhm is not None and fwhm > fwhm_threshold:
+        # Unconditional precondition: a frame without registration data was
+        # dropped by registration (no R-line in the .seq file). It still
+        # appears in frame_stats because calibration M-line stats are
+        # written independently. Such a frame cannot be stacked — reject it
+        # regardless of the sigma / min thresholds so the accepted list is
+        # always mappable to positions in the registered .seq.
+        if fwhm is None:
+            reasons.append(
+                "no registration data — frame dropped during registration "
+                "(no R-line in the .seq file); cannot be stacked"
+            )
+        elif fwhm > fwhm_threshold:
             reasons.append(f"FWHM {fwhm:.3f} > threshold {fwhm_threshold:.3f}")
 
         wfwhm = metrics.get("weighted_fwhm")
@@ -139,11 +164,15 @@ def _select_frames(
             reasons.append(f"wFWHM {wfwhm:.3f} > threshold {wfwhm_threshold:.3f}")
 
         roundness = metrics.get("roundness")
-        if roundness is not None and roundness < criteria.min_roundness:
+        if (criteria.min_roundness is not None
+                and roundness is not None
+                and roundness < criteria.min_roundness):
             reasons.append(f"roundness {roundness:.3f} < min {criteria.min_roundness}")
 
         star_count = metrics.get("number_of_stars")
-        if star_count is not None and star_count < criteria.min_star_count:
+        if (criteria.min_star_count is not None
+                and star_count is not None
+                and star_count < criteria.min_star_count):
             reasons.append(f"star_count {star_count} < min {criteria.min_star_count}")
 
         bg = metrics.get("background_lvl")
@@ -159,9 +188,21 @@ def _select_frames(
 
     accepted = [f for f in frame_metrics if f not in rejected]
 
+    # Safety escape: if every frame was rejected by the user-configurable
+    # criteria, keep all frames that still have registration data (fwhm not
+    # None) so stacking can proceed. Frames without registration data remain
+    # rejected even in the fallback — they have no .seq position to stack.
     if not accepted:
-        accepted = list(frame_metrics.keys())
-        rejected = {}
+        registered = [
+            f for f, m in frame_metrics.items() if m.get("fwhm") is not None
+        ]
+        if registered:
+            accepted = registered
+            # Preserve the "no registration data" rejections; drop the rest.
+            rejected = {
+                k: v for k, v in rejected.items()
+                if k not in registered
+            }
 
     return accepted, list(rejected.keys()), rejected
 

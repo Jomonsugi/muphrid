@@ -21,9 +21,25 @@ default = "moonshotai/Kimi-K2.5"
 # These prevent runaway tool loops and excessive resource usage.
 
 [limits]
-# Max LangGraph node transitions per stream() call (~4 per tool call)
-# 50 ≈ 12 tool calls, 100 ≈ 25 tool calls, 200 ≈ 50 tool calls
-recursion_limit = 100
+# Max LangGraph node transitions per stream() call.
+#
+# Steady-state tool-call cost: ~4 ticks per call
+#   (action → variant_snapshot → hitl_check → agent).
+# HITL round cost: ~6–10 additional ticks per gate
+#   (pass-1 prompt injection → agent analysis → optional present_images
+#    tool call → pass-2 interrupt → resume → agent). Each human feedback
+#    round inside an active HITL chat burns another ~4 ticks.
+#
+# Rough budgets including HITL overhead for a typical run with 4–6 gates:
+#   150 ≈ 25 tool calls   (tight — single-pass nonlinear only)
+#   200 ≈ 35 tool calls   (comfortable — iteration + a few HITL exchanges)
+#   300 ≈ 55 tool calls   (roomy — heavy iteration + multiple feedback rounds)
+#
+# Root-cause fixes for HITL tick burn are tracked separately (hitl_check
+# pass 1 could inline the present_images call instead of prompting the
+# agent to make it, saving ~4 ticks per gate). Until then, the safe
+# default is 200 so the agent does not hit the ceiling mid-conversation.
+recursion_limit = 200
 
 # Global default for per-phase tool call limits (0 = disabled)
 max_tools_per_phase = 30

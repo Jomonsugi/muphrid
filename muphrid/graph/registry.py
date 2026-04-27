@@ -63,6 +63,8 @@ from muphrid.tools.utility.t29_resolve_target import resolve_target
 from muphrid.tools.utility.t30_advance_phase import advance_phase
 from muphrid.tools.utility.t31_commit_variant import commit_variant
 from muphrid.tools.utility.t32_present_images import present_images
+from muphrid.tools.utility.t36_rewind_phase import rewind_phase
+from muphrid.tools.utility.t37_flag_dataset_issue import flag_dataset_issue
 
 
 # ── Tool groups ───────────────────────────────────────────────────────────────
@@ -74,8 +76,22 @@ UTILITY_TOOLS = [
     extract_narrowband,
     resolve_target,
     advance_phase,
+    rewind_phase,
+    flag_dataset_issue,
     commit_variant,
     present_images,
+    # analyze_frames and create_mask used to live in ANALYSIS and NONLINEAR
+    # respectively, but they are phase-agnostic diagnostics/primitives:
+    #   - analyze_frames reads the registration cache; agents reach for it
+    #     during REGISTRATION to check register quality, not just ANALYSIS.
+    #   - create_mask is a pure companion to pixel_math (which is already a
+    #     utility). Masked blending is legitimate in STRETCH (HDR masked
+    #     stretch) and LINEAR (masked gradient removal), not just NONLINEAR.
+    # Moving them here removes phase-gate friction for workflows a human
+    # would reach for without thinking about phases. See v2_framework_fixes
+    # Issue #3b / #3c.
+    analyze_frames,
+    create_mask,
 ]
 
 
@@ -104,8 +120,11 @@ REGISTRATION_TOOLS = [
     siril_register,
 ]
 
-ANALYSIS_TOOLS = [
-    analyze_frames,
+ANALYSIS_TOOLS: list = [
+    # analyze_frames moved to UTILITY_TOOLS — see that list for rationale.
+    # The ANALYSIS phase still exists as a distinct stop in the preprocessing
+    # order (between REGISTRATION and STACKING); it just relies on utility
+    # tools for its work.
 ]
 
 STACKING_TOOLS = [
@@ -133,7 +152,7 @@ NONLINEAR_TOOLS = [
     local_contrast_enhance,
     saturation_adjust,
     star_restoration,
-    create_mask,
+    # create_mask moved to UTILITY_TOOLS — see that list for rationale.
     reduce_stars,
     multiscale_process,
     save_checkpoint,

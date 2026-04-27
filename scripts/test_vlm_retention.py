@@ -133,8 +133,14 @@ def total_image_count(messages: list) -> int:
 
 
 def reset_vlm_modes(hitl: bool, auto: bool, cap: int = 8) -> None:
-    """Set VLM mode flags via the runtime override globals."""
-    hitl_mod._RUNTIME_VLM_HITL = hitl
+    """Set VLM mode flags via the runtime override globals.
+
+    Note: vlm_hitl() now always returns True (collaboration requires visual
+    access). The `hitl` parameter is retained for call-site compatibility
+    with legacy test cases but has no effect — when False, the test case
+    is exercising a state that is no longer reachable in production.
+    """
+    _ = hitl  # legacy: vlm_hitl is always on now
     hitl_mod._RUNTIME_VLM_AUTONOMOUS = auto
     hitl_mod._RUNTIME_VLM_RETENTION_MAX = cap
 
@@ -695,8 +701,7 @@ check(
 )
 
 
-# Cleanup runtime overrides
-hitl_mod._RUNTIME_VLM_HITL = None
+# Cleanup runtime overrides (vlm_hitl is no longer toggleable — always True).
 hitl_mod._RUNTIME_VLM_AUTONOMOUS = None
 hitl_mod._RUNTIME_VLM_RETENTION_MAX = None
 

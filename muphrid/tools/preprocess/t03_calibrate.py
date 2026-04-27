@@ -59,7 +59,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
-from muphrid.tools._siril import run_siril_script
+from muphrid.tools._siril import run_siril_script, siril_script_path
 
 
 # ── Shared schema ──────────────────────────────────────────────────────────────
@@ -99,7 +99,16 @@ class CosmeticCorrectionOptions(BaseModel):
 # ── Output parsing ─────────────────────────────────────────────────────────────
 
 def _parse_calibrate_output(stdout: str) -> tuple[int, int]:
-    """Return (calibrated_count, bad_pixel_count) from Siril stdout."""
+    """
+    Return (calibrated_count, bad_pixel_count) from Siril stdout.
+
+    Note: Siril's exact wording for the per-image calibration line varies
+    across versions, datasets, and locales, so callers must NOT rely on
+    `calibrated_count` from this function as ground truth for whether
+    calibration succeeded — they should count the actual output FITS files
+    on disk instead. The stdout-parsed count is kept as a supplementary
+    diagnostic for when it happens to match.
+    """
     cal_match = re.search(r"(\d+)\s+(?:image[s]?\s+)?calibrated", stdout, re.IGNORECASE)
     calibrated = int(cal_match.group(1)) if cal_match else 0
 
@@ -109,6 +118,47 @@ def _parse_calibrate_output(stdout: str) -> tuple[int, int]:
     bad_pixels = int(pixel_match.group(1)) if pixel_match else 0
 
     return calibrated, bad_pixels
+
+
+def _count_calibrated_files(working_dir: Path, calibrated_seq: str) -> int:
+    """
+    Ground-truth success check: count the per-frame output FITS files Siril
+    wrote for the calibrated sequence.
+
+    Siril `calibrate <seq>` produces `pp_<seq>_00001.fit`, `pp_<seq>_00002.fit`,
+    etc., plus a `pp_<seq>.seq` sequence index. Counting the per-frame FITS
+    files is invariant across Siril versions and stdout phrasing — if Siril
+    actually did the work, these files exist; if it failed, they do not.
+
+    The fitseq mode produces a single consolidated `pp_<seq>.fit` file
+    instead of per-frame files. We handle both cases.
+    """
+    wd = Path(working_dir)
+    # Per-frame layout (default): pp_<seq>_NNNNN.fit or .fits
+    per_frame = sorted(wd.glob(f"{calibrated_seq}_*.fit")) + sorted(
+        wd.glob(f"{calibrated_seq}_*.fits")
+    )
+    if per_frame:
+        return len(per_frame)
+
+    # fitseq layout: a single consolidated file — probe the sequence index
+    # file. The `.seq` file's `I <n>` line records frame count, but reading
+    # the consolidated FITS extension count is more direct and ties success
+    # to the data, not the index.
+    from astropy.io import fits as _fits
+    consolidated = wd / f"{calibrated_seq}.fit"
+    if not consolidated.exists():
+        consolidated = wd / f"{calibrated_seq}.fits"
+    if consolidated.exists():
+        try:
+            with _fits.open(str(consolidated)) as hdul:
+                # Primary HDU is typically empty; count image-bearing HDUs.
+                return sum(1 for hdu in hdul if hdu.data is not None and hdu.data.size > 0)
+        except Exception:
+            # Existence alone is a weaker positive signal. Fall through.
+            return 1
+
+    return 0
 
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
@@ -168,23 +218,29 @@ def calibrate(
 
     parts: list[str] = ["calibrate", lights_sequence]
 
+    # Siril's script tokenizer splits on whitespace BEFORE honoring quotes,
+    # so quoting paths that contain spaces does not work. siril_script_path
+    # sidesteps the issue by handing Siril a relative name (master files
+    # live inside working_dir) or an auto-created symlink in working_dir.
+    # The "=<expression>" branch preserves Siril's synthetic-bias syntax
+    # (e.g. -bias="=2048"), which is a value, not a path.
     if master_bias:
         if master_bias.startswith("="):
             parts.append(f'-bias="{master_bias}"')
         else:
-            parts.append(f"-bias={master_bias}")
+            parts.append(f"-bias={siril_script_path(master_bias, working_dir)}")
 
     if master_dark:
-        parts.append(f"-dark={master_dark}")
+        parts.append(f"-dark={siril_script_path(master_dark, working_dir)}")
 
     if master_flat:
-        parts.append(f"-flat={master_flat}")
+        parts.append(f"-flat={siril_script_path(master_flat, working_dir)}")
 
     cc = cosmetic_correction
     if cc.method == "dark" and master_dark:
         parts.append(f"-cc=dark {cc.cold_sigma} {cc.hot_sigma}")
     elif cc.method == "bpm" and cc.bpm_file:
-        parts.append(f"-cc=bpm {cc.bpm_file}")
+        parts.append(f"-cc=bpm {siril_script_path(cc.bpm_file, working_dir)}")
 
     if is_cfa:
         parts.append("-cfa")
@@ -203,14 +259,51 @@ def calibrate(
     calibrate_cmd = " ".join(parts)
     result = run_siril_script([calibrate_cmd], working_dir=working_dir, timeout=600)
 
-    calibrated, bad_pixels = _parse_calibrate_output(result.stdout)
+    # Stdout parse stays as a supplementary diagnostic — NOT the source of
+    # truth for success. Siril's per-image wording varies across versions and
+    # the previous implementation leaked those variances straight into the
+    # agent as `calibrated_count: 0`, which looked indistinguishable from a
+    # genuine failure and triggered retry loops (see: Cocoon Nebula run).
+    calibrated_from_stdout, bad_pixels = _parse_calibrate_output(result.stdout)
 
     calibrated_seq = f"pp_{lights_sequence}"
+
+    # Ground truth: count the FITS files Siril actually produced. This is
+    # invariant across Siril versions, locales, and per-frame output modes.
+    wd = Path(working_dir)
+    actual_count = _count_calibrated_files(wd, calibrated_seq)
+
+    if actual_count == 0:
+        # Nothing on disk — Siril really did not produce output. Raise with
+        # enough context (stdout tail + reconstructed command) so the agent
+        # can reason about the failure instead of blindly retrying.
+        tail = result.stdout[-1200:] if result.stdout else "<empty>"
+        raise RuntimeError(
+            f"calibrate: Siril produced no calibrated files matching "
+            f"'{calibrated_seq}*' in {working_dir}. The calibrate command did "
+            f"not write per-frame outputs OR a consolidated fitseq. Check the "
+            f"masters, input sequence integrity, and Siril stderr. "
+            f"Command: {calibrate_cmd}\n"
+            f"Stdout tail:\n{tail}"
+        )
+
+    # Cross-check: if stdout reported a different count than what landed on
+    # disk, surface the discrepancy as an informational note rather than an
+    # error. The disk count is authoritative; the stdout value is kept so
+    # the agent can see the regex/Siril-wording drift if it ever matters.
+    count_mismatch_note: str | None = None
+    if calibrated_from_stdout and calibrated_from_stdout != actual_count:
+        count_mismatch_note = (
+            f"Siril stdout reported {calibrated_from_stdout} calibrated images "
+            f"but {actual_count} output files were written. Using the disk "
+            f"count as authoritative."
+        )
 
     summary = {
         "calibrated_sequence": calibrated_seq,
         "lights_sequence": lights_sequence,
-        "calibrated_count": calibrated,
+        "calibrated_count": actual_count,
+        "calibrated_count_from_stdout": calibrated_from_stdout,
         "bad_pixels_corrected": bad_pixels,
         "masters_applied": {
             "bias": master_bias,
@@ -227,6 +320,8 @@ def calibrate(
         },
         "siril_command": calibrate_cmd,
     }
+    if count_mismatch_note:
+        summary["note"] = count_mismatch_note
 
     return Command(update={
         "paths": {**state["paths"], "calibrated_sequence": calibrated_seq},
