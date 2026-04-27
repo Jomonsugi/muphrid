@@ -1,22 +1,18 @@
 """
 T25 — create_mask
 
-Generate a single-channel FITS mask (pixel values 0.0–1.0) from the working
-image based on luminance range, tonal window, or channel difference. Masks
-confine subsequent processing to specific image regions.
+Generate a single-channel FITS mask (float32 values in [0, 1]) from the
+working image. Masks are statistical (luminance / tonal range / channel
+difference), spatial (rectangle / polygon / ellipse regions), or a
+combination of both.
 
-This tool is the prerequisite for all targeted processing in the pipeline.
-Without masks, every tool applies globally and risks degrading regions it
-should not touch.
-
-Masked-application pattern (the standard three-step sequence):
-  1. [T25 create_mask]        → mask.fits
-  2. [processing tool, any T] → processed.fits  (applied globally)
-  3. [T23 pixel_math]         "$processed$ * $mask$ + $original$ * (1 - $mask$)"
-                              → targeted_result.fits
+The mask is written as a separate FITS file under working_dir and the
+path is recorded in paths.latest_mask. The current image is not modified;
+applying the mask is done via pixel_math or via the masked_process
+compound tool.
 
 Backend: Pure Python — scikit-image + Astropy. No Siril invocation.
-All I/O via astropy.io.fits so FITS remains the single source of truth.
+All I/O via astropy.io.fits.
 """
 
 from __future__ import annotations
@@ -33,6 +29,8 @@ from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
+from skimage.draw import ellipse as sk_ellipse
+from skimage.draw import polygon as sk_polygon
 from skimage.filters import gaussian
 from skimage.morphology import binary_dilation, binary_erosion, diamond, disk, square
 
@@ -67,8 +65,29 @@ class ChannelDiffOptions(BaseModel):
     threshold: float = Field(
         default=0.01,
         description=(
-            "Minimum difference (channel_a - channel_b) to include in mask. "
-            "channel_a=R, channel_b=B, threshold=0.05 isolates H-alpha emission."
+            "Minimum value of (channel_a − channel_b) for a pixel to be "
+            "included in the mask."
+        ),
+    )
+
+
+class RegionSpec(BaseModel):
+    """A spatial region constraint applied alongside the statistical mask."""
+
+    shape: str = Field(
+        description=(
+            "Geometric primitive: 'rectangle', 'polygon', or 'ellipse'. "
+            "Determines how `coords` is interpreted."
+        ),
+    )
+    coords: list[float] = Field(
+        description=(
+            "Pixel coordinates in the source image. Origin is top-left, x "
+            "increases right, y increases down. Format depends on shape:\n"
+            "  rectangle: [x0, y0, x1, y1] (any opposite corners)\n"
+            "  polygon:   [x0, y0, x1, y1, x2, y2, ...] (≥3 vertices, "
+            "even total count)\n"
+            "  ellipse:   [center_x, center_y, radius_x, radius_y]"
         ),
     )
 
@@ -76,15 +95,15 @@ class ChannelDiffOptions(BaseModel):
 class CreateMaskInput(BaseModel):
     mask_type: str = Field(
         description=(
-            "Type of mask to generate:\n"
-            "  'luminance': bright pixels=1, dark=0. Use to protect stars or "
-            "                target bright nebula cores.\n"
-            "  'inverted_luminance': dark pixels=1, bright=0. Use to target "
-            "                        faint nebulosity or protect sky from saturation.\n"
-            "  'range': pixels within [low, high] tonal window=1. Isolates "
-            "           midtone nebulosity (e.g. low=0.2, high=0.7).\n"
-            "  'channel_diff': where channel_a > channel_b + threshold. "
-            "                  Isolates Ha emission (R>B), OIII (B>R)."
+            "Type of statistical mask:\n"
+            "  'luminance': mask=1 where luminance ∈ [low, high], else 0.\n"
+            "  'inverted_luminance': mask=0 where luminance ∈ [low, high], "
+            "else 1.\n"
+            "  'range': mask=1 where the chosen channel value ∈ [low, high], "
+            "else 0.\n"
+            "  'channel_diff': mask=1 where (channel_a − channel_b) ≥ "
+            "threshold, else 0.\n"
+            "Combined with `region_spec` (when provided) per `region_combine`."
         )
     )
     luminance_options: LuminanceOptions = Field(
@@ -99,76 +118,95 @@ class CreateMaskInput(BaseModel):
         default_factory=lambda: ChannelDiffOptions(channel_a="R", channel_b="B"),
         description="Used when mask_type is 'channel_diff'.",
     )
+    region_spec: RegionSpec | None = Field(
+        default=None,
+        description=(
+            "Optional spatial region constraint. When provided, a binary "
+            "region mask is built from `region_spec.shape` and `coords` and "
+            "combined with the statistical mask via `region_combine` before "
+            "morphology and feathering. None = no spatial constraint."
+        ),
+    )
+    region_combine: str = Field(
+        default="and",
+        description=(
+            "How the region mask combines with the statistical mask. "
+            "'and': pixel must be in both (intersection). "
+            "'or': pixel in either (union). "
+            "'subtract': pixel in statistical AND NOT in region "
+            "(removes the region from the statistical selection). "
+            "Ignored when region_spec is None."
+        ),
+    )
     feather_radius: float = Field(
         default=5.0,
         description=(
-            "Gaussian blur radius (sigma) applied to mask edges. "
-            "Always > 0 to prevent hard-edged banding in blended results. "
-            "5px: conservative (stars, fine detail). 15–30px: large-scale regions."
+            "Gaussian blur sigma in pixels, applied to the binary mask to "
+            "soften edges before write. 0 disables feathering and writes a "
+            "hard-edged binary mask. Larger values widen the transition zone."
         ),
     )
     feather_truncate: float = Field(
         default=4.0,
         description=(
-            "Truncate the Gaussian filter at this many standard deviations. "
-            "4.0: default, smooth tail. 2.0: faster, sharper cutoff. "
-            "Higher values extend the transition zone but cost more compute."
+            "Number of standard deviations at which the Gaussian filter is "
+            "truncated. Smaller values cut off the tail sooner (sharper edge "
+            "transition); larger values keep more of the tail at higher "
+            "compute cost."
         ),
     )
     feather_mode: str = Field(
         default="nearest",
         description=(
-            "Boundary handling for the Gaussian feather filter. "
-            "'nearest': extend edge pixels (default, good for most masks). "
-            "'reflect': mirror at boundary. 'constant': pad with zeros. 'wrap': periodic."
+            "Boundary handling for the Gaussian filter. "
+            "'nearest' extends edge pixel values; 'reflect' mirrors at the "
+            "boundary; 'constant' pads with zeros; 'wrap' is periodic."
         ),
     )
     expand_px: int = Field(
         default=0,
         description=(
-            "Structuring element radius for morphological dilation before "
-            "feathering. Use 5 on a star mask to ensure halos are included."
+            "Morphological dilation footprint radius in pixels, applied "
+            "before feathering. 0 = no dilation. Grows the mask outward."
         ),
     )
     contract_px: int = Field(
         default=0,
         description=(
-            "Structuring element radius for morphological erosion before "
-            "feathering. Use to tighten a mask bleeding into adjacent regions."
+            "Morphological erosion footprint radius in pixels, applied "
+            "before feathering. 0 = no erosion. Shrinks the mask inward."
         ),
     )
     morphology_iterations: int = Field(
         default=1,
         description=(
-            "Number of times to repeat dilation/erosion. "
-            "expand_px=2, iterations=3 gives a very different result from "
-            "expand_px=6, iterations=1 — repeated small operations are rounder, "
-            "single large operations follow the footprint shape more strictly."
+            "Number of times the dilation+erosion pass is applied. "
+            "Repeated small operations produce rounder boundaries than a "
+            "single pass with the equivalent total footprint."
         ),
     )
     structuring_element: str = Field(
         default="disk",
         description=(
-            "Shape of the morphological footprint for expand/contract. "
-            "'disk': circular (default, isotropic). "
-            "'square': axis-aligned box. "
-            "'diamond': 45° rotated square (Manhattan distance ball)."
+            "Shape of the morphological footprint for dilation and erosion. "
+            "'disk': circular (isotropic). "
+            "'square': axis-aligned. "
+            "'diamond': 45° rotated square (Manhattan-distance ball)."
         ),
     )
     luminance_model: str = Field(
         default="rec709",
         description=(
-            "Luminance weighting for mask computation. "
-            "'rec709': standard Rec.709 weights (0.2126R + 0.7152G + 0.0722B). "
-            "'equal': equal weight (R+G+B)/3. "
-            "'max': per-pixel max(R,G,B) — captures any channel being bright."
+            "Per-pixel luminance computation. "
+            "'rec709': Rec.709 weights (0.2126R + 0.7152G + 0.0722B). "
+            "'equal': (R + G + B) / 3. "
+            "'max': max(R, G, B) per pixel."
         ),
     )
     invert: bool = Field(
         default=False,
         description=(
-            "Invert the final mask (0→1, 1→0). Apply after feathering. "
-            "Alternative to using 'inverted_luminance' directly."
+            "Invert the final mask (0 ↔ 1) after morphology and feathering."
         ),
     )
     output_stem: str | None = Field(
@@ -218,6 +256,82 @@ def _channel_by_name(name: str, r, g, b, lum) -> np.ndarray:
     return ch
 
 
+def _build_region_mask(
+    region_spec: RegionSpec,
+    image_shape: tuple[int, int],
+) -> np.ndarray:
+    """
+    Rasterize a RegionSpec into a (H, W) bool mask.
+
+    Coordinates use top-left origin: x→right, y→down. skimage.draw uses
+    (row, col) = (y, x), which we translate when calling the primitives.
+    Coordinates outside image bounds are clipped silently.
+    """
+    h, w = image_shape
+    mask = np.zeros((h, w), dtype=bool)
+    shape = region_spec.shape.lower()
+    coords = region_spec.coords
+
+    if shape == "rectangle":
+        if len(coords) != 4:
+            raise ValueError(
+                f"rectangle region coords must be [x0, y0, x1, y1]; "
+                f"got {len(coords)} values."
+            )
+        x0, y0, x1, y1 = coords
+        x0i, x1i = sorted([int(max(0, min(w, x0))), int(max(0, min(w, x1)))])
+        y0i, y1i = sorted([int(max(0, min(h, y0))), int(max(0, min(h, y1)))])
+        mask[y0i:y1i, x0i:x1i] = True
+
+    elif shape == "polygon":
+        if len(coords) < 6 or len(coords) % 2 != 0:
+            raise ValueError(
+                f"polygon region coords must be [x0, y0, x1, y1, ...] with "
+                f"≥3 vertices (≥6 even-count values); got {len(coords)}."
+            )
+        xs = coords[0::2]
+        ys = coords[1::2]
+        rr, cc = sk_polygon(np.array(ys), np.array(xs), shape=(h, w))
+        mask[rr, cc] = True
+
+    elif shape == "ellipse":
+        if len(coords) != 4:
+            raise ValueError(
+                f"ellipse region coords must be "
+                f"[center_x, center_y, radius_x, radius_y]; "
+                f"got {len(coords)} values."
+            )
+        cx, cy, rx, ry = coords
+        rr, cc = sk_ellipse(cy, cx, ry, rx, shape=(h, w))
+        mask[rr, cc] = True
+
+    else:
+        raise ValueError(
+            f"Unknown region shape '{region_spec.shape}'. "
+            "Valid: rectangle, polygon, ellipse."
+        )
+
+    return mask
+
+
+def _combine_masks(
+    stat_mask: np.ndarray,
+    region_mask: np.ndarray,
+    mode: str,
+) -> np.ndarray:
+    """Combine the statistical and region binary masks per `mode`."""
+    m = mode.lower()
+    if m == "and":
+        return stat_mask & region_mask
+    if m == "or":
+        return stat_mask | region_mask
+    if m == "subtract":
+        return stat_mask & ~region_mask
+    raise ValueError(
+        f"Unknown region_combine '{mode}'. Valid: and, or, subtract."
+    )
+
+
 def _build_binary_mask(
     mask_type: str,
     lum: np.ndarray,
@@ -262,6 +376,8 @@ def create_mask(
     luminance_options: LuminanceOptions | None = None,
     range_options: RangeOptions | None = None,
     channel_diff_options: ChannelDiffOptions | None = None,
+    region_spec: RegionSpec | None = None,
+    region_combine: str = "and",
     feather_radius: float = 5.0,
     feather_truncate: float = 4.0,
     feather_mode: str = "nearest",
@@ -276,21 +392,24 @@ def create_mask(
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
     """
-    Generate a float32 FITS mask (values 0.0–1.0) for targeted processing.
+    Generate a float32 FITS mask (values in [0, 1]) from the working image.
 
-    Mask type guide:
-    - 'luminance': bright=1, dark=0. Protect stars during noise reduction;
-      target bright nebula cores for subtle curves adjustment.
-    - 'inverted_luminance': dark=1, bright=0. Target faint nebulosity for
-      saturation/sharpness; keep dark sky from being affected.
-    - 'range': pixels in [low, high] range=1. Midtone nebulosity isolation:
-      low=0.2, high=0.7 selects the nebula without stars or pure sky.
-    - 'channel_diff': channel_a > channel_b + threshold. Use R>B to isolate
-      Hα emission; B>R for OIII; G>R for OIII in narrowband mapped images.
+    Statistical mask types (selected via `mask_type`):
+      - luminance / inverted_luminance: gate on luminance value
+      - range: gate on a chosen channel within a value window
+      - channel_diff: gate on signed difference between two channels
 
-    The mask is saved as a single-channel float32 FITS. Use in pixel_math
-    to confine any processing to a specific tonal region:
-    "$processed$ * $mask$ + $original$ * (1 - $mask$)"
+    When `region_spec` is provided, a spatial region (rectangle, polygon,
+    or ellipse) is rasterized and combined with the statistical mask per
+    `region_combine` ('and' / 'or' / 'subtract').
+
+    Pipeline order: statistical mask → region combine (if any) → morphology
+    (dilate/erode × iterations) → feather (Gaussian) → optional invert.
+
+    The result is written to working_dir as a single-channel FITS and the
+    path is recorded in paths.latest_mask. The current image is not
+    modified — apply the mask via pixel_math or via the masked_process
+    compound tool.
     """
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"]["current_image"]
@@ -314,6 +433,14 @@ def create_mask(
         mask_type, lum, r, g, b,
         luminance_options, range_options, channel_diff_options,
     )
+
+    # Spatial region combine — applied to the binary statistical mask
+    # before morphology so dilate/erode + feather operate on the final
+    # combined selection (the typical desire — soften the edge of where
+    # both constraints intersect).
+    if region_spec is not None:
+        region_mask = _build_region_mask(region_spec, binary.shape)
+        binary = _combine_masks(binary, region_mask, region_combine)
 
     for _ in range(morphology_iterations):
         if expand_px > 0:
@@ -347,7 +474,7 @@ def create_mask(
     mask_min = float(np.min(mask))
     mask_max = float(np.max(mask))
 
-    summary = {
+    summary: dict = {
         "output_path": str(mask_output_path),
         "mask_type": mask_type,
         "source_image": str(image_path),
@@ -367,6 +494,12 @@ def create_mask(
             "invert": invert,
         },
     }
+    if region_spec is not None:
+        summary["region"] = {
+            "shape": region_spec.shape,
+            "coords": list(region_spec.coords),
+            "combine": region_combine,
+        }
 
     return Command(update={
         "paths": {**state["paths"], "latest_mask": str(mask_output_path)},

@@ -63,6 +63,8 @@ from muphrid.tools.utility.t29_resolve_target import resolve_target
 from muphrid.tools.utility.t30_advance_phase import advance_phase
 from muphrid.tools.utility.t31_commit_variant import commit_variant
 from muphrid.tools.utility.t32_present_images import present_images
+from muphrid.tools.utility.t34_masked_process import masked_process
+from muphrid.tools.utility.t35_hdr_composite import hdr_composite
 from muphrid.tools.utility.t36_rewind_phase import rewind_phase
 from muphrid.tools.utility.t37_flag_dataset_issue import flag_dataset_issue
 
@@ -78,6 +80,8 @@ UTILITY_TOOLS = [
     advance_phase,
     rewind_phase,
     flag_dataset_issue,
+    masked_process,
+    hdr_composite,
     commit_variant,
     present_images,
     # analyze_frames and create_mask used to live in ANALYSIS and NONLINEAR
