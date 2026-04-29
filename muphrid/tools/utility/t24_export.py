@@ -1,7 +1,32 @@
 """
-T24 — export_final
+T24 — export_final + commit_export
 
 Export the finished image in distribution-ready formats with ICC color profiles.
+
+Source-profile selection is driven by `state.metadata.image_space` — the
+authoritative render-state contract. When image_space="display" the source
+profile is sRGB (data is already gamma-encoded after stretch); when
+image_space="linear" it is sRGBlinear (Siril applies gamma on convert).
+The `metrics.is_linear_estimate` heuristic is NOT consulted — the human
+might have approved a stretched variant whose heuristic happened to read
+as linear, and binding the export to the heuristic would write a different
+artifact than what was approved. State authority means state, full stop;
+the heuristic stays diagnostic.
+
+Tentative-export pattern (when the T24_export HITL gate is enabled):
+
+  1. export_final runs with `tentative=True` (the agent flips this when
+     the gate is on; otherwise it defaults to False / direct export).
+     Files are written to `<output_dir>/.tentative_<stem>/`.
+  2. The tool emits a ReviewSession proposal whose visual_path points
+     at the actual rendered JPG export (the artifact the human will
+     ultimately see — not a FITS-derived auto-preview).
+  3. The HITL gate fires; the human approves the proposal.
+  4. The agent calls commit_export, which moves the tentative files
+     into the canonical export_dir and clears state.metadata.tentative_export.
+
+When the gate is disabled (autonomous), export_final writes directly
+to the export_dir with no tentative staging.
 
 Siril commands (verified against Siril 1.4 CLI docs):
     icc_assign profile               — Built-ins: sRGB, sRGBlinear, Rec2020,
@@ -146,11 +171,31 @@ class ExportFinalInput(BaseModel):
         default=None,
         description="Directory for exported files. Defaults to working_dir/export/.",
     )
-    source_profile: str = Field(
-        default="sRGBlinear",
+    source_profile: str | None = Field(
+        default=None,
         description=(
             "ICC profile to assign to the input FITS before converting. "
-            "Can be a built-in name or a path to an external ICC file."
+            "If None (default), the source profile is derived from "
+            "state.metadata.image_space — 'sRGB' for display-space data "
+            "(post-stretch) or 'sRGBlinear' for linear data. State is the "
+            "authoritative contract; explicit override is for unusual "
+            "workflows (e.g. importing pre-color-managed TIFs). "
+            "Built-in names: sRGB, sRGBlinear, Rec2020, Rec2020linear, "
+            "working, linear, graysrgb, grayrec2020, graylinear. May also "
+            "be an absolute path to an external ICC file."
+        ),
+    )
+    tentative: bool = Field(
+        default=False,
+        description=(
+            "When True, write export artifacts to "
+            "<output_dir>/.tentative_<stem>/ and record their paths in "
+            "state.metadata.tentative_export so the HITL gate can present "
+            "the actual rendered JPG before committing. The agent should "
+            "set this when the T24_export HITL gate is enabled. After "
+            "human approval, call commit_export to move the tentative "
+            "files into output_dir. When False (autonomous), files go "
+            "directly into output_dir."
         ),
     )
 
@@ -234,7 +279,8 @@ def _export_one(
 def export_final(
     formats: list[FormatSpec] | None = None,
     output_dir: str | None = None,
-    source_profile: str = "sRGBlinear",
+    source_profile: str | None = None,
+    tentative: bool = False,
     tool_call_id: Annotated[str, InjectedToolCallId] = None,
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
@@ -258,17 +304,46 @@ def export_final(
     absolute paths to external ICC/ICM files for AdobeRGB or custom profiles.
 
     For mono images, use gray profiles: graysrgb, grayrec2020, graylinear.
+
+    Source-profile selection: by default, derived from state.metadata.image_space
+    (the authoritative render-state contract). 'display' → sRGB; 'linear' →
+    sRGBlinear. State is refused if missing or invalid — the heuristic
+    `metrics.is_linear_estimate` is no longer consulted because it can
+    disagree with the artifact the human approved. Override `source_profile`
+    explicitly only for unusual workflows.
+
+    Tentative mode: when `tentative=True`, files are written to
+    <output_dir>/.tentative_<stem>/ and recorded in
+    state.metadata.tentative_export. Use with the T24_export HITL gate so
+    the human reviews the rendered JPG, then call commit_export to move
+    the tentative files into output_dir.
     """
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"]["current_image"]
 
-    # Auto-detect source profile from image linearity when the caller used
-    # the default.  After stretching the data is non-linear — assigning
-    # sRGBlinear would re-apply gamma on top of the stretch, washing out
-    # the image.  sRGB tells Siril the data is already gamma-encoded.
-    is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
-    if source_profile == "sRGBlinear" and not is_linear:
-        source_profile = "sRGB"
+    # State authority: source_profile is selected from image_space, not the
+    # diagnostic heuristic. Refuse if state is missing/invalid — exporting
+    # against an unknown source profile would silently produce a
+    # mis-rendered artifact (sRGBlinear on a stretched image re-applies
+    # gamma and washes the image out; sRGB on linear data clips the
+    # shadows). See Metadata.image_space and CLAUDE.md.
+    incoming_image_space = state.get("metadata", {}).get("image_space")
+    if incoming_image_space not in ("linear", "display"):
+        raise RuntimeError(
+            "export_final: state.metadata.image_space is missing or invalid "
+            f"(got {incoming_image_space!r}). The export needs the "
+            "authoritative render-state to choose the correct ICC source "
+            "profile. Every writer of paths.current_image must also write "
+            "metadata.image_space (enforced by the registry drift check). "
+            "This looks like a legacy checkpoint or a writer that skipped "
+            "its bookkeeping. Refusing to guess — restart from a fresh "
+            "checkpoint."
+        )
+
+    if source_profile is None:
+        # display → sRGB (data already gamma-encoded by the stretch);
+        # linear → sRGBlinear (Siril applies gamma on convert).
+        source_profile = "sRGBlinear" if incoming_image_space == "linear" else "sRGB"
 
     if formats is None:
         formats = [FormatSpec(**f) for f in DEFAULT_FORMATS]
@@ -284,7 +359,18 @@ def export_final(
     export_dir.mkdir(parents=True, exist_ok=True)
 
     stem = img_path.stem
+
+    # Tentative writes land in a per-stem staging dir under export_dir.
+    # commit_export moves them into export_dir on approval. Disambiguating
+    # by stem keeps two parallel review cycles from clobbering each other
+    # (rare, but possible when the agent re-exports after revision).
+    if tentative:
+        write_dir = export_dir / f".tentative_{stem}"
+        write_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        write_dir = export_dir
     exported_files = []
+    jpg_preview_path: str | None = None
 
     for fmt in formats:
         output_stem = f"{stem}{fmt.filename_suffix}"
@@ -297,7 +383,7 @@ def export_final(
             source_profile=source_profile,
         )
 
-        final_path = export_dir / result_path.name
+        final_path = write_dir / result_path.name
         result_path.rename(final_path)
 
         file_size_mb = round(final_path.stat().st_size / (1024 * 1024), 2)
@@ -307,15 +393,151 @@ def export_final(
             "icc_profile": fmt.icc_profile,
             "file_size_mb": file_size_mb,
         })
+        # Keep the first JPG path for the HITL preview — the human reviews
+        # the actual rendered JPG, not a FITS-derived auto-stretch. If no
+        # JPG was requested, jpg_preview_path stays None and the gate uses
+        # the FITS preview as a fallback (still better than a mock path).
+        if jpg_preview_path is None and fmt.type.lower() == "jpg":
+            jpg_preview_path = str(final_path)
+
+    summary: dict = {
+        "exported_files": exported_files,
+        "image_space": incoming_image_space,
+        "source_profile": source_profile,
+        "tentative": tentative,
+        "preview_jpg": jpg_preview_path,
+    }
+    # Surface the JPG (when present) as both output_path and preview_path
+    # so the HITL gate's variant-snapshot logic can pick up THE actual
+    # rendered artifact and present it to the human, not a FITS-derived
+    # auto-stretched preview. nodes._extract_variant_paths probes
+    # _VARIANT_FILE_KEYS in priority order; output_path is first.
+    if jpg_preview_path is not None:
+        summary["output_path"] = jpg_preview_path
+        summary["preview_path"] = jpg_preview_path
+
+    metadata_delta: dict = {
+        "image_space": incoming_image_space,
+        "export_done": not tentative,
+    }
+    if tentative:
+        metadata_delta["tentative_export"] = {
+            "stem": stem,
+            "write_dir": str(write_dir),
+            "final_dir": str(export_dir),
+            "exported_files": exported_files,
+            "preview_jpg": jpg_preview_path,
+        }
+    else:
+        # Direct (non-tentative) export — populate exported_files and clear
+        # any lingering tentative_export from a prior aborted gate.
+        metadata_delta["exported_files"] = exported_files
+        metadata_delta["tentative_export"] = None
+
+    return Command(update={
+        "metadata": metadata_delta,
+        "messages": [ToolMessage(
+            content=json.dumps(summary, indent=2),
+            tool_call_id=tool_call_id,
+        )],
+    })
+
+
+# ── commit_export tool ────────────────────────────────────────────────────────
+
+class CommitExportInput(BaseModel):
+    note: str | None = Field(
+        default=None,
+        description=(
+            "Optional human-supplied note recorded with the commit, e.g. "
+            "the rationale for accepting this export. Has no functional "
+            "effect; preserved in the tool message for audit."
+        ),
+    )
+
+
+@tool(args_schema=CommitExportInput)
+def commit_export(
+    note: str | None = None,
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
+    """
+    Promote a tentative export to its final destination.
+
+    Reads `state.metadata.tentative_export` (set by `export_final(tentative=True)`),
+    moves each tentative file from the staging directory into the canonical
+    export_dir, removes the empty staging directory, and clears the
+    tentative_export marker. Sets `metadata.export_done=True` and
+    `metadata.exported_files` to the final paths.
+
+    Refuses if no tentative_export is present — the caller must run
+    export_final(tentative=True) first. Refuses if any tentative file is
+    missing on disk (would-be silent data loss otherwise). Idempotent
+    against partial moves: if a tentative file's destination already
+    exists with the same content, the move is treated as already-complete.
+    """
+    metadata = state.get("metadata", {}) or {}
+    tentative = metadata.get("tentative_export")
+    if not isinstance(tentative, dict):
+        raise RuntimeError(
+            "commit_export: state.metadata.tentative_export is not set. "
+            "Run export_final(tentative=True) first to produce a staged "
+            "export, then call commit_export after the human approves."
+        )
+
+    write_dir = Path(tentative["write_dir"])
+    final_dir = Path(tentative["final_dir"])
+    final_dir.mkdir(parents=True, exist_ok=True)
+
+    moved: list[dict] = []
+    for entry in tentative.get("exported_files", []):
+        src = Path(entry["path"])
+        if not src.exists():
+            raise FileNotFoundError(
+                f"commit_export: tentative file missing at commit time: {src}. "
+                "Refusing to silently complete a partial export — investigate "
+                "before retrying."
+            )
+        dst = final_dir / src.name
+        if dst.exists() and dst.resolve() == src.resolve():
+            # Already in place (e.g. write_dir == final_dir for some reason).
+            moved_entry = dict(entry)
+            moved.append(moved_entry)
+            continue
+        if dst.exists():
+            # Conservative: don't clobber an unrelated final-dir file.
+            raise FileExistsError(
+                f"commit_export: destination already exists and is not the "
+                f"tentative source: {dst}. Resolve manually before retrying."
+            )
+        src.rename(dst)
+        moved_entry = dict(entry)
+        moved_entry["path"] = str(dst)
+        moved.append(moved_entry)
+
+    # Best-effort cleanup of the empty staging directory.
+    try:
+        if write_dir.exists() and not any(write_dir.iterdir()):
+            write_dir.rmdir()
+    except OSError:
+        # Non-fatal: leftover staging dir is mildly untidy, not a data risk.
+        pass
+
+    summary = {
+        "committed_files": moved,
+        "final_dir": str(final_dir),
+        "note": note,
+    }
 
     return Command(update={
         "metadata": {
-            **state["metadata"],
             "export_done": True,
-            "exported_files": exported_files,
+            "exported_files": moved,
+            "tentative_export": None,
         },
         "messages": [ToolMessage(
-            content=json.dumps({"exported_files": exported_files}, indent=2),
+            content=json.dumps(summary, indent=2),
             tool_call_id=tool_call_id,
         )],
     })

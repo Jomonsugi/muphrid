@@ -148,6 +148,10 @@ def remove_green_noise(
     }
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(output_path)},
+        "paths": {"current_image": str(output_path)},
+        # SCNR/rmgreen rebalances per-channel pixel values; the operation
+        # runs in linear space (it must, before stretch) and produces
+        # linear output. See Metadata.image_space.
+        "metadata": {"image_space": "linear"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

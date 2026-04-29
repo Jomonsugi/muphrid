@@ -109,13 +109,6 @@ class Settings:
     langchain_api_key: str
     langchain_project: str
 
-    # Long-term memory
-    memory_enabled: bool
-    memory_db_path: str
-    memory_embedding_provider: str  # "ollama" | "fastembed"
-    memory_embedding_model: str
-    memory_rebuild_embeddings: bool  # one-shot flag for model migration
-
 
 # ── Per-model defaults ─────────────────────────────────────────────────────────
 # Each model has correct temperature and thinking mode settings baked in.
@@ -214,10 +207,6 @@ def load_settings() -> Settings:
         if project:
             os.environ["LANGCHAIN_PROJECT"] = project
 
-    # Memory
-    memory_env = _optional("MEMORY_ENABLED", "")
-    memory_enabled = memory_env.lower() == "true" if memory_env else _pcfg("memory", "enabled", False)
-
     return Settings(
         llm_provider=provider,
         llm_model=model,
@@ -234,18 +223,6 @@ def load_settings() -> Settings:
         langchain_tracing=tracing,
         langchain_api_key=_optional("LANGCHAIN_API_KEY"),
         langchain_project=_optional("LANGCHAIN_PROJECT", "") or _pcfg("tracing", "project", "muphrid"),
-        memory_enabled=memory_enabled,
-        memory_db_path=_optional("MEMORY_DB_PATH", "") or _pcfg("memory", "db_path", str(Path.home() / ".muphrid" / "memory.db")),
-        memory_embedding_provider=(
-            _optional("MEMORY_EMBEDDING_PROVIDER", "")
-            or _pcfg("memory", "embedding_provider", "ollama")
-        ),
-        memory_embedding_model=_optional("MEMORY_EMBEDDING_MODEL", "") or _pcfg("memory", "embedding_model", "qwen3-embedding"),
-        memory_rebuild_embeddings=(
-            _optional("MEMORY_REBUILD_EMBEDDINGS", "").lower() == "true"
-            if _optional("MEMORY_REBUILD_EMBEDDINGS", "")
-            else _pcfg("memory", "rebuild_embeddings", False)
-        ),
     )
 
 

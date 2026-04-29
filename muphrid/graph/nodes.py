@@ -22,25 +22,24 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
+from muphrid.graph import review as review_ctl
 from muphrid.graph.hitl import (
     TOOL_TO_HITL,
     images_from_tool,
-    is_affirmative,
-    is_autonomous,
     is_enabled,
-    is_variant_approval,
-    parse_variant_approval,
     resolve_hitl_checkpoint,
     tool_cfg,
     vlm_autonomous,
     vlm_hitl,
+    vlm_phase_eligible,
     vlm_window_cap,
 )
 from muphrid.graph.content import image_blocks, text_content
+from muphrid.graph.prompts import HITL_PARTNER_FRAGMENT as _HITL_PARTNER_FRAGMENT
 from muphrid.graph.prompts import PHASE_PROMPTS as _PHASE_PROMPTS
 from muphrid.graph.prompts import SYSTEM_BASE as _SYSTEM_BASE
 from muphrid.graph.registry import all_tools, tools_for_phase
-from muphrid.graph.state import AstroState, HITLPayload, ProcessingPhase, Variant, VisualRef
+from muphrid.graph.state import AstroState, ProcessingPhase, Variant, VisualRef
 
 logger = logging.getLogger(__name__)
 
@@ -207,27 +206,92 @@ def _variants_to_refs(state: AstroState) -> list[VisualRef]:
     return refs
 
 
+def _current_image_ref(state: AstroState) -> VisualRef | None:
+    """
+    Build a VisualRef for the working image's preview, if eligible.
+
+    Auto-projection rules:
+      - The current phase must be in vlm_phase_eligible() — pre-stack phases
+        return None even when paths.current_image happens to point somewhere.
+      - state.paths.current_image must be set; the derived agent-VLM preview
+        (smaller sibling under <working_dir>/previews/) must exist on disk.
+      - We prefer the agent-sized VLM preview (`preview_<stem>_vlm.jpg`) when
+        present — produced at ~1024px / q=85 by t22_generate_preview alongside
+        the human-facing 1920px preview. If only the human preview exists, we
+        fall back to it rather than skipping (correctness over cost).
+
+    Returns None when any precondition fails. The caller decides what to do
+    in that case (typically: just don't include the working image).
+
+    This source projects the agent's qualitative anchor — the "what does the
+    image look like right now" complement to the analytical metrics. The
+    agent retains explicit visual affordances (present_images) regardless of
+    phase eligibility; this only governs the auto-injection.
+    """
+    phase = state.get("phase")
+    if not vlm_phase_eligible(phase):
+        return None
+
+    paths = state.get("paths") or {}
+    current_image = paths.get("current_image")
+    if not current_image:
+        return None
+
+    working_dir = (state.get("dataset") or {}).get("working_dir") or ""
+    stem = Path(current_image).stem
+    preview_dir = Path(working_dir) / "previews" if working_dir else None
+
+    chosen: Path | None = None
+    if preview_dir is not None:
+        vlm_preview = preview_dir / f"preview_{stem}_vlm.jpg"
+        human_preview = preview_dir / f"preview_{stem}.jpg"
+        if vlm_preview.exists():
+            chosen = vlm_preview
+        elif human_preview.exists():
+            chosen = human_preview
+
+    if chosen is None:
+        return None
+
+    phase_val = getattr(phase, "value", phase) or ""
+    return VisualRef(
+        path=str(chosen),
+        label="current working image",
+        source="current_image",
+        phase=str(phase_val),
+    )
+
+
 def _select_visible_refs(state: AstroState) -> list[VisualRef]:
     """
-    Pick the images the agent should see right now. Combines two state
-    sources:
+    Pick the images the agent should see right now. Four sources:
 
-      - state.variant_pool   → projected to VisualRefs at view-build time
-                                (the canonical store for active HITL variants)
-      - state.visual_context → present_images and phase_carry entries
+      - state.variant_pool   → projected to VisualRefs (active decision space
+                                during a HITL gate or sandwich-iteration in
+                                autonomous mode). Source label "hitl_variant".
+      - current_image        → auto-projected anchor produced by
+                                _current_image_ref(state) when vlm_phase_eligible.
+                                Source label "current_image".
+      - state.visual_context → present_images and phase_carry entries the
+                                agent has explicitly chosen to keep visible.
 
-    Mode dispatch:
-      - Both modes off → empty (no images at all)
-      - vlm_hitl only  → only the variant_pool projection. Outside an active
-                         gate variant_snapshot/promote_variant leave the pool
-                         empty, so this naturally returns nothing — no
-                         leakage between gates.
-      - vlm_autonomous (± vlm_hitl) → variant_pool projection + visual_context,
-                         capped to vlm_window_cap() from the newest end, with
-                         the gate-overflow exception: if the variant_pool alone
-                         exceeds the cap, show the full pool and drop other
-                         sources (so the human's referenced variant is always
-                         resolvable on the agent side).
+    Visibility:
+      - vlm_hitl is always True (collaboration requires visual access). The
+        active gate's variant pool is therefore always visible during HITL.
+      - vlm_autonomous controls auto-current-image and the visual_context
+        projection outside HITL. When False, the agent operates on metrics;
+        present_images returns an informative ToolMessage instead of silently
+        adding hidden context.
+
+    Cap: vlm_window_cap() applies to the combined set. The gate-overflow
+    exception remains — if the variant pool alone exceeds the cap, the pool
+    is shown in full and everything else (including the auto-current-image)
+    is dropped, so the human's referenced variant is always resolvable on
+    the agent side.
+
+    Order in the returned list (oldest → newest): visual_context entries,
+    then auto-current-image (anchor), then variant pool (active decision
+    space). The cap takes the newest tail when truncating.
     """
     hitl_on = vlm_hitl()
     auto_on = vlm_autonomous()
@@ -236,17 +300,27 @@ def _select_visible_refs(state: AstroState) -> list[VisualRef]:
 
     variant_refs = _variants_to_refs(state)
 
-    # Mode A: vlm_hitl only — show only active HITL variants from the pool.
-    # present_images / phase_carry entries require autonomous mode to be
-    # visible because they persist outside HITL conversations.
-    if hitl_on and not auto_on:
-        return variant_refs
+    # Auto-current-image is suppressed outside autonomous mode (would otherwise
+    # leak phase_carry-equivalent context across HITL gates without explicit
+    # agent action). HITL-only mode shows the variant pool plus whatever the
+    # gate brings in via state.visual_context.
+    auto_current: VisualRef | None = (
+        _current_image_ref(state) if auto_on else None
+    )
 
-    # Mode B/C: vlm_autonomous on. Combine pool + visual_context (other
-    # sources), placing variants at the end so they're treated as newest by
-    # the cap logic.
     other_refs = list(state.get("visual_context", []) or [])
-    combined = other_refs + variant_refs
+    # Drop any pre-existing entry that would shadow the auto-current-image —
+    # phase_carry / present_images entries pointing at the same path are
+    # redundant when current_image is already projected.
+    if auto_current is not None:
+        other_refs = [r for r in other_refs if r.get("path") != auto_current["path"]]
+
+    # Build the combined view. Order: other (oldest) → auto-current-image →
+    # variants (newest = active decision space).
+    combined: list[VisualRef] = list(other_refs)
+    if auto_current is not None:
+        combined.append(auto_current)
+    combined.extend(variant_refs)
 
     cap = vlm_window_cap()
     if len(variant_refs) > cap:
@@ -275,11 +349,12 @@ def _format_variant_pool_for_prompt(variant_pool: list[Variant]) -> str:
     lines = [
         "## Active variant pool",
         "",
-        "You have produced the following variants in the current HITL gate. "
-        "Each is a concrete result on disk; these are your candidates to "
-        "carry forward. In autonomous mode, call `commit_variant(variant_id=...)` "
-        "to lock in your choice and clear the rest. In HITL mode, the human "
-        "approves via Gradio.",
+        "You have produced the following variants in the current segment. "
+        "Each is a concrete result on disk. In autonomous mode, call "
+        "`commit_variant(variant_id=...)` to lock in your choice and clear "
+        "the rest. In HITL mode, call `present_for_review` to deliberately "
+        "share candidate(s), explain the tradeoffs, and make them available "
+        "for human approval.",
         "",
     ]
     for v in variant_pool:
@@ -301,6 +376,74 @@ def _format_variant_pool_for_prompt(variant_pool: list[Variant]) -> str:
                 metric_strs.append(f"{key}={val}")
         suffix = f"  ({', '.join(metric_strs)})" if metric_strs else ""
         lines.append(f"- **{vid}** — {label}{suffix}")
+    return "\n".join(lines)
+
+
+def _format_checkpoints_for_prompt(checkpoints: dict | None) -> str:
+    """Render available image rollback checkpoints for the agent."""
+    if not checkpoints:
+        return ""
+
+    items = [
+        (str(name), str(path))
+        for name, path in checkpoints.items()
+        if name and path
+    ]
+    if not items:
+        return ""
+
+    shown = items[-20:]
+    lines = [
+        "## Available image checkpoints",
+        "",
+        "The system automatically bookmarks the current image before post-stack "
+        "image-modifying tools. If a result is worse, call "
+        "`restore_checkpoint(name=...)` with one of these names instead of "
+        "trying to reason around a bad current_image.",
+        "",
+    ]
+    if len(items) > len(shown):
+        lines.append(f"... {len(items) - len(shown)} older checkpoint(s) hidden ...")
+    for name, path in shown:
+        lines.append(f"- `{name}` → `{Path(path).name}`")
+    return "\n".join(lines)
+
+
+def _format_review_session_for_prompt(review_session: dict | None) -> str:
+    """Render explicit Review Mode state for the agent."""
+    if not review_ctl.review_is_open(review_session):
+        return ""
+    proposal = review_session.get("proposal", {}) or {}
+    candidates = proposal.get("candidates", []) or []
+    last_event = review_session.get("last_human_event") or {}
+    lines = [
+        "## Active HITL review session",
+        "",
+        f"- Gate: `{review_session.get('gate_id', 'unknown')}`",
+        f"- Tool: `{review_session.get('tool_name', 'unknown')}`",
+        f"- Status: `{review_session.get('status', 'unknown')}`",
+        f"- Turn policy: `{review_session.get('turn_policy', 'answer_visible_text_before_action')}`",
+    ]
+    if last_event:
+        lines.append(
+            f"- Last human event: `{last_event.get('type', 'feedback')}` — "
+            f"{last_event.get('text', '')}"
+        )
+    if candidates:
+        lines.append("- Presented candidates: " + ", ".join(
+            str(c.get("variant_id", "?")) for c in candidates if isinstance(c, dict)
+        ))
+    else:
+        lines.append("- Presented candidates: none yet")
+    recommendation = proposal.get("recommendation")
+    if recommendation:
+        lines.append(f"- Current recommendation: `{recommendation}`")
+    lines.append("")
+    lines.append(
+        "Use visible text to answer human questions. Tool calls may follow when "
+        "experimentation is needed, but presentation/approval is mediated by "
+        "`present_for_review`, not by `commit_variant` or `advance_phase`."
+    )
     return "\n".join(lines)
 
 
@@ -329,9 +472,20 @@ def _build_vlm_view(state: AstroState, messages: list) -> list:
     if vlm_msg is None:
         return cleaned
 
+    # Estimated visual payload size, used for token-burn observability.
+    # Accurate for files we just read off disk; for missing files (never
+    # happens after _make_vlm_message succeeds) we fall back to 0.
+    total_bytes = 0
+    for p in paths:
+        try:
+            total_bytes += Path(p).stat().st_size
+        except OSError:
+            pass
+
     logger.debug(
-        f"vlm_view: showing {len(refs)} image(s) "
+        f"vlm_view: showing {len(refs)} image(s), ~{total_bytes // 1024} KB on disk "
         f"({sum(1 for r in refs if r.get('source') == 'hitl_variant')} hitl_variant, "
+        f"{sum(1 for r in refs if r.get('source') == 'current_image')} current_image, "
         f"{sum(1 for r in refs if r.get('source') == 'present_images')} present_images, "
         f"{sum(1 for r in refs if r.get('source') == 'phase_carry')} phase_carry)"
     )
@@ -345,6 +499,75 @@ def _build_vlm_view(state: AstroState, messages: list) -> list:
 
 class StuckLoopError(RuntimeError):
     """Raised when the agent calls the same tool too many times consecutively."""
+
+
+class TextLoopError(RuntimeError):
+    """Raised when the agent emits too many text-only responses without progress."""
+
+
+def _check_text_loop(messages: list) -> None:
+    """
+    Hard-fail when the agent emits N consecutive text-only AIMessages with
+    no HumanMessage and no tool calls in between. Catches the "agent
+    talking to itself" pattern that the tool-based stuck-loop detector
+    misses (M20 trace: 8 text-only responses in a row narrating the same
+    image comparison, no tool calls, no human input, until the model API
+    rejected the bloated payload).
+
+    Why "no HumanMessage between" is the right signal:
+      During an HITL gate the agent CAN legitimately produce many
+      text-only responses while conversing — but those interleave with
+      HumanMessages from the user. A run of text-only AIMessages with
+      no HumanMessage interruption means the agent is running its own
+      loop, not collaborating. We don't gate on similarity because the
+      agent's phrasing varies even when it's stuck, and Jaccard /
+      n-gram measures are too sensitive to word-choice differences.
+
+    Tunables (env vars):
+      MAX_CONSECUTIVE_TEXT_ONLY — N (default 5, 0 disables)
+    """
+    import os
+    env_n = os.environ.get("MAX_CONSECUTIVE_TEXT_ONLY", "")
+    if env_n.strip() == "0":
+        return
+    try:
+        max_n = int(env_n) if env_n else 5
+    except ValueError:
+        max_n = 5
+    if max_n <= 1:
+        return
+
+    # Walk the tail backward. Count text-only AIMessages until we hit:
+    #   - A HumanMessage (conversation interleave — resets the run)
+    #   - An AIMessage with tool_calls (agent did something — resets)
+    #   - A ToolMessage (tool ran — resets)
+    run_texts: list[str] = []
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            if msg.tool_calls:
+                break
+            text = str(msg.content or "").strip()
+            if text:
+                run_texts.append(text)
+            # else: empty AIMessage doesn't count toward the run but also
+            # doesn't reset it — keep walking.
+        elif isinstance(msg, (HumanMessage, ToolMessage)):
+            break
+
+    if len(run_texts) < max_n:
+        return
+
+    raise TextLoopError(
+        f"Agent has emitted {len(run_texts)} consecutive text-only "
+        f"responses (limit {max_n}) without a human reply or a tool call. "
+        f"This pattern is the narration-loop the tool-based stuck-loop "
+        f"detector doesn't catch — the agent is talking to itself "
+        f"instead of advancing the work. Most recent response "
+        f"(first 200 chars):\n"
+        f"  {run_texts[0][:200]!r}\n"
+        f"To override, set MAX_CONSECUTIVE_TEXT_ONLY=0 in .env. "
+        f"To raise the trigger threshold, set MAX_CONSECUTIVE_TEXT_ONLY=N."
+    )
 
 
 class NudgeLimitError(RuntimeError):
@@ -388,6 +611,67 @@ def _check_phase_tool_limit(messages: list, phase) -> None:
         )
 
 
+# Markers that identify a ToolMessage as a failure. Successful tools return
+# JSON (dict/list) in their content; failing tools yield free-form error text
+# from _format_tool_error or raw exception strings. We check:
+#   1. content is a dict/list with "error" or "success": false
+#   2. OR content is a string that matches any known failure prefix
+# Substring matching is sufficient because _format_tool_error standardizes
+# on these prefixes and SirilError messages contain "siril-cli exited".
+_TOOL_ERROR_MARKERS: tuple[str, ...] = (
+    "Tool '",                 # "Tool 'X' failed ..." from _format_tool_error
+    "Error:",                 # generic error prefix
+    "Error in line ",         # Siril script error
+    "siril-cli exited",       # SirilError
+    "Traceback (most recent", # unraised exceptions leaking through
+    "validation error",       # pydantic validation
+    "FileNotFoundError",      # raised from tool bodies
+    "RuntimeError",           # raised from tool bodies
+    "ValueError",             # raised from tool bodies
+    "with an internal error", # _format_tool_error fallback
+)
+
+
+def _tool_message_is_error(msg, content: str) -> bool:
+    """
+    Classify a ToolMessage as a failure for the stuck-loop detector.
+
+    Trusts `status='error'` when the underlying ToolNode set it (LangChain
+    ≥0.2 does this for raised exceptions). Falls back to content inspection
+    for older versions or custom handlers that only set the content string.
+
+    The JSON path mirrors how successful tools report: JSON-parseable content
+    is almost always success. Non-JSON content that starts with a known error
+    marker is treated as failure.
+    """
+    status = getattr(msg, "status", None)
+    if status == "error":
+        return True
+
+    if not content:
+        return False
+
+    # Successful tools return JSON. If parseable, only treat as error when the
+    # JSON itself declares failure.
+    stripped = content.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            if parsed.get("error"):
+                return True
+            if parsed.get("success") is False:
+                return True
+            return False
+        if parsed is not None:
+            return False
+        # JSON-looking but unparseable — fall through to marker check.
+
+    return any(marker in content for marker in _TOOL_ERROR_MARKERS)
+
+
 def _check_stuck_loop(messages: list) -> None:
     """
     Detect repeated identical tool calls within the current segment.
@@ -405,20 +689,85 @@ def _check_stuck_loop(messages: list) -> None:
     the same parameters with no-op work in between. The counter-based check
     catches this regardless of interleaving.
 
+    Effect-level collapsing: some tools report `"noop": true` in their result
+    JSON to signal that the call produced no state change (currently
+    restore_checkpoint does this when the bookmarked path already equals
+    current_image). Agents in a stuck loop often try *different argument
+    values* — restore_checkpoint("starless_base"), restore_checkpoint("v1"),
+    restore_checkpoint("good") — all noops pointing at the same stale
+    current_image. Args differ, so the args-only fingerprint never trips.
+    To catch this, any tool call whose ToolMessage carries `"noop": true` is
+    fingerprinted by effect (`{name, effect=noop}`) rather than by args, so
+    all such noops for a given tool name share one counter.
+
+    Error-level collapsing: the same class of stuck loop happens when a tool
+    *keeps failing*. The M31 run exhibited this: siril_stack failed on every
+    attempt while select_frames succeeded with varying thresholds between
+    each retry, so the args-only fingerprint never saw two matching args.
+    We now collapse any failing ToolMessage into `{name, effect=error}`
+    regardless of args, which catches the "try three different parameter
+    sets, all produce Siril errors" pattern without tripping on a single
+    transient failure.
+
     Note: the env var name is historical — the semantic is now "max identical
     invocations within the current segment", not "max consecutive".
 
     Calling build_masters(file_type="bias") then build_masters(file_type="dark")
     still passes, because the args differ → distinct fingerprints → distinct
-    counts. Only repeated calls with the *same* args trip the detector.
+    counts. Only repeated calls with the *same* args (or the *same effect,*
+    for noop-reporting tools) trip the detector.
     """
     import json
     import os
     from collections import Counter
 
-    limit = int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "0"))
+    # Resolution order: env var override → processing.toml [limits] → hardcoded.
+    # The CLI path never sets the env var (gradio_app does), so relying solely
+    # on os.environ left the detector disabled for every CLI run, which is how
+    # the M42 Sonnet run was able to retry siril_register a dozen times after
+    # a cfitsio path error without ever tripping the guard. Falling back to
+    # the toml value restores parity between the two entry points.
+    env_limit = os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "")
+    if env_limit:
+        limit = int(env_limit)
+    else:
+        try:
+            from muphrid.config import _pcfg
+            limit = int(_pcfg("limits", "max_consecutive_same_tool", 3))
+        except Exception:
+            # If config loading fails for any reason, fall back to the
+            # hardcoded default rather than silently disabling the detector.
+            limit = 3
     if limit <= 0:
         return
+
+    # First pass: collect tool_call_ids whose result was a no-op or an error.
+    # We key by id so the AIMessage pass can recognize them without walking
+    # messages twice in lockstep. The reverse walk still stops at
+    # advance_phase / HumanMessage boundaries — events outside the current
+    # segment must not leak in.
+    noop_tool_call_ids: set[str] = set()
+    error_tool_call_ids: set[str] = set()
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            if getattr(msg, "name", None) == "advance_phase":
+                break
+            tc_id = getattr(msg, "tool_call_id", None)
+            content = msg.content if isinstance(msg.content, str) else ""
+            if '"noop": true' in content or '"noop":true' in content:
+                # Confirm by parsing — the substring match is a cheap prefilter.
+                try:
+                    parsed = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict) and parsed.get("noop") is True:
+                    if tc_id:
+                        noop_tool_call_ids.add(tc_id)
+            elif tc_id and _tool_message_is_error(msg, content):
+                error_tool_call_ids.add(tc_id)
+            continue
+        if isinstance(msg, HumanMessage):
+            break
 
     counts: Counter[str] = Counter()
     for msg in reversed(messages):
@@ -432,10 +781,34 @@ def _check_stuck_loop(messages: list) -> None:
             break
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tc in msg.tool_calls:
-                fingerprint = json.dumps(
-                    {"name": tc["name"], "args": tc.get("args", {})},
-                    sort_keys=True,
-                )
+                tc_id = tc.get("id")
+                if tc_id in noop_tool_call_ids:
+                    # Effect-level fingerprint: collapse all noop calls to the
+                    # same tool (regardless of args) into one counter. This is
+                    # what catches "try a different checkpoint name each time"
+                    # loops where every attempt resolves to the same file.
+                    fingerprint = json.dumps(
+                        {"name": tc["name"], "effect": "noop"},
+                        sort_keys=True,
+                    )
+                elif tc_id in error_tool_call_ids:
+                    # Error-level fingerprint: collapse all failing calls to
+                    # the same tool into one counter. Catches oscillation like
+                    # select_frames(a) → siril_stack(x, fails) → select_frames(b)
+                    # → siril_stack(y, fails) where args vary on each retry but
+                    # the tool keeps failing. The noop counter protects against
+                    # silent no-op loops; this protects against noisy failure
+                    # loops. Pairs naturally with the existing args-based path
+                    # for successful calls.
+                    fingerprint = json.dumps(
+                        {"name": tc["name"], "effect": "error"},
+                        sort_keys=True,
+                    )
+                else:
+                    fingerprint = json.dumps(
+                        {"name": tc["name"], "args": tc.get("args", {})},
+                        sort_keys=True,
+                    )
                 counts[fingerprint] += 1
         # Text-only AIMessages are part of the segment (analysis between
         # tool calls), they don't reset the counter.
@@ -447,6 +820,35 @@ def _check_stuck_loop(messages: list) -> None:
     most_common, count = counts.most_common(1)[0]
     if count >= limit:
         info = json.loads(most_common)
+        if info.get("effect") == "noop":
+            raise StuckLoopError(
+                f"Agent called '{info['name']}' {count} times with different "
+                f"arguments but every result was a no-op (limit: {limit}) — "
+                f"aborting. The tool keeps resolving to the same underlying "
+                f"state regardless of the argument value, which means the "
+                f"problem is upstream of this tool (e.g. current_image is "
+                f"stale, or the checkpoints all point at the same file). "
+                f"Do not retry with yet another argument — branch: inspect "
+                f"paths.current_image, promote the correct file with a "
+                f"different tool, or send a feedback message to reset the "
+                f"segment. Set MAX_CONSECUTIVE_SAME_TOOL=0 in .env to "
+                f"disable this check."
+            )
+        if info.get("effect") == "error":
+            raise StuckLoopError(
+                f"Agent called '{info['name']}' {count} times and every "
+                f"result was an error (limit: {limit}) — aborting. Varying "
+                f"arguments have not resolved the failure, which means the "
+                f"problem is upstream of this tool's inputs (e.g. the "
+                f"sequence on disk is malformed, a prior step produced "
+                f"inconsistent state, or an environmental precondition is "
+                f"missing). Do not retry '{info['name']}' again with yet "
+                f"another parameter set — inspect the last tool output for "
+                f"the actual error, fix the precondition with a different "
+                f"tool, or send a feedback message to reset the segment. "
+                f"Set MAX_CONSECUTIVE_SAME_TOOL=0 in .env to disable this "
+                f"check."
+            )
         raise StuckLoopError(
             f"Agent called '{info['name']}' {count} times with identical "
             f"arguments {info['args']} within the current segment "
@@ -529,6 +931,103 @@ def _rescue_raw_tool_calls(response: AIMessage) -> AIMessage:
     return AIMessage(content=hint, tool_calls=[])
 
 
+# Sentinel content used when a model returns an AIMessage with neither text
+# nor tool_calls. Persisting an empty AIMessage poisons subsequent calls
+# regardless of backend: OpenAI-compatible providers (Together, OpenAI,
+# DeepSeek) reject with HTTP 400 "Input validation error", and Anthropic's
+# Messages API rejects with "all messages must have non-empty content" — the
+# rule is a wire-format invariant, not a provider quirk. Substituting a
+# non-empty placeholder keeps the conversation valid for any backend while
+# still signalling to the agent_chat nudger that this turn was a no-op.
+_EMPTY_RESPONSE_PLACEHOLDER = (
+    "(no response — I should call a tool or respond with text on the next turn)"
+)
+
+
+def _is_empty_ai_message(msg: AIMessage) -> bool:
+    """True iff the AIMessage has no usable content AND no tool_calls."""
+    content = msg.content
+    if isinstance(content, str):
+        text_empty = not content.strip()
+    elif isinstance(content, list):
+        # Multi-part content (text + image blocks): empty iff every part is
+        # an empty string or a non-text part. We're permissive with non-text
+        # blocks because removing those would change semantics we don't own.
+        text_empty = all(
+            (isinstance(part, str) and not part.strip()) or
+            (isinstance(part, dict) and (
+                part.get("type") == "text" and not (part.get("text") or "").strip()
+            ))
+            for part in content
+        )
+    else:
+        text_empty = not content
+    return text_empty and not (msg.tool_calls or [])
+
+
+def _normalize_empty_response(response: AIMessage) -> AIMessage:
+    """
+    Replace empty AIMessage(content='', tool_calls=[]) with a placeholder
+    so the conversation never contains a malformed assistant turn.
+
+    Why: every chat completion API in use rejects conversations that
+    contain an assistant turn with no content and no tool_calls. The
+    OpenAI-compatible providers return HTTP 400 "Input validation error";
+    Anthropic's Messages API returns "all messages must have non-empty
+    content". The moment one such turn is persisted, every subsequent
+    invoke on that thread fails until the message is surgically removed
+    from the checkpoint. Normalizing at the source means state never
+    holds a turn that would poison the next call, regardless of which
+    backend is configured.
+
+    This pairs with `_strip_empty_ai_messages` (defense-in-depth, applied
+    to the messages list before invoke) so existing poisoned checkpoints
+    can recover.
+    """
+    if not isinstance(response, AIMessage):
+        return response
+    if not _is_empty_ai_message(response):
+        return response
+    logger.warning(
+        "agent_node: model returned empty response (no content, no tool_calls) — "
+        "substituting placeholder to keep conversation valid for next invoke"
+    )
+    return AIMessage(
+        content=_EMPTY_RESPONSE_PLACEHOLDER,
+        tool_calls=[],
+        # Preserve any other attributes the model attached (id, etc.) so
+        # tracing/logging stays consistent.
+        additional_kwargs=getattr(response, "additional_kwargs", None) or {},
+        response_metadata=getattr(response, "response_metadata", None) or {},
+    )
+
+
+def _strip_empty_ai_messages(messages: list) -> list:
+    """
+    Remove any AIMessage with empty content AND no tool_calls from the
+    messages list before sending to the model.
+
+    This is a recovery path for checkpoints that were already poisoned
+    before `_normalize_empty_response` existed (or in case it's bypassed
+    by a future code path). The empty turn stays in the persisted state
+    for audit; we just hide it from the model on the way out.
+    """
+    out = []
+    dropped = 0
+    for m in messages:
+        if isinstance(m, AIMessage) and _is_empty_ai_message(m):
+            dropped += 1
+            continue
+        out.append(m)
+    if dropped:
+        logger.info(
+            f"_strip_empty_ai_messages: filtered {dropped} empty AIMessage(s) "
+            f"from invoke input (state preserved; only the wire payload is "
+            f"sanitized)"
+        )
+    return out
+
+
 def make_agent_node(model_factory):
     """
     Create the agent node with a model factory for phase-gated tool binding.
@@ -545,6 +1044,14 @@ def make_agent_node(model_factory):
 
         # Stuck-loop detection: hard fail if the agent repeats the same tool call.
         _check_stuck_loop(raw_messages)
+
+        # Text-loop detection: hard fail if the agent emits N consecutive
+        # text-only responses with high pairwise similarity. Catches the
+        # narration-loop pattern that the tool-based stuck-loop detector
+        # misses (observed in M20 trace: 8 near-identical "Top: teal /
+        # Bottom: bronze" responses without progress, eventually crashing
+        # the model API on token-limit overflow).
+        _check_text_loop(raw_messages)
 
         # Per-phase tool call cap: count tool calls since the last advance_phase
         # and fail if the limit is exceeded.
@@ -563,6 +1070,21 @@ def make_agent_node(model_factory):
         variant_pool_section = _format_variant_pool_for_prompt(
             state.get("variant_pool", []) or []
         )
+        checkpoints_section = _format_checkpoints_for_prompt(
+            (state.get("metadata", {}) or {}).get("checkpoints")
+        )
+        review_session_section = _format_review_session_for_prompt(
+            state.get("review_session")
+        )
+
+        # HITL collaboration fragment — appended only when the agent is at an
+        # active HITL gate. Lives in its own dynamic block so the cached
+        # prefix doesn't churn when the gate opens or closes mid-phase.
+        hitl_fragment = (
+            _HITL_PARTNER_FRAGMENT
+            if review_ctl.active_review_session(state)
+            else ""
+        )
 
         # Anthropic prompt caching: use content blocks with cache_control
         # so the stable prefix is cached across calls within a phase.
@@ -576,6 +1098,14 @@ def make_agent_node(model_factory):
             if variant_pool_section:
                 # Uncached: regenerated each turn from live state
                 system_blocks.append({"type": "text", "text": variant_pool_section})
+            if checkpoints_section:
+                # Uncached: regenerated each turn from live checkpoint state
+                system_blocks.append({"type": "text", "text": checkpoints_section})
+            if hitl_fragment:
+                # Uncached: only present during active HITL conversations
+                system_blocks.append({"type": "text", "text": hitl_fragment})
+            if review_session_section:
+                system_blocks.append({"type": "text", "text": review_session_section})
             messages = [SystemMessage(content=system_blocks)] + raw_messages
 
             # Mark the last successful advance_phase as a cache boundary so
@@ -606,7 +1136,13 @@ def make_agent_node(model_factory):
         else:
             full_system = system
             if variant_pool_section:
-                full_system = f"{system}\n\n{variant_pool_section}"
+                full_system = f"{full_system}\n\n{variant_pool_section}"
+            if checkpoints_section:
+                full_system = f"{full_system}\n\n{checkpoints_section}"
+            if hitl_fragment:
+                full_system = f"{full_system}\n\n{hitl_fragment}"
+            if review_session_section:
+                full_system = f"{full_system}\n\n{review_session_section}"
             messages = [SystemMessage(content=full_system)] + raw_messages
 
         # VLM view: state.visual_context owns visibility. See _build_vlm_view.
@@ -616,8 +1152,43 @@ def make_agent_node(model_factory):
         # captured the conclusions; raw JSON is dead weight after phase ends.
         messages = _prune_phase_analysis(messages)
 
+        # Defense-in-depth: filter out any prior empty AIMessage (no content,
+        # no tool_calls) before invoking the model. Both OpenAI-compatible
+        # providers (Together, OpenAI, DeepSeek) and Anthropic reject
+        # conversations that contain such turns. A single empty AI turn
+        # poisoned by a previous agent stall would block every subsequent
+        # invocation on this thread until manually surgically removed from
+        # the checkpoint. Stripping at invoke time recovers gracefully.
+        # Note: this only filters; the AIMessage stays in checkpoint state
+        # so the audit trail is preserved. We just don't show it to the
+        # model. Pair with the post-invoke normalization below — together
+        # they prevent the bad message from being persisted in the first
+        # place AND let us recover existing checkpoints.
+        messages = _strip_empty_ai_messages(messages)
+
         response = model.invoke(messages)
         response = _rescue_raw_tool_calls(response)
+        response = _normalize_empty_response(response)
+
+        review_session_update: dict[str, Any] = {}
+        if review_ctl.visible_response_required(state.get("review_session")):
+            if response.tool_calls and not review_ctl.ai_message_has_visible_text(response):
+                logger.info(
+                    "HITL turn policy rejected a tool-only response after "
+                    "human review feedback; routing back to agent for visible text."
+                )
+                return {
+                    "messages": [
+                        review_ctl.build_visible_response_required_prompt(
+                            state.get("review_session")
+                        )
+                    ]
+                }
+            if review_ctl.ai_message_has_visible_text(response):
+                review_session_update["review_session"] = review_ctl.update_review_session(
+                    state.get("review_session"),
+                    visible_response_required=False,
+                )
 
         # Phase gate enforcement: reject any tool call not available in the
         # current phase. This catches DeepSeek rescue reconstructing calls
@@ -643,14 +1214,14 @@ def make_agent_node(model_factory):
                         f"advance_phase to move to the next phase."
                     ),
                     tool_calls=[],
-                )]}
+                )], **review_session_update}
 
         logger.info(
             f"Agent response: {'tool_calls' if response.tool_calls else 'no tool_calls'}"
             + (f" ({[tc['name'] for tc in response.tool_calls]})" if response.tool_calls else f" | text: {str(response.content)[:300]!r}")
         )
 
-        return {"messages": [response]}
+        return {"messages": [response], **review_session_update}
 
     return agent_node
 
@@ -660,6 +1231,97 @@ def make_agent_node(model_factory):
 # returns ToolMessages. Initialized with all_tools() — the phase_router
 # controls which tools the LLM can *call* (via bind_tools), but the
 # ToolNode can execute any of them.
+
+_POST_STACK_CHECKPOINT_PHASES = {
+    ProcessingPhase.LINEAR,
+    ProcessingPhase.STRETCH,
+    ProcessingPhase.NONLINEAR,
+}
+
+_IMAGE_MUTATING_TOOLS = {
+    "remove_gradient",
+    "color_calibrate",
+    "remove_green_noise",
+    "noise_reduction",
+    "deconvolution",
+    "stretch_image",
+    "select_stretch_variant",
+    "star_removal",
+    "curves_adjust",
+    "local_contrast_enhance",
+    "saturation_adjust",
+    "hsv_adjust",
+    "star_restoration",
+    "reduce_stars",
+    "multiscale_process",
+    "pixel_math",
+    "masked_process",
+    "hdr_composite",
+}
+
+
+def _checkpoint_safe_tool_label(tool_names: list[str]) -> str:
+    joined = "_".join(tool_names[:3]) if tool_names else "tool"
+    return re.sub(r"[^a-zA-Z0-9_]+", "_", joined).strip("_") or "tool"
+
+
+def auto_checkpoint(state: AstroState) -> dict[str, Any]:
+    """
+    Automatically bookmark current_image before post-stack image mutations.
+
+    This is deliberately metadata-only and runs immediately before ToolNode.
+    It must not append a message, because ToolNode expects the latest message
+    to be the AIMessage containing tool_calls.
+    """
+    phase = state.get("phase", ProcessingPhase.INGEST)
+    if phase not in _POST_STACK_CHECKPOINT_PHASES:
+        return {}
+
+    messages = state.get("messages", []) or []
+    if not messages or not isinstance(messages[-1], AIMessage):
+        return {}
+
+    tool_calls = messages[-1].tool_calls or []
+    mutating_tools = [
+        tc.get("name", "")
+        for tc in tool_calls
+        if tc.get("name") in _IMAGE_MUTATING_TOOLS
+    ]
+    if not mutating_tools:
+        return {}
+
+    current_image = (state.get("paths", {}) or {}).get("current_image")
+    if not current_image:
+        return {}
+    path = Path(current_image)
+    if not path.exists():
+        logger.warning(
+            f"auto_checkpoint skipped: current_image does not exist: {current_image}"
+        )
+        return {}
+
+    checkpoints = (state.get("metadata", {}) or {}).get("checkpoints") or {}
+    auto_count = sum(
+        1
+        for name in checkpoints
+        if str(name).startswith("auto:") and str(name) != "auto:previous"
+    )
+    label = _checkpoint_safe_tool_label(mutating_tools)
+    phase_value = getattr(phase, "value", str(phase))
+    unique_name = f"auto:{phase_value}:before_{label}:{auto_count + 1:03d}"
+
+    logger.info(
+        f"auto_checkpoint: {unique_name} → {path.name} "
+        f"before {', '.join(mutating_tools)}"
+    )
+    return {
+        "metadata": {
+            "checkpoints": {
+                unique_name: str(path),
+                "auto:previous": str(path),
+            }
+        }
+    }
 
 
 def _format_tool_error(exc: Exception) -> str:
@@ -753,10 +1415,9 @@ def _make_vlm_message(image_paths: list[str], label: str) -> HumanMessage | None
 # at the moment of capture. The pool accumulates across iterations within a
 # HITL gate and is cleared on phase advance or variant commit.
 #
-# Two side effects per HITL-tool execution:
-#   1. Append a Variant entry to state.variant_pool
-#   2. Enrich the ToolMessage's content with a formatted pool summary so the
-#      agent has a stable, indexed view of its own attempts on its next turn.
+# Side effect per HITL-tool execution: append a Variant entry to
+# state.variant_pool. The agent sees a formatted pool summary through the
+# dynamic system prompt on its next turn.
 #
 # Behavior is mode-agnostic: the pool builds in both HITL and autonomous modes.
 # In autonomous mode it's pure observability; in HITL mode it powers the UI's
@@ -1025,17 +1686,14 @@ def variant_snapshot(state: AstroState) -> dict[str, Any]:
     Detect HITL-mapped tool executions in the latest action result and
     snapshot them into state.variant_pool.
 
-    Runs between action and hitl_check, but is gated to HITL-only: it only
-    captures variants when HITL is actually enabled for the trailing
-    HITL-mapped tool. Outside HITL (autonomous mode, per-tool checkbox off,
-    runtime override disabled), the function returns early as a no-op and
-    the pool stays empty.
+    Runs between action and hitl_check. It is intentionally mode-agnostic:
+    HITL uses the pool as workbench history behind review candidates, while
+    autonomous runs use it so the agent can compare and commit variants
+    without a human gate.
 
-    The pool exists solely to ground HITL conversations — its only consumers
-    are the Gradio variant panel and the hitl_check approval-dispatch path.
-    The agent itself uses message history for its own bookkeeping and never
-    reads the pool as a structured artifact, so this function does NOT
-    enrich the ToolMessage stream — it only writes to state.variant_pool.
+    The pool grounds HITL conversations, the Gradio workbench filmstrip, and
+    autonomous commit_variant decisions. The agent also sees a compact pool
+    summary in the dynamic system prompt.
 
     Side effect: also self-corrects the pool by dropping any entries whose
     backing files no longer exist on disk. This handles resume after the
@@ -1061,18 +1719,6 @@ def variant_snapshot(state: AstroState) -> dict[str, Any]:
     # Filter to HITL-mapped tools only
     hitl_msgs = [m for m in trailing if m.name in TOOL_TO_HITL]
     if not hitl_msgs:
-        return {}
-
-    # ── HITL-enabled gate ────────────────────────────────────────────
-    # The pool's only consumers are the HITL UI panel and the hitl_check
-    # approval handler. If HITL isn't actually enabled for the tool that
-    # just executed, no consumer will ever read the pool, so the producer
-    # should not run. This is the same gate hitl_check uses to decide
-    # whether to fire interrupts, so producer and consumer agree on when
-    # HITL is "really" engaged.
-    last_hitl_msg = hitl_msgs[-1]
-    hitl_key = TOOL_TO_HITL.get(last_hitl_msg.name)
-    if hitl_key is None or not is_enabled(hitl_key):
         return {}
 
     phase = state.get("phase", ProcessingPhase.INGEST)
@@ -1143,6 +1789,9 @@ def build_variant_promotion_update(
       - paths.current_image := variant.file_path
       - variant_pool := []
       - visual_context := <existing> + phase_carry entry for the approved variant
+      - metadata.last_committed_variant := {id, file_path}  (race-fix signal:
+        lets commit_variant detect "already promoted via HITL" when the pool
+        has been cleared and return idempotent success instead of an error)
 
     Shared by promote_variant (HITL) and the commit_variant tool (autonomous).
     """
@@ -1154,27 +1803,34 @@ def build_variant_promotion_update(
     paths = dict(state.get("paths", {}) or {})
     paths["current_image"] = variant["file_path"]
 
-    # Append a phase_carry entry to visual_context so the agent retains a
-    # visual anchor on what it chose to keep. Other entries are preserved.
-    working_dir = state.get("dataset", {}).get("working_dir", "")
-    is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
-    phase_value = state.get("phase")
-    if hasattr(phase_value, "value"):
-        phase_value = phase_value.value
-    existing_visual = list(state.get("visual_context", []) or [])
-    approved_preview = _resolve_variant_preview(variant, working_dir, is_linear)
-    if approved_preview:
-        existing_visual.append(VisualRef(
-            path=approved_preview,
-            label=f"Carried forward: {variant.get('label') or variant['id']}",
-            source="phase_carry",
-            phase=str(phase_value) if phase_value else "",
-        ))
+    # Drop the now-promoted variant's hitl_variant entry (variant_pool is
+    # being cleared, but visual_context may have older present_images /
+    # phase_carry entries we want to preserve). Drop ANY existing
+    # phase_carry entries too — they were a pre-#44 mechanism for keeping
+    # a chosen variant visible, but the auto-current-image source now
+    # projects paths.current_image automatically. Keeping a phase_carry
+    # in addition causes a stale-comparison artifact: when the next tool
+    # moves current_image to a new file, phase_carry still points at the
+    # old variant's preview, the VLM sees both, and the agent gets stuck
+    # narrating a now-irrelevant before/after. (Was #66 in the to-do list.)
+    existing_visual = [
+        r for r in (state.get("visual_context", []) or [])
+        if r.get("source") not in ("hitl_variant", "phase_carry")
+    ]
 
     update: dict[str, Any] = {
         "paths": paths,
         "variant_pool": [],
         "visual_context": existing_visual,
+        # metadata is merged via _merge_dicts, so partial updates are safe —
+        # other metadata fields are preserved and only last_committed_variant
+        # is overwritten.
+        "metadata": {
+            "last_committed_variant": {
+                "id": variant["id"],
+                "file_path": variant["file_path"],
+            },
+        },
     }
     return variant, update
 
@@ -1202,13 +1858,31 @@ def promote_variant(
         return None
     variant, update = result
 
-    approval_lines = [f"Approved {variant['id']} ({variant['label']})."]
+    # The HumanMessage is both a narrative cue AND a reset point for
+    # _check_stuck_loop. Make the state change explicit so the agent does not
+    # then call commit_variant to "lock it in" — that would be a redundant
+    # round-trip, and the variant_pool is already empty so commit_variant
+    # would otherwise fall into its error path. commit_variant's
+    # already_committed guard handles this idempotently too, but the clearer
+    # the signal here, the fewer ticks the agent burns.
+    approval_lines = [
+        "HUMAN APPROVED",
+        f"Approved: {variant['id']} ({variant['label']})",
+        "current_image has been promoted to the approved variant.",
+        "The HITL gate is closed. Continue the pipeline from this image.",
+        "Do not call commit_variant for this approval; the approval itself "
+        "already committed the selected variant.",
+    ]
     if rationale:
         approval_lines.append(f"Rationale: {rationale}")
     approval_lines.append("Continue to the next step.")
     approval_text = "\n".join(approval_lines)
 
     update["active_hitl"] = False
+    update["review_session"] = review_ctl.close_review_session(
+        state.get("review_session"),
+        reason="variant_approved",
+    )
     update["messages"] = [HumanMessage(content=approval_text)]
 
     logger.info(
@@ -1222,73 +1896,13 @@ def promote_variant(
 # ── hitl_check ────────────────────────────────────────────────────────────────
 
 
-def _find_active_hitl_tool(messages: list) -> tuple[str | None, str | None]:
-    """
-    Walk backward through ALL messages to find the most recent HITL-triggering
-    ToolMessage. Used when re-entering hitl_check during an active HITL chat
-    (where the most recent messages are Human/AI chat, not ToolMessages).
-    """
-    from muphrid.graph.hitl import TOOL_TO_HITL
-    for msg in reversed(messages):
-        if isinstance(msg, ToolMessage) and msg.name in TOOL_TO_HITL:
-            return TOOL_TO_HITL[msg.name], msg.name
-    return None, None
-
-
-def _count_silent_hitl_tools(messages: list) -> int:
-    """
-    Count consecutive HITL-mapped tool executions since the most recent
-    "conversation breath" — defined as any of:
-      - The agent emitted a non-empty text-only AIMessage (it narrated)
-      - The human sent a HumanMessage (real input, not VLM injection or
-        system HITL prompt)
-      - The pipeline crossed a phase boundary (advance_phase ToolMessage)
-
-    Used by hitl_check to detect the runaway pattern where an agent in
-    active HITL re-applies HITL-mapped tools without ever pausing to talk,
-    starving the human of any review opportunity. The "wait for narration"
-    branch trusts the agent to take a breath; this counter is the safety net
-    that catches the agent when it doesn't.
-
-    Returns the number of HITL-mapped ToolMessages seen since the last reset
-    point. The current ToolMessage at the end of `messages` is included in
-    the count.
-    """
-    from muphrid.graph.hitl import TOOL_TO_HITL
-
-    count = 0
-    for msg in reversed(messages):
-        if isinstance(msg, ToolMessage):
-            name = getattr(msg, "name", None)
-            if name == "advance_phase":
-                # Phase boundary — clean slate
-                break
-            if name in TOOL_TO_HITL:
-                count += 1
-            continue
-        if isinstance(msg, AIMessage):
-            if msg.tool_calls:
-                # Tool-call-only AIMessage isn't a "narration breath"; the
-                # agent dispatched without speaking. Keep counting.
-                continue
-            text = text_content(msg.content) if msg.content else ""
-            if text.strip():
-                # Real text emission = the agent narrated. Reset point.
-                break
-            continue
-        if isinstance(msg, HumanMessage):
-            # Don't reset on system-injected HITL prompts or VLM injections —
-            # those aren't real human input. Real input or auto-approval text
-            # is the reset.
-            kwargs = getattr(msg, "additional_kwargs", {}) or {}
-            if kwargs.get("is_hitl_prompt") or kwargs.get("is_nudge"):
-                continue
-            if isinstance(msg.content, list):
-                # Multimodal block (VLM image injection) — not human input
-                continue
-            # Real HumanMessage content (free-text or approval) = reset
-            break
-    return count
+def _present_for_review_succeeded(msg: ToolMessage) -> bool:
+    """True when the present_for_review tool actually updated the review set."""
+    try:
+        payload = json.loads(text_content(msg.content))
+    except Exception:
+        return True
+    return isinstance(payload, dict) and payload.get("status") == "presented"
 
 
 def hitl_check(state: AstroState) -> dict[str, Any]:
@@ -1307,53 +1921,73 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     on the next text response.
     """
     messages = state.get("messages", [])
-    active_hitl = state.get("active_hitl", False)
+    review_session = review_ctl.active_review_session(state)
+    review_open = review_session is not None
     hitl_key, tool_name = resolve_hitl_checkpoint(messages)
     last = messages[-1] if messages else None
 
+    # present_for_review is the collaboration handoff, not a normal utility
+    # result to keep streaming past. Once the agent deliberately presents
+    # candidates during an active gate, interrupt immediately so the human
+    # can review before any more autonomous work happens.
+    if (
+        review_open
+        and isinstance(last, ToolMessage)
+        and last.name == "present_for_review"
+        and _present_for_review_succeeded(last)
+    ):
+        hitl_key, tool_name = review_ctl.active_review_tool(state)
+        if hitl_key is None:
+            return {}
+
     # ── No HITL tool found in recent messages ────────────────────────
     if hitl_key is None:
-        if not active_hitl:
+        if not review_open:
             return {}  # no HITL mapping, no active conversation — pass through
 
-        # Active HITL: agent called a non-HITL tool (analyze_image, present_images)
+        # Active review: agent called a non-HITL tool (analyze_image, present_images)
         # Let it pass through so the agent sees the result.
         if isinstance(last, ToolMessage) and last.name not in TOOL_TO_HITL:
             return {}
 
-        # Agent responded with text — find the original HITL trigger
-        hitl_key, tool_name = _find_active_hitl_tool(messages)
+        # Agent responded with text — use the explicit review session.
+        hitl_key, tool_name = review_ctl.active_review_tool(state)
         if hitl_key is None:
-            return {"active_hitl": False}
+            return {}
 
     # ── HITL disabled for this tool (or autonomous mode) ─────────────
     if not is_enabled(hitl_key):
-        return {}
+        if not review_open:
+            return {}
+
+        active_key, active_tool = review_ctl.active_review_tool(state)
+        if active_key is None:
+            return {}
+        hitl_key, tool_name = active_key, active_tool
+
+        if isinstance(last, ToolMessage) and last.name in TOOL_TO_HITL:
+            return {}
 
     # ── HITL tool just executed — pass through for agent analysis ────
     # The agent hasn't seen the result yet. Let it analyze before we
     # fire the interrupt. This applies both to initial triggers AND
     # re-runs during active HITL (agent adjusted params after feedback).
-    if isinstance(last, ToolMessage) and last.name in TOOL_TO_HITL:
-        if not active_hitl:
+    if (
+        isinstance(last, ToolMessage)
+        and last.name in TOOL_TO_HITL
+        and TOOL_TO_HITL.get(last.name) == hitl_key
+    ):
+        if not review_open:
             # Initial trigger — inject analysis prompt
             logger.info(f"HITL triggered for {tool_name} — routing to agent for analysis")
             return {
                 "active_hitl": True,
-                "messages": [HumanMessage(
-                    content=(
-                        f"HITL review triggered for {tool_name}. A human is now "
-                        f"reviewing your work on this step.\n\n"
-                        f"Analyze the result — what do the metrics show? What changed?\n"
-                        f"Call present_images to show the current image.\n"
-                        f"Share your assessment: what worked, what trade-offs you see.\n"
-                        f"The human will give feedback or approve.\n\n"
-                        f"If they give feedback, interpret it in terms of tool parameters, "
-                        f"re-run the tool, and present the updated result with a comparison "
-                        f"of what changed."
-                    ),
-                    additional_kwargs={"is_hitl_prompt": True},
-                )],
+                "review_session": review_ctl.make_review_session(
+                    state=state,
+                    hitl_key=hitl_key,
+                    tool_name=tool_name,
+                ),
+                "messages": [review_ctl.build_open_review_prompt(tool_name)],
             }
         else:
             # Re-run during active HITL.
@@ -1363,48 +1997,48 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
             # workflow intact (agent runs N variants, narrates them, the
             # human reviews them all in one go with the agent's analysis).
             #
-            # Safety net: count how many HITL-mapped tools have run since
-            # the last narration breath. If the agent has been silently
-            # firing tools without ever speaking, force the interrupt to
-            # give the human a chance to intervene. Without this guard, an
-            # agent that never narrates can run dozens of tools after the
-            # last interrupt and the human has no way to step in. This is
-            # what bit the m20 trifid run — 54 silent tool calls after the
-            # last human feedback.
+            # Safety net: count HITL-mapped tools after the latest human
+            # review event using explicit review_session state. When the
+            # count reaches the limit, ask the agent to curate and explain
+            # the current pool before it keeps experimenting.
             import os
-            silent_count = _count_silent_hitl_tools(messages)
             silent_limit = int(os.environ.get("MAX_SILENT_HITL_TOOLS", "3"))
-            if silent_limit > 0 and silent_count >= silent_limit:
+            updated_session = review_ctl.increment_tool_runs_since_human(
+                state.get("review_session"),
+            )
+            tool_count = review_ctl.tool_runs_since_human(updated_session)
+            if review_ctl.silent_tool_limit_reached(updated_session, silent_limit):
                 logger.warning(
-                    f"HITL silent-tool backstop tripped: {silent_count} "
-                    f"HITL-mapped tools have run since the agent's last "
-                    f"narration (limit: {silent_limit}) — forcing interrupt "
-                    f"on {tool_name} to restore human visibility."
+                    f"HITL tool-run backstop tripped: {tool_count} "
+                    f"HITL-mapped tools have run since the latest human "
+                    f"review event (limit: {silent_limit}) — routing to "
+                    "curation before more autonomous work."
                 )
-                # Fall through to the interrupt branch below
-            else:
-                logger.info(
-                    f"HITL tool {tool_name} re-executed "
-                    f"(silent_count={silent_count}/{silent_limit}) — "
-                    f"letting agent analyze new result"
+                curated_state = dict(state)
+                curated_state["review_session"] = updated_session
+                return review_ctl.curation_update(
+                    state=curated_state,
+                    tool_name=tool_name,
+                    pool=list(state.get("variant_pool", []) or []),
                 )
-                return {}
+            logger.info(
+                f"HITL tool {tool_name} re-executed "
+                f"(tool_runs_since_human={tool_count}/{silent_limit}) — "
+                f"letting agent analyze new result"
+            )
+            return {"review_session": updated_session}
 
     # ── Agent has analyzed — fire interrupt ──────────────────────────
     cfg = tool_cfg(hitl_key)
     image_paths = images_from_tool(messages, tool_name)
 
     # Extract agent's analysis text (latest AIMessage)
-    _agent_text = ""
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage):
-            _agent_text = text_content(msg.content)
-            break
+    _agent_text = review_ctl.extract_latest_agent_text(messages)
 
     # Self-correct the pool before exposing it to the UI: drop any dangling
     # entries whose files have been removed (e.g., across a session restart
-    # with cleanup_previous_runs=true). The UI must never render an Approve
-    # button for a non-existent file.
+    # with cleanup_previous_runs=true). The pool drives the read-only
+    # "history" panel; the proposal (below) drives the Approve buttons.
     raw_pool_for_payload = list(state.get("variant_pool", []) or [])
     payload_pool, dropped_at_payload = _validate_variant_pool(raw_pool_for_payload)
     if dropped_at_payload:
@@ -1413,14 +2047,40 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
             f"before payload: {dropped_at_payload}"
         )
 
-    payload = HITLPayload(
-        type=cfg["type"],
-        title=cfg["title"],
+    # Build the proposal from the ReviewSession artifact. Entries whose
+    # variant_id no longer exists in the pool are dropped — better an
+    # empty/short proposal than a broken Approve button.
+    proposal = review_ctl.proposal_entries_from_session(
+        state.get("review_session"), payload_pool
+    )
+
+    needs_curation = review_ctl.review_readiness(payload_pool, proposal)[0]
+
+    if review_ctl.should_route_for_curation(
+        review_session=state.get("review_session"),
+        pool=payload_pool,
+        proposal=proposal,
+        force_interrupt=False,
+    ):
+        logger.info(
+            f"HITL gate for {tool_name} has pool variants but no presented "
+            "candidates — routing back to agent for curation before interrupt."
+        )
+        return review_ctl.curation_update(
+            state=state,
+            tool_name=tool_name,
+            pool=payload_pool,
+        )
+
+    payload = review_ctl.build_interrupt_payload(
+        cfg=cfg,
         tool_name=tool_name,
-        images=image_paths,
-        context=messages[-6:],
+        image_paths=image_paths,
+        messages=messages,
         agent_text=_agent_text,
-        variant_pool=payload_pool,
+        pool=payload_pool,
+        proposal=proposal,
+        review_session=state.get("review_session"),
     )
 
     # VLM visibility is state-driven. variant_snapshot has already updated
@@ -1434,21 +2094,55 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     response = interrupt(payload)
     logger.info(f"HITL response: {response!r}")
 
-    response_text = str(response)
+    human_event = review_ctl.parse_human_event(response)
+    response_text = human_event.get("text", str(response))
 
     # ── Variant approval ─────────────────────────────────────────────
-    # The Gradio variant panel sends a structured sentinel naming the
+    # The Gradio variant panel sends a typed event naming the
     # specific variant being committed plus an optional rationale from
-    # the textbox. Promote the chosen variant's file to current_image,
-    # clear the pool, and surface the rationale to memory extraction.
-    if is_variant_approval(response_text):
-        variant_id, rationale = parse_variant_approval(response_text)
+    # the textbox. Promote the chosen variant's file to current_image
+    # and clear the pool.
+    if human_event.get("type") == "approve_variant":
+        variant_id = human_event.get("variant_id")
+        rationale = human_event.get("rationale", "")
         if variant_id is None:
             # Malformed payload — treat as feedback rather than approval
-            logger.warning(f"Malformed variant approval payload: {response_text!r}")
+            logger.warning(f"Malformed variant approval payload: {response!r}")
             return {
                 "messages": vlm_messages + [HumanMessage(content=response_text)],
                 "active_hitl": True,
+                "review_session": review_ctl.update_review_session(
+                    state.get("review_session"),
+                    status="awaiting_agent_response",
+                    last_human_event=human_event,
+                    tool_runs_since_human=0,
+                    visible_response_required=True,
+                ),
+            }
+
+        presented_ids = review_ctl.proposal_candidate_ids(state.get("review_session"))
+        if payload_pool and variant_id not in presented_ids:
+            logger.warning(
+                f"Variant approval for {variant_id!r} was rejected because "
+                "the variant is not in review_session.proposal"
+            )
+            return {
+                "messages": vlm_messages + [HumanMessage(
+                    content=(
+                        f"[System] Variant {variant_id} is in the pool but "
+                        "is not in the current review proposal. Ask "
+                        "the agent to compare and present candidates before "
+                        "approving."
+                    )
+                )],
+                "active_hitl": True,
+                "review_session": review_ctl.update_review_session(
+                    state.get("review_session"),
+                    status="awaiting_human_approval",
+                    last_human_event=human_event,
+                    tool_runs_since_human=0,
+                    visible_response_required=True,
+                ),
             }
 
         update = promote_variant(state, variant_id, rationale=rationale or None)
@@ -1467,23 +2161,55 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                     )
                 )],
                 "active_hitl": True,
+                "review_session": review_ctl.update_review_session(
+                    state.get("review_session"),
+                    status="awaiting_human_approval",
+                    last_human_event=human_event,
+                    tool_runs_since_human=0,
+                    visible_response_required=True,
+                ),
             }
-
-        # Long-term memory extraction with rationale as the note
-        _extract_hitl_memories(state, messages, tool_name, rationale or "")
 
         # Merge vlm_messages with the promotion update's messages
         update["messages"] = vlm_messages + update["messages"]
         return update
 
     # ── Bare approval (CLI / fallback) ───────────────────────────────
-    if is_affirmative(response_text):
-        from muphrid.graph.hitl import extract_approval_note
-        note = extract_approval_note(response_text)
-        approval_text = note if note else "Approved. Continue to the next step."
+    if human_event.get("type") == "approve_current":
+        if needs_curation:
+            logger.warning(
+                "Bare approval rejected because the active HITL gate has "
+                "pool variants but no agent-presented candidates"
+            )
+            return {
+                "messages": vlm_messages + [HumanMessage(
+                    content=(
+                        "[System] Approval is not available yet. The agent "
+                        "must first select candidate(s) from the pool, explain "
+                        "the tradeoffs, and call present_for_review. You can "
+                        "ask it what to compare or tell it to iterate."
+                    )
+                )],
+                "active_hitl": True,
+                "review_session": review_ctl.update_review_session(
+                    state.get("review_session"),
+                    status="awaiting_curation",
+                    last_human_event=human_event,
+                    tool_runs_since_human=0,
+                    visible_response_required=True,
+                ),
+            }
 
-        # Long-term memory extraction (v1: HITL-only)
-        _extract_hitl_memories(state, messages, tool_name, note)
+        note = human_event.get("rationale", "")
+        approval_lines = [
+            "HUMAN APPROVED",
+            "Approved without naming a specific variant.",
+            "The HITL gate is closed. Continue to the next step.",
+            "Do not call commit_variant for this approval.",
+        ]
+        if note:
+            approval_lines.insert(2, f"Rationale: {note}")
+        approval_text = "\n".join(approval_lines)
 
         # Bare approval (CLI / fallback) — drop hitl_variant entries from
         # visual_context. No specific variant was named, so nothing to carry
@@ -1492,123 +2218,24 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         non_hitl = [r for r in existing_visual if r.get("source") != "hitl_variant"]
         return {
             "active_hitl": False,
+            "review_session": review_ctl.close_review_session(
+                state.get("review_session"),
+                reason="bare_approval",
+            ),
             "variant_pool": [],
             "visual_context": non_hitl,
             "messages": vlm_messages + [HumanMessage(content=approval_text)],
         }
 
     # Human gave feedback — keep in HITL loop
-    return {
-        "messages": vlm_messages + [HumanMessage(content=response_text)],
-        "active_hitl": True,
-    }
-
-
-# ── Long-term memory extraction from HITL ────────────────────────────────────
-
-def _extract_hitl_memories(state: AstroState, messages: list, tool_name: str, approval_note: str):
-    """
-    Extract and store memories after HITL approval (non-blocking, non-fatal).
-
-    Called programmatically by the harness after every HITL approval.
-    Uses the agent's LLM to extract observations, failures, and preferences
-    from the HITL conversation context.
-
-    Design: Lesson #1 (programmatic saves), #9 (HITL-only for v1),
-            #10 (schema-driven extraction)
-    """
-    from muphrid.graph.hitl import is_memory_enabled
-    if not is_memory_enabled():
-        return
-
-    try:
-        from muphrid.memory.extraction import (
-            build_hitl_conversation_text,
-            extract_hitl_memory,
-        )
-        from muphrid.tools.utility.t33_memory_search import _MEMORY_STORE
-        from muphrid.config import make_llm
-
-        if _MEMORY_STORE is None:
-            return
-
-        phase = state.get("phase", ProcessingPhase.INGEST)
-        phase_str = phase.value if hasattr(phase, "value") else str(phase)
-        session = state.get("session", {})
-        dataset = state.get("dataset", {})
-        acquisition = dataset.get("acquisition_meta", {})
-
-        session_context = {
-            "target_name": session.get("target_name", "unknown"),
-            "target_type": session.get("target_type", ""),
-            "sensor": acquisition.get("camera_name", ""),
-            "sensor_type": acquisition.get("sensor_type", ""),
-        }
-
-        # Build conversation text from message history
-        conversation_text = build_hitl_conversation_text(messages, tool_name)
-        if not conversation_text.strip():
-            return
-
-        # If the user added an approval note, append it
-        if approval_note:
-            conversation_text += f"\n\n[Human approval note]\n{approval_note}"
-
-        # Extract memories using the agent's LLM
-        llm = make_llm()
-        extraction = extract_hitl_memory(
-            conversation=conversation_text,
-            tool_name=tool_name,
-            phase=phase_str,
-            session_context=session_context,
-            llm=llm,
-        )
-
-        # Get thread_id for session linkage
-        # (thread_id is in the config, not state — use a placeholder for now)
-        session_id = None
-
-        # Store extracted memories
-        for obs in extraction.observations:
-            _MEMORY_STORE.add_observation(
-                content=obs.content,
-                phase=obs.phase or phase_str,
-                session_id=session_id,
-                source="hitl",
-                parameters=obs.parameters,
-                metrics=obs.metrics,
-            )
-
-        for fail in extraction.failures:
-            _MEMORY_STORE.add_failure(
-                content=fail.content,
-                phase=fail.phase or phase_str,
-                tool=fail.tool or tool_name,
-                session_id=session_id,
-                source="hitl",
-                parameters=fail.parameters,
-                root_cause=fail.root_cause,
-                resolution=fail.resolution,
-            )
-
-        for pref in extraction.preferences:
-            _MEMORY_STORE.add_preference(
-                content=pref.content,
-                tool=pref.tool or tool_name,
-                session_id=session_id,
-                source="hitl",
-                parameters=pref.parameters,
-                target_type=session_context.get("target_type"),
-                sensor=session_context.get("sensor"),
-            )
-
-        total = len(extraction.observations) + len(extraction.failures) + len(extraction.preferences)
-        if total > 0:
-            logger.info(f"Memory: stored {total} memories from {tool_name} HITL approval")
-
-    except Exception as e:
-        # Memory extraction is never fatal — the pipeline must continue
-        logger.warning(f"Memory extraction failed (non-fatal): {e}")
+    return review_ctl.feedback_update(
+        state=state,
+        event=human_event,
+        tool_name=tool_name,
+        pool=payload_pool,
+        proposal=proposal,
+        prefix_messages=vlm_messages,
+    )
 
 
 # ── agent_chat ────────────────────────────────────────────────────────────────
@@ -1652,7 +2279,13 @@ def agent_chat(state: AstroState) -> dict[str, Any]:
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and not msg.tool_calls:
             consecutive_text_only += 1
-        elif isinstance(msg, HumanMessage) and msg.additional_kwargs.get("is_nudge"):
+        elif (
+            isinstance(msg, HumanMessage)
+            and (
+                msg.additional_kwargs.get("is_nudge")
+                or msg.additional_kwargs.get("is_hitl_turn_policy")
+            )
+        ):
             continue  # skip our own nudge injections
         else:
             break  # tool results, HITL feedback, etc. reset the counter
@@ -1694,12 +2327,17 @@ def route_after_agent(state: AstroState) -> str:
     messages = state.get("messages", [])
     if messages:
         last = messages[-1]
+        if (
+            isinstance(last, HumanMessage)
+            and getattr(last, "additional_kwargs", {}).get("is_hitl_turn_policy")
+        ):
+            return "agent"
         if hasattr(last, "tool_calls") and last.tool_calls:
             return "action"
 
     # Active HITL conversation — agent answered a question, route back to
     # hitl_check which will re-fire interrupt() for the human to continue.
-    if state.get("active_hitl", False):
+    if review_ctl.active_review_session(state):
         return "hitl_check"
 
     return "agent_chat"

@@ -36,22 +36,14 @@ _CFG = _load_config()
 
 # Runtime overrides — CLI/Gradio can override toml settings.
 _RUNTIME_AUTONOMOUS: bool = False
-_RUNTIME_VLM_HITL: bool | None = None
 _RUNTIME_VLM_AUTONOMOUS: bool | None = None
 _RUNTIME_VLM_RETENTION_MAX: int | None = None
-_RUNTIME_MEMORY_ENABLED: bool = False
 
 
 def set_autonomous(value: bool) -> None:
     """Called by the CLI/app to override the toml autonomous flag."""
     global _RUNTIME_AUTONOMOUS
     _RUNTIME_AUTONOMOUS = value
-
-
-def set_vlm_hitl(value: bool) -> None:
-    """Called by the app to override the toml vlm_hitl flag."""
-    global _RUNTIME_VLM_HITL
-    _RUNTIME_VLM_HITL = value
 
 
 def set_vlm_autonomous(value: bool) -> None:
@@ -64,17 +56,6 @@ def set_vlm_retention_max(value: int) -> None:
     """Called by the app to override the toml vlm_retention_max_images value."""
     global _RUNTIME_VLM_RETENTION_MAX
     _RUNTIME_VLM_RETENTION_MAX = int(value)
-
-
-def set_memory_enabled(value: bool) -> None:
-    """Called by the CLI/app to enable long-term memory."""
-    global _RUNTIME_MEMORY_ENABLED
-    _RUNTIME_MEMORY_ENABLED = value
-
-
-def is_memory_enabled() -> bool:
-    """Check if long-term memory is active for this session."""
-    return _RUNTIME_MEMORY_ENABLED
 
 
 def tool_cfg(tool_id: str) -> dict:
@@ -98,31 +79,35 @@ def is_autonomous() -> bool:
 
 
 def vlm_hitl() -> bool:
-    """Check if VLM is enabled during HITL conversations."""
-    if _RUNTIME_VLM_HITL is not None:
-        return _RUNTIME_VLM_HITL
-    return _CFG.get("vlm_hitl", False)
+    """
+    VLM access during HITL conversations.
+
+    Always True — collaboration is the entire point of HITL, and collaboration
+    over images requires the model to see what the human is referencing. There
+    is no user toggle for this; the toml ignores any value, the Gradio settings
+    panel does not expose it. The retention cap and the autonomous-mode toggle
+    remain user-controllable.
+    """
+    return True
 
 
 def vlm_autonomous() -> bool:
     """Check if VLM is enabled outside HITL (agent self-inspection)."""
     if _RUNTIME_VLM_AUTONOMOUS is not None:
         return _RUNTIME_VLM_AUTONOMOUS
-    return _CFG.get("vlm_autonomous", False)
+    return _CFG.get("vlm_autonomous", True)
 
 
 def vlm_window_cap() -> int:
     """
     Hard total cap on images retained in the agent's view per agent_node call.
 
-    Applies when vlm_autonomous is on; vlm_hitl alone uses gate-only
-    visibility (no persistence outside the active gate).
-
-    HITL gate images count against this cap like any other multimodal
-    HumanMessage. The single exception is "gate overflow": when the active
-    HITL gate alone contains more images than the cap, the gate is shown in
-    full (so the user can reference any variant they see in Gradio) and no
-    remaining budget is granted to older non-gate images. Effective ceiling:
+    Applies whenever the VLM view is being built. HITL gate variants count
+    against this cap like any other source. The single exception is "gate
+    overflow": when the active HITL gate alone contains more images than the
+    cap, the gate is shown in full (so the user can reference any variant
+    they see in Gradio) and no remaining budget is granted to older non-gate
+    images. Effective ceiling:
 
         max(cap, |images in current HITL gate|)
 
@@ -137,6 +122,40 @@ def vlm_window_cap() -> int:
         except ValueError:
             pass
     return int(_CFG.get("vlm_retention_max_images", 8))
+
+
+# ── Phase eligibility for auto-current-image projection ──────────────────────
+# Only the auto-current-image source consults this. Explicit visual
+# affordances — present_images, variant_pool, phase_carry — bypass it: the
+# agent retains full visual access on demand in any phase if it decides the
+# image will inform a decision the metrics cannot.
+
+_VLM_AUTO_PHASES = frozenset({
+    "stacking",   # current_image becomes meaningful after siril_stack
+    "linear",
+    "stretch",
+    "nonlinear",
+    "review",
+    "export",
+})
+
+
+def vlm_phase_eligible(phase) -> bool:
+    """
+    True when the auto-current-image source should project a preview.
+
+    INGEST/CALIBRATION/REGISTRATION/ANALYSIS return False — current_image
+    either does not exist yet (pre-stack) or pixel inspection adds nothing
+    over the analytical metrics. STACKING onward returns True.
+
+    Affordances the agent invokes deliberately (present_images, variant
+    capture during a HITL-mapped tool, phase-carry from a prior promotion)
+    are not gated by this — the agent's explicit choice always wins.
+    """
+    val = getattr(phase, "value", phase)
+    if not isinstance(val, str):
+        return False
+    return val in _VLM_AUTO_PHASES
 
 
 # ── Tool name → HITL config key mapping ──────────────────────────────────────
@@ -177,6 +196,12 @@ TOOL_TO_HITL: dict[str, str] = {
     "create_mask":            "T25_mask",
     "reduce_stars":           "T26_reduce_stars",
     "multiscale_process":     "T27_multiscale",
+    # Export — gated as a final review on the actual JPG export artifact
+    # (not on a FITS-derived preview). When the gate is enabled, export_final
+    # produces the export to a tentative subdirectory; the human reviews
+    # the rendered JPG; on approval, commit_export moves the tentative
+    # files into the final output_dir.
+    "export_final":           "T24_export",
 }
 
 
@@ -208,89 +233,6 @@ def resolve_hitl_checkpoint(messages: list) -> tuple[str | None, str | None]:
             hitl_key = TOOL_TO_HITL[msg.name]
             return hitl_key, msg.name
     return None, None
-
-
-# ── Affirmative detection ─────────────────────────────────────────────────────
-# HITL responses are structured, not free-text parsed. The UI (CLI, Gradio,
-# etc.) presents an explicit approve/revise choice and sends a sentinel string
-# on approval. Any other string is treated as revision feedback.
-#
-# Two flavors of approval sentinel:
-#
-#   APPROVE_SENTINEL — bare approval ("approve current state, advance phase").
-#     Used by clients that don't render the variant pool (e.g. CLI). Optionally
-#     followed by a free-text note.
-#
-#   APPROVE_VARIANT_SENTINEL — explicit variant approval, payload is JSON with
-#     {"id": "<variant_id>", "rationale": "<optional text>"}. Sent by the
-#     Gradio UI when the human clicks a specific variant's Approve button.
-#     The variant_id is unambiguous; the rationale is whatever was in the
-#     textbox at click time, recorded as the human's stated reason.
-
-APPROVE_SENTINEL = "__APPROVE__"
-APPROVE_VARIANT_SENTINEL = "__APPROVE_VARIANT__"
-
-
-def is_affirmative(response: str) -> bool:
-    """Check if the response is any kind of approval (bare or variant-specific)."""
-    text = response.strip()
-    return text.startswith(APPROVE_SENTINEL) or text.startswith(APPROVE_VARIANT_SENTINEL)
-
-
-def is_variant_approval(response: str) -> bool:
-    """Check if the response is a variant-specific approval."""
-    return response.strip().startswith(APPROVE_VARIANT_SENTINEL)
-
-
-def extract_approval_note(response: str) -> str:
-    """
-    Extract the human's note from a bare approve-with-note response.
-    Returns empty string for variant approvals (use parse_variant_approval
-    for those).
-    """
-    text = response.strip()
-    if text.startswith(APPROVE_VARIANT_SENTINEL):
-        return ""
-    if text.startswith(APPROVE_SENTINEL):
-        return text[len(APPROVE_SENTINEL):].strip()
-    return ""
-
-
-def parse_variant_approval(response: str) -> tuple[str | None, str]:
-    """
-    Parse a variant approval sentinel into (variant_id, rationale).
-
-    Format: __APPROVE_VARIANT__{"id": "T09_v3", "rationale": "..."}
-
-    Returns (None, "") if the payload is malformed — the caller should
-    treat this as revision feedback rather than approval.
-    """
-    text = response.strip()
-    if not text.startswith(APPROVE_VARIANT_SENTINEL):
-        return None, ""
-    payload = text[len(APPROVE_VARIANT_SENTINEL):].strip()
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError:
-        return None, ""
-    if not isinstance(data, dict):
-        return None, ""
-    variant_id = data.get("id")
-    if not isinstance(variant_id, str) or not variant_id:
-        return None, ""
-    rationale = data.get("rationale", "")
-    if not isinstance(rationale, str):
-        rationale = ""
-    return variant_id, rationale
-
-
-def build_variant_approval(variant_id: str, rationale: str = "") -> str:
-    """
-    Build the approval sentinel string for a variant. Used by UI clients.
-    Always pairs with parse_variant_approval on the receiving side.
-    """
-    payload = json.dumps({"id": variant_id, "rationale": rationale})
-    return f"{APPROVE_VARIANT_SENTINEL}{payload}"
 
 
 # ── Image extraction from message history ─────────────────────────────────────

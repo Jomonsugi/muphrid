@@ -1,23 +1,15 @@
 """
 T14 — stretch_image
 
-Transform the image from linear to non-linear (perceptual) brightness space.
-This is the single most impactful step — it makes the invisible faint signal
-visible by applying a non-linear transfer function.
+Apply a non-linear transfer function that transforms the image from linear
+(sensor-space) to non-linear (display-space) brightness.
 
-Backend: Siril CLI — GHS (Generalized Hyperbolic Stretch), arcsinh, or
-autostretch. GHS offers the most control and is preferred.
+Backend: Siril CLI. Methods: GHS (Generalized Hyperbolic Stretch), arcsinh,
+autostretch.
 
-Produce multiple variants using distinct output_suffix values (e.g. 'gentle',
-'moderate', 'aggressive') so the best result can be selected. After stretch,
-the image is non-linear — subsequent linear tools (T09–T13) must not be
-applied.
-
-Key metrics to monitor (from analyze_image after stretch):
-  - clipped_shadows_pct < 0.5% — preserve faint nebulosity
-  - clipped_highlights_pct < 0.1% — avoid burned star cores
-Always use linked stretch (same transfer function across channels) after color
-calibration to preserve white balance.
+Produces variants identified by output_suffix. Each call stretches from the
+same linear master — variants are independent and do not chain. After the
+stretch, the image is non-linear; linear-space tools are no longer valid.
 """
 
 from __future__ import annotations
@@ -43,30 +35,24 @@ from muphrid.tools._siril import fits_has_nan, run_siril_script
 class GHSOptions(BaseModel):
     stretch_amount: float = Field(
         description=(
-            "D: stretch intensity (0–10). The primary control — determines how "
+            "D: stretch intensity (0–10). Primary control — determines how "
             "aggressively the non-linear transfer function redistributes pixel "
-            "values. Higher D moves the histogram further from linear. Choose "
-            "based on how much the histogram needs to shift to reveal the signal "
-            "of interest, then verify with analyze_image."
+            "values. Higher D moves the histogram further from linear."
         ),
     )
     local_intensity: float = Field(
         default=0.0,
         description=(
-            "B: focuses the stretch around the symmetry point (-5 to 15). "
-            "0 = standard exponential stretch. "
-            "Higher values (5–13) create a very targeted stretch around SP — "
-            "useful for brightening specific tonal ranges without affecting others. "
-            "Negative values create a de-focused stretch."
+            "B: focus of the stretch around the symmetry point (-5 to 15). "
+            "0 = standard exponential stretch. Positive values tighten the "
+            "stretch around SP. Negative values de-focus it."
         ),
     )
     symmetry_point: float = Field(
         default=0.0,
         description=(
-            "SP: the brightness level where the stretch adds the most contrast "
-            "(0–1). Set SP to the region of the histogram where your signal of "
-            "interest lives. 0.0 targets the darkest values. Use analyze_image "
-            "histogram data to identify where the signal sits."
+            "SP: the brightness level (0–1) at which the stretch adds the "
+            "most contrast. 0.0 targets the darkest values."
         ),
     )
     shadow_protection: float = Field(
@@ -81,27 +67,24 @@ class GHSOptions(BaseModel):
         default=1.0,
         description=(
             "HP: pixels above this value are stretched linearly instead of "
-            "non-linearly (0–1). Prevents bright pixels from clipping and "
-            "star cores from bloating. 1.0 = no protection. Lower HP to "
-            "protect more of the bright end. Check clipped_highlights_pct "
-            "in analyze_image to decide whether HP needs adjusting."
+            "non-linearly (0–1). 1.0 = no protection. Lower HP stretches "
+            "less of the bright end non-linearly."
         ),
     )
     color_model: str = Field(
         default="human",
         description=(
-            "human: preserves human color perception (L*a*b* lightness) — recommended "
-            "for color images after color calibration. "
+            "human: L*a*b* lightness-weighted (preserves perceived color). "
             "even: equal weights across channels. "
-            "independent: each channel processed independently — use only if you "
-            "intentionally want to alter white balance."
+            "independent: each channel processed independently (can shift "
+            "white balance)."
         ),
     )
     channels: str = Field(
         default="all",
         description=(
-            "Which channels to apply the stretch to. "
-            "all: all channels (default, use for linked stretch). "
+            "Which channels receive the stretch. "
+            "all: all channels with the same parameters (linked stretch). "
             "R, G, B: single channel. RG, RB, GB: channel pairs."
         ),
     )
@@ -111,9 +94,61 @@ class GHSOptions(BaseModel):
             "How out-of-range values are handled after stretch. "
             "'clip': hard clip to [0,1]. "
             "'rescale': rescale to fit. "
-            "'rgbblend': blend RGB to preserve color (default, recommended). "
+            "'rgbblend': blend RGB to preserve color. "
             "'globalrescale': rescale uniformly across all channels."
         ),
+    )
+    per_channel: list["GHSChannelOverride"] | None = Field(
+        default=None,
+        description=(
+            "Per-channel parameter overrides. Must be a list of exactly 3 "
+            "entries in [R, G, B] order. When provided, the stretch runs "
+            "three sequential `ght <channel>` commands inside a single "
+            "Siril script — each channel uses its merged parameters "
+            "(channel override fields override the corresponding base "
+            "GHSOptions fields; None entries inherit). The base `channels` "
+            "field is ignored when per_channel is set. None (default) "
+            "applies a single linked stretch using the base parameters."
+        ),
+    )
+
+
+class GHSChannelOverride(BaseModel):
+    """
+    Per-channel parameter overrides for GHS. Any field left None inherits
+    from the base GHSOptions. Used as one entry in
+    GHSOptions.per_channel = [override_R, override_G, override_B].
+    """
+    stretch_amount: float | None = Field(
+        default=None,
+        description="Override D for this channel. None = inherit from base.",
+    )
+    local_intensity: float | None = Field(
+        default=None,
+        description="Override B for this channel. None = inherit from base.",
+    )
+    symmetry_point: float | None = Field(
+        default=None,
+        description="Override SP for this channel. None = inherit from base.",
+    )
+    shadow_protection: float | None = Field(
+        default=None,
+        description="Override LP for this channel. None = inherit from base.",
+    )
+    highlight_protection: float | None = Field(
+        default=None,
+        description="Override HP for this channel. None = inherit from base.",
+    )
+    color_model: str | None = Field(
+        default=None,
+        description=(
+            "Override color_model for this channel. None = inherit from base. "
+            "Rarely useful per-channel — included for completeness."
+        ),
+    )
+    clip_mode: str | None = Field(
+        default=None,
+        description="Override clip_mode for this channel. None = inherit from base.",
     )
 
 
@@ -122,21 +157,20 @@ class AsinhOptions(BaseModel):
         default=100.0,
         description=(
             "Stretch strength (1–1000). Higher values produce a stronger "
-            "non-linear lift of faint signal. The effect depends on the data — "
-            "verify with analyze_image after applying."
+            "non-linear transfer response."
         ),
     )
     black_point_offset: float = Field(
         default=0.0,
         description=(
-            "Normalized offset (0–1) applied to the black point before stretching. "
-            "Small positive values (0.0–0.05) lift the black level slightly."
+            "Normalized offset (0–1) applied to the black point before "
+            "stretching."
         ),
     )
     color_model: str = Field(
         default="human",
         description=(
-            "human: preserves L*a*b* lightness (recommended for color). "
+            "human: L*a*b* lightness-weighted. "
             "default: simple channel mean for luminance calculation."
         ),
     )
@@ -168,8 +202,9 @@ class AutostretchOptions(BaseModel):
     linked: bool = Field(
         default=True,
         description=(
-            "Linked stretch: apply same parameters to all channels. "
-            "Always use True after color calibration to preserve white balance."
+            "True: apply identical parameters to all channels (linked "
+            "stretch — preserves channel ratios). False: each channel "
+            "computed independently (can shift white balance)."
         ),
     )
 
@@ -178,10 +213,11 @@ class StretchImageInput(BaseModel):
     method: str = Field(
         default="ghs",
         description=(
-            "ghs: Generalized Hyperbolic Stretch — preferred for fine control. "
-            "asinh: Arcsinh stretch — simpler, smooth shadow lifting. "
-            "autostretch: Automatic histogram-based stretch — safe fallback / "
-            "quick first look. Use linked=True to preserve color balance."
+            "ghs: Generalized Hyperbolic Stretch — parametric transfer with "
+            "five controls (see GHSOptions). "
+            "asinh: Arcsinh transfer function (see AsinhOptions). "
+            "autostretch: Siril automatic histogram-based stretch (see "
+            "AutostretchOptions)."
         ),
     )
     ghs_options: GHSOptions | None = Field(
@@ -193,15 +229,42 @@ class StretchImageInput(BaseModel):
     output_suffix: str = Field(
         default="stretch",
         description=(
-            "Suffix appended to the output filename stem. "
-            "Use descriptive names when producing variants: 'gentle', 'moderate', "
-            "'aggressive'. Allows the agent to produce multiple variants without "
-            "overwriting each other."
+            "Suffix appended to the output filename stem. Each distinct "
+            "suffix yields an independent variant file; identical suffix "
+            "with identical parameters is rejected as a duplicate."
         ),
     )
 
 
 # ── Command builders ───────────────────────────────────────────────────────────
+
+def _merge_ghs_with_override(
+    base: "GHSOptions",
+    override: "GHSChannelOverride",
+    channel: str,
+) -> "GHSOptions":
+    """
+    Build a single-channel-scoped GHSOptions by merging a per-channel
+    override onto the base options. Override fields that are None inherit
+    from the base. The `channels` field is forced to the given letter
+    ('R' / 'G' / 'B') and `per_channel` is cleared on the returned copy
+    so downstream command building treats it as a normal single-channel
+    invocation.
+    """
+    def _pick(o, b):
+        return o if o is not None else b
+    return GHSOptions(
+        stretch_amount=_pick(override.stretch_amount, base.stretch_amount),
+        local_intensity=_pick(override.local_intensity, base.local_intensity),
+        symmetry_point=_pick(override.symmetry_point, base.symmetry_point),
+        shadow_protection=_pick(override.shadow_protection, base.shadow_protection),
+        highlight_protection=_pick(override.highlight_protection, base.highlight_protection),
+        color_model=_pick(override.color_model, base.color_model),
+        channels=channel,
+        clip_mode=_pick(override.clip_mode, base.clip_mode),
+        per_channel=None,
+    )
+
 
 def _build_ghs_cmd(opts: GHSOptions) -> str:
     # Siril constraint: LP must be <= SP. Clamp if the agent violated this.
@@ -272,23 +335,21 @@ def stretch_image(
     """
     Apply a non-linear stretch to the linear FITS image.
 
-    Transforms linear (un-stretched) data into perceptual brightness space,
-    making faint signal visible. All variants stretch from the same linear
-    master — they are independent, not chained.
+    Transforms linear (sensor-space) data into non-linear (display-space)
+    brightness. All variants stretch from the same linear master — they are
+    independent, not chained.
 
     Each call produces a variant with an auto-generated name from the method
-    and parameters (e.g. ghs_d25_b0_sp009). The result includes the variant
-    name and file path. To compare variants, call present_images with the
-    paths from each result.
-
-    Use select_stretch_variant to choose the best variant as the active image.
+    and parameters (e.g. ghs_d25_b0_sp009) unless output_suffix is set. The
+    result includes the variant name and file path. Use select_stretch_variant
+    to promote a variant to the active image.
 
     Methods:
-    - ghs: most control — five parameters shape the transfer function.
-      Choose parameters based on the histogram and verify with analyze_image.
-    - autostretch: automatic histogram-based stretch — useful as a quick
-      first look to understand the data before switching to GHS.
-    - asinh: smooth shadow lifting without harsh highlight compression.
+    - ghs: Generalized Hyperbolic Stretch. Five parameters shape the transfer
+      function (see GHSOptions).
+    - asinh: arcsinh transfer function (see AsinhOptions).
+    - autostretch: Siril automatic histogram-based stretch (see
+      AutostretchOptions).
     """
     working_dir = state["dataset"]["working_dir"]
     metadata = state.get("metadata", {})
@@ -351,8 +412,7 @@ def stretch_image(
 
     if method == "ghs" and ghs_options is None:
         raise ValueError(
-            "ghs_options.stretch_amount is required for method=ghs. "
-            "Provide a stretch_amount (e.g., 2.5 for a moderate first stretch)."
+            "ghs_options.stretch_amount is required for method=ghs."
         )
 
     stem = img_path.stem
@@ -360,10 +420,22 @@ def stretch_image(
     # Auto-generate suffix from parameters if not provided
     if not output_suffix or output_suffix == "stretch":
         if method == "ghs" and ghs_options is not None:
-            d = int(ghs_options.stretch_amount * 10) if ghs_options.stretch_amount else 0
-            b = int(ghs_options.local_intensity) if ghs_options.local_intensity else 0
-            sp = int(ghs_options.symmetry_point * 1000) if ghs_options.symmetry_point else 0
-            output_suffix = f"ghs_d{d}_b{b}_sp{sp:03d}"
+            if ghs_options.per_channel is not None:
+                # Per-channel suffix encodes the three D values
+                ds: list[str] = []
+                for ov in ghs_options.per_channel:
+                    d_val = (
+                        ov.stretch_amount
+                        if ov.stretch_amount is not None
+                        else ghs_options.stretch_amount
+                    )
+                    ds.append(str(int((d_val or 0) * 10)))
+                output_suffix = f"ghs_pc_d{'_'.join(ds)}"
+            else:
+                d = int(ghs_options.stretch_amount * 10) if ghs_options.stretch_amount else 0
+                b = int(ghs_options.local_intensity) if ghs_options.local_intensity else 0
+                sp = int(ghs_options.symmetry_point * 1000) if ghs_options.symmetry_point else 0
+                output_suffix = f"ghs_d{d}_b{b}_sp{sp:03d}"
         elif method == "asinh":
             sf = int(asinh_options.stretch_factor * 10) if asinh_options.stretch_factor else 0
             output_suffix = f"asinh_sf{sf}"
@@ -373,18 +445,56 @@ def stretch_image(
 
     output_stem = f"{stem}_{output_suffix}"
 
-    if method == "ghs":
-        stretch_cmd = _build_ghs_cmd(ghs_options)  # type: ignore[arg-type]
-    elif method == "asinh":
-        stretch_cmd = _build_asinh_cmd(asinh_options)
+    # Per-channel GHS path: validate the override list, then build a
+    # single Siril script that runs three sequential `ght <channel>`
+    # commands inside one load/save pair so the per-channel stretches
+    # compose in memory without intermediate disk round-trips.
+    if (
+        method == "ghs"
+        and ghs_options is not None
+        and ghs_options.per_channel is not None
+    ):
+        if len(ghs_options.per_channel) != 3:
+            raise ValueError(
+                f"ghs_options.per_channel must have exactly 3 entries "
+                f"[R, G, B]; got {len(ghs_options.per_channel)}."
+            )
+        channel_letters = ("R", "G", "B")
+        per_channel_cmds: list[str] = []
+        merged_per_channel: list[dict] = []
+        for letter, override in zip(channel_letters, ghs_options.per_channel):
+            merged = _merge_ghs_with_override(ghs_options, override, letter)
+            per_channel_cmds.append(_build_ghs_cmd(merged))
+            merged_per_channel.append({
+                "channel": letter,
+                "stretch_amount": merged.stretch_amount,
+                "local_intensity": merged.local_intensity,
+                "symmetry_point": merged.symmetry_point,
+                "shadow_protection": merged.shadow_protection,
+                "highlight_protection": merged.highlight_protection,
+                "color_model": merged.color_model,
+                "clip_mode": merged.clip_mode,
+            })
+        # Single-line summary for diagnostics; the full per-channel cmd
+        # list goes into the JSON summary below.
+        stretch_cmd = " ; ".join(per_channel_cmds)
+        commands = [f"load {stem}", *per_channel_cmds, f"save {output_stem}"]
     else:
-        stretch_cmd = _build_autostretch_cmd(autostretch_options)
+        if method == "ghs":
+            stretch_cmd = _build_ghs_cmd(ghs_options)  # type: ignore[arg-type]
+            merged_per_channel = []
+        elif method == "asinh":
+            stretch_cmd = _build_asinh_cmd(asinh_options)
+            merged_per_channel = []
+        else:
+            stretch_cmd = _build_autostretch_cmd(autostretch_options)
+            merged_per_channel = []
+        commands = [
+            f"load {stem}",
+            stretch_cmd,
+            f"save {output_stem}",
+        ]
 
-    commands = [
-        f"load {stem}",
-        stretch_cmd,
-        f"save {output_stem}",
-    ]
     result = run_siril_script(commands, working_dir=working_dir, timeout=120)
 
     output_path = Path(working_dir) / f"{output_stem}.fit"
@@ -409,9 +519,14 @@ def stretch_image(
             "shadow_protection": ghs_options.shadow_protection,
             "highlight_protection": ghs_options.highlight_protection,
             "color_model": ghs_options.color_model,
-            "channels": ghs_options.channels,
+            "channels": (
+                "per_channel" if ghs_options.per_channel is not None
+                else ghs_options.channels
+            ),
             "clip_mode": ghs_options.clip_mode,
         }
+        if ghs_options.per_channel is not None and merged_per_channel:
+            summary["ghs_per_channel_merged"] = merged_per_channel
     elif method == "asinh":
         summary["asinh_parameters"] = {
             "stretch_factor": asinh_options.stretch_factor,
@@ -426,31 +541,58 @@ def stretch_image(
     if stretch_stats:
         summary["stretch_stats"] = stretch_stats
 
+    # `pre_stretch_image` is a one-shot capture: only set on the first
+    # stretch call, stable thereafter. We compute it here (None or path)
+    # and inline it in the dict literal below — keeping the metadata emit
+    # inspectable by the registry's structural drift check, which only
+    # walks dict literals (no name references).
+    new_pre_stretch = (
+        state["paths"]["current_image"]
+        if metadata.get("pre_stretch_image") is None
+        else metadata.get("pre_stretch_image")
+    )
+
+    # Delta-only metadata emit, ALL keys inline so the structural drift
+    # check (registry._assert_image_space_writers) can verify the
+    # image_space contract statically. The deep-merge reducer composes
+    # this with siblings; `stretch_variants` is itself a dict that the
+    # reducer merges into the existing variants map without losing prior
+    # entries. `image_space` is THE transition: stretch is the one tool
+    # that turns linear sensor-space data into display-space.
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(output_path)},
+        "paths": {"current_image": str(output_path)},
         "metadata": {
-            **state["metadata"],
-            "pre_stretch_image": metadata.get("pre_stretch_image", state["paths"]["current_image"]),
-            "stretch_variants": {**_stretch_variants, output_suffix: _args_fingerprint},
+            # Stretch is THE transition: linear → display. After this
+            # point, downstream tools (export, preview generation) MUST
+            # use the display-space source profile / no-autostretch
+            # path. See Metadata.image_space — state is the
+            # authoritative contract.
+            "image_space": "display",
+            "stretch_variants": {output_suffix: _args_fingerprint},
+            "pre_stretch_image": new_pre_stretch,
         },
-        # Stretch output is always non-linear — mark it so downstream
-        # consumers (e.g. export_final) use the correct ICC source profile.
-        "metrics": {**state.get("metrics", {}), "is_linear_estimate": False},
+        # Heuristic snapshot stays diagnostic; image_space (above) is the
+        # authoritative render contract. See CLAUDE.md.
+        "metrics": {"is_linear_estimate": False},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })
 
 
 # ── Select variant tool ──────────────────────────────────────────────────────
 
-@tool
-def select_stretch_variant(
-    variant: Annotated[str, Field(
+class SelectStretchVariantInput(BaseModel):
+    variant: str = Field(
         description=(
             "The output_suffix of the variant to select (e.g. 'aggressive', "
             "'moderate', 'gentle'). Must match a suffix used in a previous "
             "stretch_image call."
         ),
-    )],
+    )
+
+
+@tool(args_schema=SelectStretchVariantInput)
+def select_stretch_variant(
+    variant: str,
     tool_call_id: Annotated[str, InjectedToolCallId] = None,
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
@@ -520,7 +662,12 @@ def select_stretch_variant(
         params = {}
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(variant_path)},
+        "paths": {"current_image": str(variant_path)},
+        # Selecting a stretch variant promotes a display-space artifact;
+        # the variant was produced by a previous stretch_image call which
+        # has already crossed the linear → display transition. State must
+        # reflect this so preview/export render decisions are correct.
+        "metadata": {"image_space": "display"},
         "messages": [ToolMessage(
             content=json.dumps({
                 "selected_variant": variant,

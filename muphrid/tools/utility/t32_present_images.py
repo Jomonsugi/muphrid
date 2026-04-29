@@ -31,6 +31,7 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from muphrid.graph.hitl import vlm_autonomous
 from muphrid.graph.state import AstroState, VisualRef
 
 logger = logging.getLogger(__name__)
@@ -95,15 +96,42 @@ def present_images(
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
     """
-    Present images for visual inspection and comparison.
+    Present contextual imagery for visual inspection — NOT for HITL approval.
+
+    Two distinct tools, two distinct intents:
+
+      * present_for_review (T39) — surface specific pool variants for
+        human approval. Approve buttons appear. Use this when you want
+        the human to weigh in on a candidate from variant_pool. The
+        variant_id you reference must exist in the pool.
+
+      * present_images (this tool) — show CONTEXT. Reference imagery,
+        before/after comparisons, cross-phase artifacts. No Approve
+        consequence. The human can see what you're showing them but
+        cannot approve it directly.
+
+    Use present_images for things that aren't in variant_pool:
+
+      * Cross-phase comparisons — e.g. the linear-stage original
+        alongside the current stretched image so the human sees the
+        effect of stretch over multiple phases.
+      * Reference imagery you've retrieved or generated for
+        benchmarking purposes.
+      * A focused side-by-side of two specific frames you want
+        the human to look at — when no approval decision is needed.
+
+    Do NOT use this tool to surface variants for approval — that's
+    what present_for_review is for. Calling present_images on a
+    variant from the pool will show the image but will NOT make it
+    approvable; the human will see something they can't act on, which
+    is exactly the confusion this two-tool split was introduced to
+    prevent.
 
     analyze_image is your primary diagnostic tool — use it first for
-    data-driven decisions. Call present_images when visual inspection
-    is needed to evaluate results that metrics alone cannot fully capture:
-    stretch character, gradient artifacts, star rendering, color balance.
-
-    Do NOT use as a default step after every tool — most decisions are
-    fully served by analyze_image data.
+    data-driven decisions. Reach for present_images only when visual
+    inspection is needed to evaluate qualitative results that metrics
+    alone cannot capture (stretch character, gradient artifacts, star
+    rendering, color balance).
     """
     valid_images: list[ImageEntry] = []
     for img in images:
@@ -120,8 +148,21 @@ def present_images(
             )],
         })
 
+    # Honesty about visual access. When vlm_autonomous is off and the call
+    # is happening outside an active HITL gate, the images won't actually
+    # reach the model's view — _select_visible_refs will skip them. Tell
+    # the agent so it can adjust reasoning instead of expecting visualization
+    # that won't materialize. The state side-effect (visual_context update)
+    # still happens — when an HITL gate opens later, those references can
+    # become visible via the gate's visibility rules.
+    state = state or {}
+    from muphrid.graph import review as review_ctl
+
+    in_hitl = bool(review_ctl.active_review_session(state))
+    visual_will_render = in_hitl or vlm_autonomous()
+
     # Build the result the presenter layer reads from the ToolMessage stream
-    result = {
+    result: dict = {
         "status": "presented",
         "title": title,
         "description": description,
@@ -131,10 +172,19 @@ def present_images(
         ],
         "count": len(valid_images),
     }
+    if not visual_will_render:
+        result["status"] = "presented_text_only"
+        result["visual_access"] = (
+            "Visual access is disabled outside HITL gates (vlm_autonomous=false). "
+            "These image paths exist on disk but will not be rendered into my "
+            "view. Reason from analyze_image metrics for the decision; the human "
+            "will see the images in the Gradio panel and can comment on them. "
+            "When an HITL gate opens, these references will become visible "
+            "automatically."
+        )
 
     # Build new visual_context: replace previous present_images entries with
     # this call's set; preserve other sources (hitl_variant, phase_carry).
-    state = state or {}
     working_dir = state.get("dataset", {}).get("working_dir", "")
     is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
     phase_value = state.get("phase")

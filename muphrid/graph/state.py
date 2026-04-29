@@ -16,10 +16,17 @@ from __future__ import annotations
 
 import operator
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from langgraph.graph.message import add_messages
-from typing import TypedDict
+
+# Pydantic 2.13+ requires typing_extensions.TypedDict on Python < 3.12 —
+# typing.TypedDict's runtime introspection is missing fields the schema
+# generator reads, producing "all fields missing" validation errors when
+# langchain auto-generates a tool args schema that includes AstroState
+# (e.g. on the async Gradio path). typing_extensions.TypedDict is a
+# drop-in replacement and is correct on all supported Python versions.
+from typing_extensions import NotRequired, TypedDict
 
 
 def _merge_dicts(old: dict, new: dict) -> dict:
@@ -31,6 +38,90 @@ def _merge_dicts(old: dict, new: dict) -> dict:
         else:
             merged[k] = v
     return merged
+
+
+# ── Replace-aware reducers ────────────────────────────────────────────────────
+#
+# Some state fields need BOTH semantics:
+#   * additive composition (so parallel tool calls each contribute their delta
+#     and none of them clobber the others), AND
+#   * full clear / replacement (so rewind_phase can reset the field to a
+#     captured snapshot, and advance_phase can wipe phase-scoped state).
+#
+# A plain dict-merge reducer only supports composition; a plain replace
+# reducer only supports clearing. The Replace sentinel below threads the
+# needle: by default the reducer composes, but when it sees Replace(value)
+# it returns value as-is, throwing away whatever was there before.
+#
+# Use Replace from clearer/restorer code paths (rewind_phase, advance_phase
+# clears, etc.). Regular tool updates should emit plain deltas — the reducer
+# composes them without losing siblings under parallel execution.
+#
+# This pattern is documented in CLAUDE.md "Tool state updates" section so
+# that future contributors don't reintroduce the {**state["X"], "k": v}
+# spread idiom that silently breaks parallel writes.
+
+# Magic key used by the Replace sentinel. Chosen to be unique enough that
+# accidental collision with a real dict key is implausible. Any dict with
+# this key set to True is treated as a Replace wrapper by the reducers.
+_REPLACE_MAGIC = "__muphrid_replace__"
+
+
+def Replace(value):  # noqa: N802 — function-style API, mirrors a constructor
+    """
+    Sentinel telling Replace-aware reducers to fully replace the field
+    with the wrapped value rather than merging.
+
+    Usage:
+        return Command(update={"metrics": Replace(restored_metrics)})
+
+    Implementation note: Replace is a plain dict (`{"__muphrid_replace__":
+    True, "value": value}`), not a custom class. This matters because
+    LangGraph's checkpointer serializes intermediate writes via ormsgpack
+    BEFORE the reducer collapses them — a custom class would raise
+    `Type is not msgpack serializable`. A dict packs natively. The
+    reducers below recognize the magic key and unwrap.
+    """
+    return {_REPLACE_MAGIC: True, "value": value}
+
+
+def _is_replace(x) -> bool:
+    """True iff x is a Replace-wrapped value."""
+    return isinstance(x, dict) and x.get(_REPLACE_MAGIC) is True
+
+
+def _replace_unwrap(x):
+    """If x is a Replace wrapper, return its inner value; else return x."""
+    if _is_replace(x):
+        return x.get("value")
+    return x
+
+
+def _dict_merge_or_replace(old, new):
+    """
+    Reducer for dict-valued fields that need parallel-safe composition AND
+    explicit replacement.
+
+      * Replace(v)            → v (full replacement)
+      * dict + dict           → deep merge (additive)
+      * non-dict new          → return new (replace, matches default semantics)
+
+    Used by the `metrics` field so multiple tools can each add their own
+    keys in a single parallel super-step without stomping each other, while
+    rewind_phase can still clear and restore via Replace(snapshot).
+
+    Defensive on `old`: in normal LangGraph flow, the canonical channel
+    value is always already a real dict (with the Replace wrapper unwrapped
+    by the prior reducer pass). The unwrap here is for robustness — if a
+    sequence of updates ever produces an unexpected shape, we treat a
+    Replace-wrapped old as its inner value rather than silently dropping it.
+    """
+    old = _replace_unwrap(old)
+    if _is_replace(new):
+        return new.get("value")
+    if isinstance(new, dict) and isinstance(old, dict):
+        return _merge_dicts(old, new)
+    return new
 
 
 # ── Processing phases ──────────────────────────────────────────────────────────
@@ -98,7 +189,77 @@ class Metadata(TypedDict):
     plate_solve_coords: dict | None  # {"ra": float, "dec": float}
     focal_length_mm:    float | None
     pixel_size_um:      float | None
-    checkpoints:        dict[str, str] | None  # agent-named image state bookmarks
+
+    # Authoritative render state — what space the pipeline has put the
+    # current image into. "linear" before stretch_image runs (stack
+    # output, gradient removal, color calibration, deconvolution all
+    # preserve linear); "display" after stretch_image and through every
+    # nonlinear tool that follows.
+    #
+    # READ SITES (Gradio preview generation, export_final source-profile
+    # selection, future agent prompt) consult ONLY this field. They
+    # never fall back to metrics.is_linear_estimate, never infer from
+    # FITS HISTORY, never default to a "safe" value when missing. A
+    # missing image_space at a read site means the checkpoint predates
+    # this contract — the run refuses with a clear message rather than
+    # silently producing wrong renders.
+    #
+    # WRITERS — every tool whose Command.update writes paths.current_image
+    # MUST also write metadata.image_space. The structural drift check at
+    # registry import time refuses to start the system if any current_image
+    # writer omits it. See `muphrid.graph.registry._assert_image_space_writers`.
+    #
+    # Distinct from `metrics.is_linear_estimate`, which is analyze_image's
+    # diagnostic "what the data looks like." That stays as observation;
+    # image_space is the contract.
+    image_space:        Literal["linear", "display"]
+    checkpoints:        dict[str, dict] | None  # agent-named image state bookmarks; entries are {"path": str, "image_space": Literal["linear","display"]}
+
+    # Last variant committed to current_image — set by both HITL promote_variant
+    # and the autonomous commit_variant tool. Lets commit_variant detect the
+    # "already committed via HITL" race (variant_pool is empty but the variant
+    # was promoted) and return idempotent success instead of a confusing error.
+    # Keys: {"id": str, "file_path": str}. None before any commit.
+    last_committed_variant: dict | None
+
+    # Snapshot of the metrics dict from the most recent analyze_image call.
+    # Persists across tool calls so the next analyze_image can compare
+    # current measurements against it and surface regression_warnings.
+    # Updated by analyze_image on every successful run; cleared by phase
+    # transitions (baselines don't carry across phases — different metrics
+    # become meaningful in different phases).
+    last_analysis_snapshot: dict | None
+
+    # Phase-boundary state snapshots, keyed by ProcessingPhase value.
+    # Written by advance_phase as the pipeline transitions: the snapshot
+    # under key X represents the working state at the moment the pipeline
+    # entered phase X (= the end of the prior phase). rewind_phase reads
+    # these to restore the working state when the agent decides a phase
+    # mistake originated upstream. See PhaseSnapshot for the captured
+    # field set.
+    phase_checkpoints: dict[str, "PhaseSnapshot"] | None
+
+    # Per-target rewind counter. rewind_phase increments the count for the
+    # target phase on every successful rewind and refuses when the count
+    # is already ≥ 1. The first rewind to a phase is the safety net; a
+    # second would suggest a structural problem the framework can't fix
+    # on its own — the agent is expected to surface that situation rather
+    # than loop on rewinds.
+    phase_rewind_counts: dict[str, int] | None
+
+    # Export bookkeeping — written by t24_export and t24_commit_export.
+    #   export_done       : True after a successful direct export OR after
+    #                       commit_export promotes a tentative export.
+    #   exported_files    : list of {"path", "format", "icc_profile",
+    #                       "file_size_mb"} for the final-location files.
+    #   tentative_export  : non-None while a HITL-gated tentative export
+    #                       is staged but not yet committed. Carries the
+    #                       staging dir, final dir, file list, and
+    #                       preview_jpg path so commit_export and the
+    #                       gate's preview consumer agree on the artifact.
+    export_done:        bool | None
+    exported_files:     list | None
+    tentative_export:   dict | None
 
 
 class FrameMetrics(TypedDict, total=False):
@@ -162,6 +323,19 @@ class Metrics(TypedDict):
     # Contrast (p95 - p5 luminance range)
     contrast_ratio:      float | None
 
+    # Structured additions from analyze_image. See T20 docstring for the
+    # full definition of each. All optional so legacy callers keep working.
+    pixel_coverage:        dict | None            # total / n_valid / valid_pct / etc.
+    clipping_per_channel:  dict | None            # per-channel clip staircase at chosen thresholds
+    mode_estimate:         dict | None            # histogram-peak per channel + luminance
+    background_quadrants:  dict | None            # per-quadrant bg/noise/valid
+    wavelet_noise_scales:  list | None            # noise at multiple wavelet scales
+    channel_snr:           dict | None            # per-channel P95 / MAD SNR
+    star_distribution:     dict | None            # FWHM/peak/roundness percentiles
+    bg_box_size:           int | None             # Background2D tile size actually used
+    histogram:             dict | None            # per-channel percentile summary
+    analyze_params:        dict | None            # echoed call parameters for reproducibility
+
 
 class AcquisitionMeta(TypedDict):
     target_name:      str | None
@@ -211,6 +385,79 @@ class ReportEntry(TypedDict):
     outcome:        str          # "success" | "degraded" | "error" | "reverted"
     outcome_detail: str          # brief summary of what changed or went wrong
     timestamp:      str          # ISO 8601
+
+
+class PhaseSnapshot(TypedDict):
+    """
+    A frozen slice of working state captured at a phase boundary.
+
+    Written by advance_phase into metadata.phase_checkpoints[<new_phase>]
+    at the moment the pipeline transitions: the snapshot under key X
+    represents "the state at the start of phase X" (equivalently, the
+    end of the prior phase). rewind_phase reads these to roll the
+    working state back to a known-good boundary when the agent decides
+    a phase-level mistake originated upstream.
+
+    Captured fields are everything that defines the working "scratchpad"
+    of the pipeline at a moment in time. The narrative — messages,
+    processing_report, processing_log.md — is intentionally NOT captured;
+    it stays append-only across rewinds so the agent (and any later
+    reviewer) can see what the abandoned phase tried and why it was
+    abandoned. metadata.phase_checkpoints itself is also excluded from
+    the metadata snapshot to avoid recursive growth across rewinds.
+
+    Field semantics:
+      paths              — full PathState dict (current_image, sequence
+                            chain, masters, mask, preview pointers, etc.)
+      metrics            — full Metrics dict
+      metadata           — Metadata dict minus phase_checkpoints and
+                            last_analysis_snapshot (which is itself a
+                            transient analyze_image baseline)
+      regression_warnings — pending warnings at the moment of advance
+      variant_pool       — typically empty (advance_phase clears it)
+                            but captured for safety
+      visual_context     — typically empty (advance_phase clears it)
+                            but captured for safety
+      captured_at        — ISO 8601 timestamp
+      captured_from_phase — the phase that just ended, for diagnostics
+    """
+    paths:                  dict
+    metrics:                dict
+    metadata:               dict
+    regression_warnings:    list
+    variant_pool:           list
+    visual_context:         list
+    captured_at:            str
+    captured_from_phase:    str
+
+
+class RegressionWarning(TypedDict):
+    """
+    An image-quality metric that worsened between two analyze_image calls.
+
+    Written by analyze_image when a current measurement has degraded vs the
+    baseline in metadata.last_analysis_snapshot. Informational — the agent
+    reads these to decide whether to revert (restore_checkpoint / rewind_phase)
+    or accept the tradeoff. Nothing in the framework blocks on their presence.
+
+    Lifecycle:
+      - Emitted by analyze_image when a metric breaks the configured
+        deterioration threshold for its direction.
+      - Cleared individually when a subsequent analyze_image shows the metric
+        has returned within tolerance of the warning's own baseline value.
+      - Cleared en-masse by restore_checkpoint, rewind_phase, and advance_phase
+        (the current-phase warnings are finalized into processing_log.md at
+        the advance moment, then state starts fresh in the new phase).
+    """
+    metric:           str               # canonical metric key, e.g. "clipped_highlights_pct"
+    baseline:         float | int | None # value at the baseline analyze_image
+    current:          float | int | None # value at the detecting analyze_image
+    delta:            float              # signed change (current − baseline)
+    relative_delta:   float | None       # (current − baseline) / baseline, when baseline ≠ 0
+    direction:        str                # "worse" — always, since only worsening triggers a warning
+    summary:          str                # "Highlight clipping rose 0.1% → 3.2% (+3.1%)"
+    phase_origin:     str                # ProcessingPhase at detection time
+    detected_at:      str                # ISO 8601 timestamp
 
 
 class VisualRef(TypedDict):
@@ -274,6 +521,75 @@ class Variant(TypedDict):
     metrics:      dict          # snapshot of relevant metrics at capture time
     created_at:   str           # ISO 8601
     rationale:    str | None    # populated only after this variant is committed
+
+
+class ReviewHumanEvent(TypedDict, total=False):
+    """
+    A typed human event delivered while a HITL review session is paused.
+
+    This replaces treating every resume value as ambiguous text. Chat
+    questions, revision feedback, and approval clicks remain model-visible,
+    but the graph controller can apply the correct state transition without
+    parsing UX intent out of prose.
+    """
+    type: Literal["question", "feedback", "approve_variant", "approve_current"]
+    text: str
+    variant_id: NotRequired[str]
+    rationale: NotRequired[str]
+    received_at: NotRequired[str]
+
+
+class ReviewProposalCandidate(TypedDict):
+    """One approvable candidate in a review proposal artifact."""
+    variant_id:   str
+    rationale:    str
+    presented_at: str
+
+
+class ReviewProposal(TypedDict, total=False):
+    """
+    First-class artifact rendered by clients during a HITL review.
+
+    This artifact is the canonical UI and approval contract: which candidates
+    are approvable, what the agent recommends, and what tradeoffs or metrics
+    should be shown alongside the images.
+    """
+    candidates:        list[ReviewProposalCandidate]
+    recommendation:    str | None
+    rationale:         str
+    tradeoffs:         list[str]
+    metric_highlights: dict
+    updated_at:        str
+
+
+class ReviewSession(TypedDict, total=False):
+    """
+    Explicit HITL Review Mode state.
+
+    This session is the source of truth for open review gates, turn policy,
+    proposal artifacts, and typed human events.
+    """
+    gate_id:               str
+    hitl_key:              str
+    tool_name:             str
+    phase:                 str
+    title:                 str
+    status:                Literal[
+        "review_open",
+        "awaiting_agent_response",
+        "awaiting_curation",
+        "awaiting_human_approval",
+        "closed",
+    ]
+    opened_at:             str
+    updated_at:            str
+    closed_at:             NotRequired[str]
+    close_reason:          NotRequired[str]
+    last_human_event:      ReviewHumanEvent | None
+    turn_policy:           str
+    tool_runs_since_human: int
+    visible_response_required: bool
+    proposal:              ReviewProposal
 
 
 # ── Session context (human-provided at startup) ────────────────────────────────
@@ -342,6 +658,14 @@ class HITLPayload(TypedDict):
 
     hitl_check calls interrupt(HITLPayload) and never does I/O.
     The caller reads this payload and handles all presentation.
+
+    Two variant lists, two distinct UI surfaces:
+      * variant_pool — every variant produced this segment. Read-only
+        history; presenters render it as a "what the agent has tried"
+        panel without Approve buttons.
+      * proposal — the agent's curated subset from review_session.proposal.
+        Each entry pairs a Variant with the rationale the agent supplied when
+        surfacing it. Approve buttons render here.
     """
     type:           str             # "data_review", "image_review", or "agent_chat"
     title:          str             # human-readable title (from hitl_config.toml)
@@ -349,7 +673,11 @@ class HITLPayload(TypedDict):
     images:         list[str]       # image paths produced by the tool (for image_review)
     context:        list            # recent messages for continuity (last N)
     agent_text:     str             # agent's response text (for multi-turn HITL display)
-    variant_pool:   list[Variant]   # variants captured during this HITL gate (for variant panel UI)
+    variant_pool:   list[Variant]   # passive history — every variant produced this segment
+    proposal:       list[dict]      # agent's curation: each item = {variant, rationale, presented_at}
+    review_session: NotRequired[ReviewSession | None]  # canonical Review Mode state
+    review_state:   NotRequired[str]  # "ready" or "needs_curation"
+    approval_allowed: NotRequired[bool]  # false when pool is only observational
 
 
 # ── Top-level graph state ──────────────────────────────────────────────────────
@@ -363,7 +691,10 @@ class AstroState(TypedDict):
     phase:      ProcessingPhase
     paths:      Annotated[PathState, _merge_dicts]
     metadata:   Annotated[Metadata, _merge_dicts]
-    metrics:    Metrics
+    # metrics uses Replace-aware deep-merge: tools emit per-call deltas
+    # and parallel writers compose without clobbering siblings;
+    # rewind_phase wraps in Replace() to fully reset on backtrack.
+    metrics:    Annotated[Metrics, _dict_merge_or_replace]
 
     # Append-only logs — use operator.add reducer so updates accumulate
     history:            Annotated[list[str],         operator.add]
@@ -375,16 +706,20 @@ class AstroState(TypedDict):
     # Accumulated HITL preferences — written by hitl_node, read by planner
     user_feedback: dict
 
-    # Active HITL conversation flag — set by hitl_check when interrupt fires,
-    # cleared on approval. While True, the agent routes back to hitl_check
-    # (not agent_chat) even when it responds without tool calls, so the
-    # human can chat freely before approving or requesting revision.
+    # Derived HITL conversation flag for logs/legacy inspection. Review policy
+    # must read review_session instead.
     active_hitl: bool
 
-    # Variant pool — concrete results produced for the current HITL gate.
-    # Built passively as a side effect of HITL-mapped tool execution in the
-    # action node. Cleared on phase advance and on variant commit. Default
-    # LangGraph "replace" semantics: nodes return the full new list.
+    # Canonical HITL review session. This makes review state explicit instead
+    # of inferring gate identity, turn policy, and proposal eligibility from
+    # recent messages.
+    review_session: ReviewSession | None
+
+    # Variant pool — passive history of every variant produced this segment.
+    # Built automatically by variant_snapshot from HITL-mapped tool execution.
+    # The UI shows this as a read-only "what has the agent tried" panel — it
+    # is NOT the approve set. Cleared on phase advance and variant commit.
+    # Default LangGraph "replace" semantics: nodes return the full new list.
     variant_pool: list[Variant]
 
     # Visual context — non-variant working set of images for the VLM
@@ -393,6 +728,17 @@ class AstroState(TypedDict):
     # view-build time. Messages stay text-only; state owns visibility.
     # See VisualRef for source semantics.
     visual_context: list[VisualRef]
+
+    # Active regression warnings — metrics that worsened between the baseline
+    # analyze_image and the most recent one. Informational: the agent reads
+    # these to decide whether to revert or accept. The framework surfaces
+    # them in advance_phase's response and writes them into processing_log.md
+    # at phase transitions but never blocks on them. Managed by analyze_image
+    # (emit, auto-clear-on-recovery), restore_checkpoint / rewind_phase
+    # (clear on rollback), and advance_phase (clear on transition after
+    # logging). Default LangGraph "replace" semantics — producers return the
+    # full new list each call. See RegressionWarning for entry shape.
+    regression_warnings: list[RegressionWarning]
 
 
 # ── Factory ────────────────────────────────────────────────────────────────────
@@ -434,7 +780,15 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             plate_solve_coords=None,
             focal_length_mm=None,
             pixel_size_um=None,
+            # New runs always start in linear: ingest produces linear data,
+            # the entire preprocess + linear pipeline preserves it, only
+            # stretch_image flips this to "display". See Metadata.image_space.
+            image_space="linear",
             checkpoints=None,
+            last_committed_variant=None,
+            last_analysis_snapshot=None,
+            phase_checkpoints=None,
+            phase_rewind_counts=None,
         ),
         metrics=Metrics(
             frame_stats={},
@@ -463,14 +817,27 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             fwhm_std=None,
             median_star_peak_ratio=None,
             contrast_ratio=None,
+            # Structured additions — see T20 docstring.
+            pixel_coverage=None,
+            clipping_per_channel=None,
+            mode_estimate=None,
+            background_quadrants=None,
+            wavelet_noise_scales=None,
+            channel_snr=None,
+            star_distribution=None,
+            bg_box_size=None,
+            histogram=None,
+            analyze_params=None,
         ),
         history=[],
         processing_report=[],
         messages=[],
         user_feedback={},
         active_hitl=False,
+        review_session=None,
         variant_pool=[],
         visual_context=[],
+        regression_warnings=[],
     )
 
 

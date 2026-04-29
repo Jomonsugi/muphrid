@@ -1,5 +1,10 @@
 """
-Proof of concept: Config-driven multi-variant collection loop with HITL gate.
+Historical proof of concept: Config-driven multi-variant collection loop.
+
+This script is not part of the production Review Mode path. It predates
+typed `review_session` state and still demonstrates a toy affirmative-text
+parser for the old experiment only. Do not use it as an implementation model
+for current HITL approval policy.
 
 All HITL policy lives in hitl_config.toml:
   - autonomous = true/false          (master switch for the whole run)

@@ -31,6 +31,76 @@ from astropy.io import fits as astropy_fits
 from muphrid.config import load_settings
 
 
+def siril_script_path(path: Path | str, working_dir: Path | str) -> str:
+    """
+    Return a whitespace-free reference to ``path`` for use inside a Siril
+    script command line.
+
+    Siril 1.4's script tokenizer splits arguments on raw whitespace BEFORE
+    any quote handling — double-quoting does not help. A path such as::
+
+        -bias="/Users/x/COCOON NEBULA/master_bias.fit"
+
+    is split into two tokens at the space, leaving the stray quote in the
+    first one. Siril then tries to open ``/Users/x/COCOON`` and fails with::
+
+        log: "/Users/x/COCOON.[any_allowed_extension] not found
+
+    To make Siril commands work regardless of how the user named their
+    dataset folder, this helper guarantees Siril only ever sees short,
+    whitespace-free references:
+
+      - If ``path`` is under ``working_dir`` and the relative form has no
+        whitespace, the relative path is returned. Siril resolves it
+        against the ``-d`` working directory (which is passed as a single
+        argv token at the subprocess layer, so spaces there are fine).
+      - Otherwise a symlink is created in ``working_dir`` under a
+        whitespace-free name, and the basename is returned. The symlink
+        is idempotent — repeat calls reuse any existing link that already
+        points at ``path``.
+
+    The symlink fallback is safe: muphrid run folders are per-session,
+    so leftover symlinks die with the run folder.
+    """
+    import hashlib
+    import re
+
+    src = Path(path).resolve()
+    wd = Path(working_dir).resolve()
+
+    # Case 1: path is inside working_dir and the relative form is clean.
+    try:
+        rel_str = str(src.relative_to(wd))
+        if not re.search(r"\s", rel_str):
+            return rel_str
+    except ValueError:
+        pass  # path lives outside working_dir — fall through to symlink
+
+    # Case 2: symlink into working_dir under a whitespace-free basename.
+    clean_name = re.sub(r"\s+", "_", src.name) or "file"
+
+    link = wd / clean_name
+
+    # Disambiguate on collision with an unrelated file/link at that name.
+    already_points_here = (
+        link.is_symlink() and link.resolve() == src
+    )
+    if (link.exists() or link.is_symlink()) and not already_points_here:
+        digest = hashlib.sha1(str(src).encode()).hexdigest()[:8]
+        clean_name = f"{digest}_{clean_name}"
+        link = wd / clean_name
+
+    if link.is_symlink():
+        if link.resolve() != src:
+            link.unlink()
+            link.symlink_to(src)
+    elif not link.exists():
+        wd.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(src)
+
+    return clean_name
+
+
 def fits_nlayers(fits_path: Path | str) -> int:
     """Return the number of color channels in a FITS image.
 

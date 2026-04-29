@@ -1,19 +1,11 @@
 """
 T18 — saturation_adjust
 
-Enhance or reduce color saturation, with optional targeting of specific hue
-ranges and background noise protection.
+Increase or decrease color saturation, optionally targeting a specific hue
+range, with background-noise protection.
 
-Backend: Siril CLI — `satu` (saturation with background protection and hue
-targeting) or `ght -sat` (GHT applied to the HSL saturation channel for
-midtone-focused saturation boost).
-
-Apply to the starless image to prevent star color bloat. Use background_factor
-to protect noise in the dark sky from being color-amplified. For emission
-nebulae, target specific hue indices separately (Ha = 0, OIII = 3).
-
-Apply in small increments — multiple passes with moderate amounts produce
-better results than one large boost.
+Backend: Siril CLI — `satu` (saturation with background threshold and hue
+targeting) or `ght -sat` (GHT applied to the HSL saturation channel).
 """
 
 from __future__ import annotations
@@ -33,20 +25,12 @@ from muphrid.graph.state import AstroState
 from muphrid.tools._siril import fits_nlayers, run_siril_script
 
 
-# Hue range index reference (documented for agent and user)
-# 0 = pink-orange (Hα emission, pinkish reds)
-# 1 = orange-yellow
-# 2 = yellow-cyan
-# 3 = cyan (OIII emission, blue-green)
-# 4 = cyan-magenta
-# 5 = magenta-pink
-# 6 = all channels (default)
-
+# Hue range index → color band. These are Siril `satu` command values.
 HUE_RANGE_DESCRIPTIONS = {
-    0: "pink-orange (Hα emission reds)",
+    0: "pink-orange",
     1: "orange-yellow",
     2: "yellow-cyan",
-    3: "cyan (OIII emission blue-green)",
+    3: "cyan",
     4: "cyan-magenta",
     5: "magenta-pink",
     6: "all hue ranges (global)",
@@ -56,25 +40,21 @@ HUE_RANGE_DESCRIPTIONS = {
 class GHTSatOptions(BaseModel):
     stretch_amount: float = Field(
         description=(
-            "D: stretch strength applied to the saturation channel (0–10). "
-            "Use small values (0.3–1.5) for post-stretch saturation boost. "
-            "Higher values risk over-saturation and neon artefacts."
+            "D: stretch strength applied to the saturation channel (0–10)."
         ),
     )
     local_intensity: float = Field(
         default=0.0,
         description=(
-            "B: focus the saturation boost around the symmetry point. "
-            "0 = standard exponential. Higher (5–10) = targets mid-saturation "
-            "pixels, protects already-saturated colors."
+            "B: focus the saturation boost around the symmetry point "
+            "(-5 to 15). 0 = standard exponential. Higher values tighten "
+            "the boost around SP."
         ),
     )
     symmetry_point: float = Field(
         default=0.5,
         description=(
-            "SP: saturation value (0–1) at which the boost is most intense. "
-            "0.5 targets mid-saturation pixels — good default. "
-            "Lower SP for images with mostly unsaturated colors."
+            "SP: saturation value (0–1) at which the boost peaks."
         ),
     )
     clip_mode: str = Field(
@@ -89,44 +69,34 @@ class GHTSatOptions(BaseModel):
 class SaturationAdjustInput(BaseModel):
     method: str = Field(
         description=(
-            "Choose based on target type — there is no universal default:\n"
-            "  global: uniform saturation across all hues. Correct for broadband "
-            "galaxy and star cluster images where all channels should be boosted equally.\n"
-            "  hue_targeted: boost a specific hue range only (set hue_target). "
-            "Required for emission nebulae — use hue_target=0 for Hα, hue_target=3 "
-            "for OIII. Global boost on emission nebulae amplifies background color noise.\n"
-            "  ght_saturation: GHT on the HSL saturation channel — targets "
-            "mid-saturation pixels, protects already-saturated stars. Good when the "
-            "background is marginally saturated and global would over-amplify it."
+            "global: uniform saturation across all hues (Siril `satu`).\n"
+            "hue_targeted: saturation applied only to the hue range set by "
+            "hue_target (Siril `satu` with hue index).\n"
+            "ght_saturation: Generalized Hyperbolic Stretch applied to the "
+            "HSL saturation channel (Siril `ght -sat`). Non-uniform in "
+            "saturation — boost peaks at symmetry_point."
         ),
     )
     amount: float = Field(
         description=(
-            "Saturation adjustment multiplier. Must be chosen from the current "
-            "image's saturation state — there is no universally safe value.\n"
-            "> 0: increase saturation. < 0: decrease. 0: no change.\n"
-            "Typical range: 0.3–1.0. Apply in steps of 0.3–0.5 and iterate. "
-            "Check analyze_image saturation statistics before choosing. "
-            "For a first pass on a well-calibrated stack: 0.3–0.5. "
-            "For a noisy or high-ISO image: 0.2–0.3 maximum."
+            "Saturation adjustment multiplier for Siril `satu`. "
+            "> 0 increases saturation, < 0 decreases, 0 no change."
         ),
     )
     background_factor: float = Field(
         default=1.5,
         description=(
-            "Background protection threshold factor. "
-            "Pixels below (median + background_factor * sigma) are not saturated. "
-            "Protects background noise from color amplification. "
-            "1.5 is a good default. 0 = disable protection (not recommended). "
-            "Increase to 2.0–3.0 for noisy images."
+            "Background protection threshold factor. Pixels below "
+            "(median + background_factor * sigma) are excluded from the "
+            "saturation adjustment. 0 disables protection."
         ),
     )
     hue_target: int | None = Field(
         default=None,
         description=(
-            "Hue range index for targeted saturation (only used in hue_targeted mode). "
-            "0=pink-orange (Hα), 1=orange-yellow, 2=yellow-cyan, "
-            "3=cyan (OIII), 4=cyan-magenta, 5=magenta-pink, 6=all (same as global)."
+            "Hue range index (only used when method=hue_targeted). "
+            "0=pink-orange, 1=orange-yellow, 2=yellow-cyan, 3=cyan, "
+            "4=cyan-magenta, 5=magenta-pink, 6=all (equivalent to global)."
         ),
     )
     ght_sat_options: GHTSatOptions | None = Field(
@@ -150,16 +120,13 @@ def saturation_adjust(
     """
     Adjust color saturation of the non-linear image.
 
-    Emission nebula targeting:
-    - For Hα (reds): method=hue_targeted, hue_target=0
-    - For OIII (blue-green): method=hue_targeted, hue_target=3
+    Requires a 3-channel RGB input (fails on mono). background_factor > 0
+    excludes pixels below (median + background_factor * sigma) from the
+    saturation operation.
 
-    GHT saturation (ght_saturation) is recommended over global for images
-    where the sky background is already marginally saturated — it targets
-    mid-saturation pixels and avoids over-saturating already vivid colors.
-
-    Always use background_factor > 0 to protect sky background noise from
-    being color-boosted into a colorful noise pattern.
+    method=ght_saturation requires ght_sat_options.stretch_amount.
+    method=hue_targeted uses hue_target to select one of the 6 Siril hue
+    bands.
     """
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"]["current_image"]
@@ -232,6 +199,10 @@ def saturation_adjust(
         }
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(output_path)},
+        "paths": {"current_image": str(output_path)},
+        # Saturation adjustment is a display-stage colour boost; input is
+        # already display-space (post-stretch) and output stays in display
+        # space. See Metadata.image_space.
+        "metadata": {"image_space": "display"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

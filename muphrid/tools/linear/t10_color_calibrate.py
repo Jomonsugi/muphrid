@@ -430,33 +430,98 @@ def _build_spcc_cmd(
     return cmd
 
 
-def _parse_plate_solve_result(result: SirilResult) -> dict:
-    """Extract WCS coords, pixel scale, and measured focal length from Siril platesolve stdout."""
-    import re
-    ra, dec, pixel_scale, focal_length_mm = None, None, None, None
+def _read_wcs_from_fits(fits_path: Path, pixel_size_um: float | None = None) -> dict:
+    """
+    Canonical post-platesolve WCS reader: pull the standard FITS keywords
+    Siril writes via WCSLIB straight out of the file.
 
-    m = re.search(r"RA\s*[=:]\s*([\d.]+)", result.stdout, re.IGNORECASE)
-    if m:
-        ra = float(m.group(1))
-    m = re.search(r"DEC?\s*[=:]\s*(-?[\d.]+)", result.stdout, re.IGNORECASE)
-    if m:
-        dec = float(m.group(1))
-    m = re.search(r"pixel\s+scale[^=]*[=:]\s*([\d.]+)", result.stdout, re.IGNORECASE)
-    if m:
-        pixel_scale = float(m.group(1))
-    # Siril reports the plate-solve-derived focal length, which is more accurate
-    # than the manufacturer nominal (e.g. "Focal length: 129.50 mm").
-    # Computed from measured plate scale × known pixel size ÷ 206.265.
-    m = re.search(r"focal\s+length[^:]*:\s*([\d.]+)\s*mm", result.stdout, re.IGNORECASE)
-    if m:
-        focal_length_mm = float(m.group(1))
+    After `platesolve` succeeds, Siril writes the standard FITS WCS
+    keywords — CRVAL1/CRVAL2 (RA/Dec at the reference pixel, in decimal
+    degrees), the CD matrix (CD1_1/CD1_2/CD2_1/CD2_2 in degrees per pixel),
+    and PLTSOLVD = T as the success flag — directly to the saved FITS
+    header. Reading them via `astropy.wcs.WCS` is locale-, version-, and
+    log-format-agnostic. This is THE interface for consuming a Siril
+    plate-solve; there is no regex fallback because falling back to
+    scraping stdout was the bug we just retired.
 
-    return {
-        "ra": ra,
-        "dec": dec,
-        "pixel_scale_arcsec": pixel_scale,
-        "measured_focal_length_mm": focal_length_mm,
-    }
+    On a real failure (FITS missing, header malformed, no WCS keys
+    present, or astropy import broken) the returned dict carries
+    `wcs_read_error` and all-None values. That's a real condition the
+    caller surfaces to the agent — it is not papered over.
+
+    Sources:
+      * https://siril.readthedocs.io/en/stable/astrometry/platesolving.html
+      * https://siril.readthedocs.io/en/latest/FITS-header.html
+    """
+    import math
+
+    try:
+        from astropy.io import fits
+        from astropy.wcs import WCS
+    except ImportError:
+        return {
+            "ra": None, "dec": None,
+            "pixel_scale_arcsec": None,
+            "measured_focal_length_mm": None,
+            "wcs_read_error": "astropy not installed",
+        }
+
+    try:
+        with fits.open(str(fits_path)) as hdul:
+            header = hdul[0].header
+            pltsolvd = bool(header.get("PLTSOLVD", False))
+
+            # Siril can write solved WCS keywords onto RGB FITS files where
+            # the data/header still has NAXIS=3 (color plane + two spatial
+            # axes). Astropy rejects SIP/distortion tables on a full 3D WCS
+            # with "distortions only work in 2 dimensions", even though the
+            # celestial solution itself is valid. Ask explicitly for the
+            # 2D celestial WCS so plate_solve/color_calibrate work on RGB
+            # products as well as mono/2D FITS.
+            wcs = WCS(header, naxis=2)
+            crval = wcs.wcs.crval if wcs.has_celestial else None
+
+            ra = float(crval[0]) if crval is not None and len(crval) >= 1 else None
+            dec = float(crval[1]) if crval is not None and len(crval) >= 2 else None
+
+            # Pixel scale: |det(CD)|^0.5 × 3600 gives arcsec/pixel and is
+            # invariant under image rotation. astropy's pixel_scale_matrix
+            # handles both CD- and PC+CDELT-form headers transparently.
+            pixel_scale = None
+            try:
+                psm = wcs.pixel_scale_matrix
+                # psm is in degrees/pixel; take the geometric mean of the
+                # two axis scales to handle anisotropic pixels gracefully.
+                if psm is not None and psm.shape == (2, 2):
+                    det = abs(psm[0][0] * psm[1][1] - psm[0][1] * psm[1][0])
+                    pixel_scale = math.sqrt(det) * 3600.0
+            except Exception:
+                pass
+
+            # Measured focal length: derived from pixel scale and the
+            # known sensor pixel size via the standard small-angle formula
+            # f_mm = (px_um × 206.265) / scale_arcsec_per_pixel
+            # Siril doesn't write a FOCALLEN keyword on platesolve (the
+            # info is implicit in the CD matrix), so we compute it.
+            measured_focal_length_mm = None
+            if pixel_scale and pixel_size_um:
+                measured_focal_length_mm = (pixel_size_um * 206.265) / pixel_scale
+
+            return {
+                "ra": ra,
+                "dec": dec,
+                "pixel_scale_arcsec": pixel_scale,
+                "measured_focal_length_mm": measured_focal_length_mm,
+                "pltsolvd": pltsolvd,
+                "wcs_source": "fits_header",
+            }
+    except Exception as e:
+        return {
+            "ra": None, "dec": None,
+            "pixel_scale_arcsec": None,
+            "measured_focal_length_mm": None,
+            "wcs_read_error": f"{type(e).__name__}: {e}",
+        }
 
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
@@ -560,7 +625,6 @@ def color_calibrate(
 
     try:
         result = run_siril_script(commands, working_dir=working_dir, timeout=180)
-        wcs_info = _parse_plate_solve_result(result)
     except SirilError as exc:
         stdout_lower = exc.result.stdout.lower() + exc.result.stderr.lower()
         if "plate" in stdout_lower or "wcs" in stdout_lower or "astrometry" in stdout_lower:
@@ -581,6 +645,13 @@ def color_calibrate(
         raise FileNotFoundError(
             f"Color calibration did not produce: {output_path}"
         )
+
+    # Read WCS straight from the FITS header Siril just wrote. This is
+    # the canonical post-platesolve interface (CRVAL1/CRVAL2, CD matrix,
+    # PLTSOLVD = T) — we never scrape stdout. If the read fails, the
+    # returned dict carries `wcs_read_error` and the agent sees the real
+    # failure rather than a stale-regex-derived value.
+    wcs_info = _read_wcs_from_fits(output_path, pixel_size_um=px_size)
 
     summary = {
         "output_path": str(output_path),
@@ -603,6 +674,10 @@ def color_calibrate(
         )
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(output_path)},
+        "paths": {"current_image": str(output_path)},
+        # PCC/SPCC apply per-channel linear scaling (white balance) and
+        # background neutralization. Both operations are linear in pixel
+        # value space and produce linear output. See Metadata.image_space.
+        "metadata": {"image_space": "linear"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

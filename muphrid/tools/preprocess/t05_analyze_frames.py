@@ -37,8 +37,31 @@ from langchain_core.tools import tool
 from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
+from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
+
+
+class AnalyzeFramesInput(BaseModel):
+    """analyze_frames takes no LLM-facing arguments — all real inputs come
+    from state. The optional ``note`` field exists *only* to keep this
+    schema non-empty, which avoids a short-circuit in langchain-core's
+    `BaseTool._to_args_and_kwargs` (base.py: ``if ... and not
+    get_fields(self.args_schema): return (), {}``). When the schema has
+    zero fields, that path discards the state and tool_call_id that
+    LangGraph just injected via `_inject_tool_args`, and the function is
+    invoked with literally no args — producing the cryptic
+    ``analyze_frames() missing 2 required positional arguments`` error.
+    A single optional field keeps us off that branch. The field is
+    ignored by the tool body."""
+
+    note: str | None = Field(
+        default=None,
+        description=(
+            "Optional. Ignored by the tool. May be left empty or omitted. "
+            "All real inputs come from graph state."
+        ),
+    )
 
 
 # ── .seq parser ────────────────────────────────────────────────────────────────
@@ -299,10 +322,11 @@ def _compute_summary(frame_metrics: dict[str, dict], seq_data: dict) -> dict:
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool
+@tool(args_schema=AnalyzeFramesInput)
 def analyze_frames(
-    tool_call_id: Annotated[str, InjectedToolCallId],
-    state: Annotated[AstroState, InjectedState],
+    note: str | None = None,  # noqa: ARG001 — schema-only, see AnalyzeFramesInput
+    tool_call_id: Annotated[str, InjectedToolCallId] = "",
+    state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
     """
     Extract per-frame registration data from a Siril .seq file.
@@ -334,12 +358,59 @@ def analyze_frames(
             f"Ensure calibration (T03) and registration (T04) completed."
         )
 
+    # Artifact-based validation (mirrors t03_calibrate / t04_register):
+    # the .seq file existing is necessary but not sufficient. A zero-byte
+    # or malformed .seq silently yields an all-null summary; surface that
+    # explicitly so the agent has a clear signal instead of stale metrics.
+    seq_size = seq_path.stat().st_size
+    if seq_size == 0:
+        raise RuntimeError(
+            f"analyze_frames: Sequence file {seq_path} is empty (0 bytes). "
+            f"Calibration (T03) or registration (T04) did not write frame "
+            f"data. Re-run the upstream preprocessing step and verify the "
+            f"input frames are intact."
+        )
+
     seq_data = _parse_seq_file(seq_path)
+
+    # The S-line defines the sequence header (n_frames). If it is missing or
+    # malformed, the .seq file is not a real Siril sequence — likely the
+    # wrong path or a corrupted write. Disk existence already confirmed.
+    if seq_data["n_frames"] == 0:
+        head = seq_path.read_text(encoding="utf-8", errors="replace")[:400]
+        raise RuntimeError(
+            f"analyze_frames: Sequence file {seq_path} has no valid header "
+            f"(S-line with n_frames). File may be corrupted or truncated. "
+            f"Re-run calibration/registration. First 400 chars:\n{head}"
+        )
+
     frame_metrics = _build_frame_metrics(seq_data)
     summary = _compute_summary(frame_metrics, seq_data)
 
+    # Attach an actionable hint when registration data is absent so the
+    # agent has a concrete next step rather than a null-valued blob. This
+    # is the expected "re-run T04 with tuned findstar" path, not a hard
+    # fail — the tool completes successfully and the agent decides.
+    if not summary["has_registration_data"]:
+        summary = {
+            **summary,
+            "hint": (
+                "No registration data in the .seq file — Siril's findstar "
+                "likely failed to detect stars during T04 registration. "
+                "Re-run siril_register with tuned parameters: lower threshold "
+                "(e.g. threshold=0.8), increased radius (e.g. radius=10), "
+                "and relax=True. Star-sparse fields may also need minstars "
+                "lowered (e.g. minstars=20). The .seq header parsed fine "
+                f"({summary['frame_count']} frames), so the sequence itself "
+                f"is valid — only the registration pass needs rerunning."
+            ),
+        }
+
     import json
+    # Delta-only emit. The metrics reducer (_dict_merge_or_replace) composes
+    # this with whatever's already in state.metrics, so we never spread the
+    # existing dict and never risk clobbering a parallel sibling tool's key.
     return Command(update={
-        "metrics": {**state["metrics"], "frame_stats": frame_metrics, "frame_summary": summary},
+        "metrics": {"frame_stats": frame_metrics, "frame_summary": summary},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2), tool_call_id=tool_call_id)],
     })

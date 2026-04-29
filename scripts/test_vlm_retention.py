@@ -133,8 +133,14 @@ def total_image_count(messages: list) -> int:
 
 
 def reset_vlm_modes(hitl: bool, auto: bool, cap: int = 8) -> None:
-    """Set VLM mode flags via the runtime override globals."""
-    hitl_mod._RUNTIME_VLM_HITL = hitl
+    """Set VLM mode flags via the runtime override globals.
+
+    Note: vlm_hitl() now always returns True (collaboration requires visual
+    access). The `hitl` parameter is retained for call-site compatibility
+    with legacy test cases but has no effect — when False, the test case
+    is exercising a state that is no longer reachable in production.
+    """
+    _ = hitl  # legacy: vlm_hitl is always on now
     hitl_mod._RUNTIME_VLM_AUTONOMOUS = auto
     hitl_mod._RUNTIME_VLM_RETENTION_MAX = cap
 
@@ -143,7 +149,7 @@ def reset_vlm_modes(hitl: bool, auto: bool, cap: int = 8) -> None:
 
 print("_select_visible_refs cases\n" + "=" * 40)
 
-# Case 1: both modes off → no refs visible
+# Case 1: vlm_hitl is always on; auto off still shows explicit state refs
 reset_vlm_modes(hitl=False, auto=False, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
@@ -152,12 +158,12 @@ state = make_state(
 )
 out = _select_visible_refs(state)
 check(
-    "case 1: both modes off → 0 visible refs",
-    len(out) == 0,
-    f"got {len(out)}",
+    "case 1: auto off still shows HITL-capable refs",
+    len(out) == 2,
+    f"got {len(out)}, sources={[r['source'] for r in out]}",
 )
 
-# Case 2: vlm_hitl only → only the variant_pool projection is visible
+# Case 2: vlm_hitl only → variant pool plus explicit visual_context are visible
 reset_vlm_modes(hitl=True, auto=False, cap=8)
 paths = make_stub_jpgs(4)
 state = make_state(
@@ -172,12 +178,15 @@ state = make_state(
 )
 out = _select_visible_refs(state)
 check(
-    "case 2: vlm_hitl only → only variant_pool entries visible (other sources hidden)",
-    len(out) == 2 and all(r["source"] == "hitl_variant" for r in out),
+    "case 2: vlm_hitl only → variant_pool and visual_context visible",
+    len(out) == 4
+    and [r["source"] for r in out] == [
+        "present_images", "phase_carry", "hitl_variant", "hitl_variant"
+    ],
     f"got {len(out)}, sources={[r['source'] for r in out]}",
 )
 
-# Case 3 (concern 1): vlm_hitl only, EMPTY variant_pool → empty view
+# Case 3: vlm_hitl only, empty variant_pool → explicit visual_context remains visible
 reset_vlm_modes(hitl=True, auto=False, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
@@ -189,9 +198,9 @@ state = make_state(
 )
 out = _select_visible_refs(state)
 check(
-    "case 3 (concern 1): vlm_hitl only, empty variant_pool → 0 visible (no leakage)",
-    len(out) == 0,
-    f"got {len(out)}",
+    "case 3: vlm_hitl only, empty pool → visual_context visible",
+    len(out) == 2,
+    f"got {len(out)}, sources={[r['source'] for r in out]}",
 )
 
 # Case 4: vlm_autonomous on, total entries ≤ cap → all visible
@@ -307,7 +316,7 @@ check(
 
 print("\n_build_vlm_view cases\n" + "=" * 40)
 
-# Case 8: both modes off → strips any historical multimodal messages, no injection
+# Case 8: auto off but HITL visual access on → historical images stripped, state refs injected
 reset_vlm_modes(hitl=False, auto=False, cap=8)
 paths = make_stub_jpgs(1)
 historical_msg = HumanMessage(content=[
@@ -323,8 +332,8 @@ messages = [
 state = make_state(variant_pool=[stub_variant(paths[0], "T09_v1")])
 out = _build_vlm_view(state, messages)
 check(
-    "case 8: both modes off → all images stripped, no injection",
-    total_image_count(out) == 0,
+    "case 8: historical images stripped; HITL state ref injected",
+    total_image_count(out) == 1,
     f"got {total_image_count(out)} images in view",
 )
 
@@ -400,7 +409,7 @@ check(
     f"got {total_image_count(out)} (expected 6 — gate overflow)",
 )
 
-# Case 12 (concern 1 end-to-end): vlm_hitl only, empty pool → empty view
+# Case 12: vlm_hitl only, empty pool → explicit visual_context is still visible
 reset_vlm_modes(hitl=True, auto=False, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
@@ -413,8 +422,8 @@ state = make_state(
 messages = [SystemMessage(content="sys"), HumanMessage(content="working")]
 out = _build_vlm_view(state, messages)
 check(
-    "case 12 (concern 1): vlm_hitl only, empty pool → 0 images visible",
-    total_image_count(out) == 0,
+    "case 12: vlm_hitl only, empty pool → visual_context visible",
+    total_image_count(out) == 2,
     f"got {total_image_count(out)}",
 )
 
@@ -423,7 +432,7 @@ check(
 
 print("\nbuild_variant_promotion_update + commit_variant cases\n" + "=" * 40)
 
-# Case 13: build_variant_promotion_update happy path — paths/pool/visual_context all updated
+# Case 13: build_variant_promotion_update happy path — paths/pool updated and gate visuals cleared
 paths = make_stub_jpgs(3)
 state = make_state(
     variant_pool=[
@@ -452,10 +461,8 @@ check(
     f"got {update['variant_pool']}",
 )
 check(
-    "case 13: visual_context gets exactly one phase_carry entry for the chosen variant",
-    len(update["visual_context"]) == 1
-    and update["visual_context"][0]["source"] == "phase_carry"
-    and update["visual_context"][0]["path"] == paths[1],
+    "case 13: visual_context is cleared of gate carry entries",
+    update["visual_context"] == [],
     f"got {update['visual_context']}",
 )
 
@@ -470,7 +477,7 @@ check(
     f"got {result}",
 )
 
-# Case 15: existing visual_context entries (present_images, prior phase_carry) survive
+# Case 15: present_images survive promotion; stale phase_carry is cleared
 paths = make_stub_jpgs(3)
 existing_present = vref(paths[0], "present_images", label="prior inspection")
 existing_carry = vref(paths[1], "phase_carry", label="earlier carry")
@@ -481,18 +488,18 @@ state = make_state(
 _, update = build_variant_promotion_update(state, "T09_v1")
 new_visual = update["visual_context"]
 check(
-    "case 15: existing present_images and phase_carry entries survive promotion",
-    existing_present in new_visual and existing_carry in new_visual,
+    "case 15: present_images survives and stale phase_carry is cleared",
+    existing_present in new_visual and existing_carry not in new_visual,
     f"existing entries missing from {new_visual}",
 )
 check(
-    "case 15: new phase_carry entry is appended for the committed variant",
-    new_visual[-1]["source"] == "phase_carry" and new_visual[-1]["path"] == paths[2],
+    "case 15: no new phase_carry entry is appended",
+    all(r["source"] != "phase_carry" for r in new_visual),
     f"got tail {new_visual[-1]}",
 )
 check(
-    "case 15: total visual_context length = old + 1",
-    len(new_visual) == 3,
+    "case 15: total visual_context length keeps only present_images",
+    len(new_visual) == 1,
     f"got {len(new_visual)}",
 )
 
@@ -525,9 +532,8 @@ check(
     cmd.update["variant_pool"] == [],
 )
 check(
-    "case 16: Command.update has exactly one phase_carry visual_context entry",
-    len(cmd.update["visual_context"]) == 1
-    and cmd.update["visual_context"][0]["source"] == "phase_carry",
+    "case 16: Command.update clears carry visual_context entries",
+    cmd.update["visual_context"] == [],
     f"got {cmd.update['visual_context']}",
 )
 tool_msgs = cmd.update["messages"]
@@ -584,9 +590,8 @@ check(
     f"got update keys {list(cmd.update.keys())}",
 )
 
-# Case 18: end-to-end with VLM autonomous on — committed variant flows into the view
-# After commit, visual_context has one phase_carry entry; _build_vlm_view should
-# produce a multimodal HumanMessage with that single image.
+# Case 18: end-to-end with VLM autonomous on — current_image auto-projection
+# replaces the old phase_carry mechanism.
 reset_vlm_modes(hitl=False, auto=True, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
@@ -600,18 +605,22 @@ cmd = commit_variant.invoke({
     "state": state,
     "tool_call_id": "test_tcid_3",
 })
+preview_dir = Path(paths[0]).parent / "previews"
+preview_dir.mkdir(exist_ok=True)
+(preview_dir / f"preview_{Path(paths[0]).stem}.jpg").write_bytes(_FAKE_JPG_BYTES)
 # Apply the Command's update onto state (simulate LangGraph's reducer)
 post_state = make_state(
     variant_pool=cmd.update["variant_pool"],
     visual_context=cmd.update["visual_context"],
     paths=cmd.update["paths"],
+    dataset={"working_dir": str(Path(paths[0]).parent)},
 )
 messages = [SystemMessage(content="sys"), HumanMessage(content="continuing")]
 out = _build_vlm_view(post_state, messages)
 check(
-    "case 18: post-commit, _build_vlm_view shows the carried-forward image",
+    "case 18: post-commit, _build_vlm_view shows current_image",
     total_image_count(out) == 1,
-    f"got {total_image_count(out)} images (expected 1 — committed variant via phase_carry)",
+    f"got {total_image_count(out)} images (expected 1 via current_image)",
 )
 
 
@@ -695,8 +704,7 @@ check(
 )
 
 
-# Cleanup runtime overrides
-hitl_mod._RUNTIME_VLM_HITL = None
+# Cleanup runtime overrides (vlm_hitl is no longer toggleable — always True).
 hitl_mod._RUNTIME_VLM_AUTONOMOUS = None
 hitl_mod._RUNTIME_VLM_RETENTION_MAX = None
 

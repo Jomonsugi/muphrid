@@ -46,20 +46,16 @@ from muphrid.tools._siril import run_siril_script
 class StarRemovalInput(BaseModel):
     upscale: bool = Field(
         description=(
-            "Apply 2× intermediate upsampling before star removal (-u flag). "
-            "Must be chosen from T05 summary.median_fwhm:\n"
-            "  True:  FWHM < 2px (under-sampled, tight stars) — StarNet will "
-            "partially miss tight stars without upscaling. Doubles processing time.\n"
-            "  False: FWHM ≥ 2px — upscale adds no benefit and costs time.\n"
-            "Always read median_fwhm from T05 before calling."
+            "Apply 2× intermediate upsampling before StarNet inference (-u "
+            "flag). True roughly doubles processing time. StarNet detects "
+            "stars less reliably at small FWHM (below ~2px) without upscaling."
         ),
     )
     generate_star_mask: bool = Field(
         default=True,
         description=(
-            "Generate a star mask alongside the starless image. "
-            "The mask is required for T19 star_restoration blend mode. "
-            "Always set True unless you will use synthstar mode in T19."
+            "Generate a star mask alongside the starless image. Required "
+            "input for star_restoration blend mode."
         ),
     )
 
@@ -113,18 +109,18 @@ def star_removal(
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
     """
-    Remove stars from the stretched image using StarNet v2 neural network.
+    Remove stars from a non-linear image using StarNet v2.
 
     Produces a color starless image and optionally a star mask.
 
     Processing pipeline (internal):
-      1. Convert FITS → 16-bit TIF (Siril savetif16)
+      1. Convert FITS → 16-bit TIF (Siril savetif)
       2. Run StarNet2 MPS on TIF → starless TIF + mask TIF
       3. Convert TIFs back → FITS (Siril save)
 
-    Set upscale=True when median_fwhm < 2px (under-sampled). Under-sampled
-    images have tight stars that StarNet partially misses without upscaling.
-    Upscaling doubles processing time and adds no benefit when FWHM ≥ 2px.
+    upscale=True applies 2× intermediate upsampling — roughly doubles
+    processing time; StarNet's detection reliability drops at FWHM < ~2px
+    without it.
     """
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"]["current_image"]
@@ -198,16 +194,64 @@ def star_removal(
         if mf.exists():
             mask_fits_path = str(mf)
 
+    # Post-condition contract: image-modifying tools update paths.current_image
+    # to their primary output. star_removal's primary output is the starless
+    # image — that is the file downstream nonlinear tools should process. The
+    # pre-starless image is preserved at paths.previous_image so the agent can
+    # refer back to it if needed, and the starless image is ALSO kept at
+    # paths.starless_image for explicit reference (star_restoration needs it
+    # to know what to blend stars back onto).
+    #
+    # Prior to this fix, current_image was left pointing at the pre-starless
+    # input, which caused save_checkpoint("starless_base") to bookmark the
+    # starred file by mistake — restore_checkpoint then became a no-op relative
+    # to any subsequent starless work, and the agent could not recover.
+    prev_current = state["paths"].get("current_image")
     summary = {
+        "current_image": str(starless_fits),
+        "previous_image": prev_current,
         "starless_image_path": str(starless_fits),
         "star_mask_path": mask_fits_path,
         "upscale": upscale,
         "generate_star_mask": generate_star_mask,
         "color_detected": color_detected,
         "starnet_stdout": starnet_stdout.strip(),
+        "note": (
+            "current_image now points at the starless FITS. Subsequent tools "
+            "(curves, saturation, multiscale_process, local_contrast_enhance) "
+            "will read the starless image. The pre-starless file is still on "
+            "disk at previous_image. Call star_restoration before export to "
+            "blend the stars back."
+        ),
     }
 
+    # Star removal preserves image_space: the operation splits an image into
+    # (starless, mask) but each output is in the same value space as the
+    # input. The documented contract is that t15 runs post-stretch, so the
+    # input should be display-space — but state is the authoritative
+    # contract, so pass through whatever the input claims to be. State
+    # missing image_space is a legacy/broken checkpoint; refuse rather
+    # than guess. See Metadata.image_space.
+    incoming_image_space = state["metadata"].get("image_space")
+    if incoming_image_space not in ("linear", "display"):
+        raise RuntimeError(
+            "star_removal: state.metadata.image_space is missing or invalid "
+            f"(got {incoming_image_space!r}). Every writer of paths.current_image "
+            "must also write metadata.image_space; this looks like a legacy "
+            "checkpoint or a writer that skipped its bookkeeping. Refusing to "
+            "guess — restart from a fresh checkpoint."
+        )
+
+    # Delta-only paths emit; the spread used here previously was the
+    # parallel-update anti-pattern (CLAUDE.md). Each key is only named if
+    # this tool changes it.
     return Command(update={
-        "paths": {**state["paths"], "starless_image": str(starless_fits), "star_mask": mask_fits_path},
+        "paths": {
+            "current_image": str(starless_fits),
+            "previous_image": prev_current,
+            "starless_image": str(starless_fits),
+            "star_mask": mask_fits_path,
+        },
+        "metadata": {"image_space": incoming_image_space},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

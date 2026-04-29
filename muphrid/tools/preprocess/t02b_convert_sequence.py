@@ -25,9 +25,27 @@ from langchain_core.tools import tool
 from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
+from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
 from muphrid.tools._siril import run_siril_script
+
+
+class ConvertSequenceInput(BaseModel):
+    sequence_name: str = Field(
+        description=(
+            "Name for the output FITSEQ sequence (without extension). "
+            "Produces <sequence_name>.seq + <sequence_name>.fit in the "
+            "working directory."
+        ),
+    )
+    debayer: bool = Field(
+        default=False,
+        description=(
+            "When True, debayer raw CFA frames during conversion. Leave "
+            "False for OSC pipelines that debayer at calibrate time instead."
+        ),
+    )
 
 
 def _convert_to_sequence(
@@ -87,7 +105,7 @@ def _convert_to_sequence(
     }
 
 
-@tool
+@tool(args_schema=ConvertSequenceInput)
 def convert_sequence(
     sequence_name: str,
     debayer: bool = False,
@@ -114,6 +132,6 @@ def convert_sequence(
     result = _convert_to_sequence(working_dir, input_files, sequence_name, debayer)
 
     return Command(update={
-        "paths": {**state["paths"], "lights_sequence": result["sequence_name"]},
+        "paths": {"lights_sequence": result["sequence_name"]},
         "messages": [ToolMessage(content=json.dumps(result, indent=2, default=str), tool_call_id=tool_call_id)],
     })

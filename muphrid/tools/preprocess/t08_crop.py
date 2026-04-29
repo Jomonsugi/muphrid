@@ -132,7 +132,7 @@ def _find_crop_bounds(image_path: Path, threshold: float) -> tuple[int, int, int
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool
+@tool(args_schema=AutoCropInput)
 def auto_crop(
     mode: str = "auto",
     threshold: float = 0.01,
@@ -220,6 +220,10 @@ def auto_crop(
     }
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(cropped_path)},
+        "paths": {"current_image": str(cropped_path)},
+        # auto_crop runs immediately after stacking — the input is linear
+        # by construction and cropping is a pixel-area operation that does
+        # not change the value space. See Metadata.image_space.
+        "metadata": {"image_space": "linear"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

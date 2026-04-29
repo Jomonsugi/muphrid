@@ -1,7 +1,7 @@
 # Processing pipeline configuration
 #
 # Project-level settings for model selection, safety limits, behavior,
-# memory, and tracing. This file is version-controllable (not secrets).
+# and tracing. This file is version-controllable (not secrets).
 #
 # Secrets (API keys) and machine-specific paths (binary locations) stay
 # in .env or shell environment (~/.zshrc).
@@ -21,9 +21,25 @@ default = "moonshotai/Kimi-K2.5"
 # These prevent runaway tool loops and excessive resource usage.
 
 [limits]
-# Max LangGraph node transitions per stream() call (~4 per tool call)
-# 50 ≈ 12 tool calls, 100 ≈ 25 tool calls, 200 ≈ 50 tool calls
-recursion_limit = 100
+# Max LangGraph node transitions per stream() call.
+#
+# Steady-state tool-call cost: ~4 ticks per call
+#   (action → variant_snapshot → hitl_check → agent).
+# HITL round cost: ~6–10 additional ticks per gate
+#   (pass-1 prompt injection → agent analysis → optional present_images
+#    tool call → pass-2 interrupt → resume → agent). Each human feedback
+#    round inside an active HITL chat burns another ~4 ticks.
+#
+# Rough budgets including HITL overhead for a typical run with 4–6 gates:
+#   150 ≈ 25 tool calls   (tight — single-pass nonlinear only)
+#   200 ≈ 35 tool calls   (comfortable — iteration + a few HITL exchanges)
+#   300 ≈ 55 tool calls   (roomy — heavy iteration + multiple feedback rounds)
+#
+# Root-cause fixes for HITL tick burn are tracked separately (hitl_check
+# pass 1 could inline the present_images call instead of prompting the
+# agent to make it, saving ~4 ticks per gate). Until then, the safe
+# default is 200 so the agent does not hit the ceiling mid-conversation.
+recursion_limit = 200
 
 # Global default for per-phase tool call limits (0 = disabled)
 max_tools_per_phase = 30
@@ -76,35 +92,6 @@ cleanup_previous_runs = true
 # context window. The model's reasoning captures the conclusions; raw JSON is
 # dead weight after a phase ends. Full data stays in state.
 prune_phase_analysis = true
-
-# ── Long-term memory ──────────────────────────────────────────────────────────
-# Off by default. Enable when the agent is producing quality results and you
-# want it to learn from HITL sessions.
-
-[memory]
-enabled = false
-db_path = "~/.muphrid/memory.db"
-
-# Embedding provider: "ollama" (external service, large models) or "fastembed" (in-process, ONNX)
-# This is a one-time choice — changing provider or model requires rebuilding the vector index.
-embedding_provider = "ollama"
-
-# Embedding model name. Must be valid for the chosen provider.
-# Changing the model requires rebuilding the vector index.
-#
-# Ollama models (run `ollama list` to see available):
-#   - qwen3-embedding (4096 dims, 8B params, best quality, requires ~5GB)
-#
-# FastEmbed models (downloaded automatically on first use):
-#   - snowflake/snowflake-arctic-embed-l (1024 dims, best quality for fastembed, ~1GB)
-#   - BAAI/bge-small-en-v1.5 (384 dims, lightweight, ~67MB)
-#   - nomic-ai/nomic-embed-text-v1.5 (768 dims, good balance, ~137MB)
-#
-embedding_model = "qwen3-embedding"
-
-# Set to true ONCE after changing embedding_provider or embedding_model.
-# This drops and rebuilds the vector index. Remove after one successful run.
-# rebuild_embeddings = false
 
 # ── LangSmith tracing ────────────────────────────────────────────────────────
 # Requires LANGCHAIN_API_KEY in shell environment or .env.
