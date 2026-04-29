@@ -56,3 +56,4 @@ checkpoints.db-wal
 *.db-shm
 *.db-wal
 .claude/
+CLAUDE.md
