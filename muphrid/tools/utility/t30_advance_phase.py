@@ -26,6 +26,7 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from muphrid.graph import review as review_ctl
 from muphrid.graph.state import AstroState, PhaseSnapshot, ProcessingPhase, RegressionWarning, Replace
 
 
@@ -425,7 +426,6 @@ def _build_phase_snapshot(state: AstroState, captured_from_phase: str) -> PhaseS
     })
     regression_snap = copy.deepcopy(state.get("regression_warnings") or [])
     variants_snap = copy.deepcopy(state.get("variant_pool") or [])
-    presented_snap = copy.deepcopy(state.get("presented_for_review") or [])
     visual_snap = copy.deepcopy(state.get("visual_context") or [])
 
     return PhaseSnapshot(
@@ -435,7 +435,6 @@ def _build_phase_snapshot(state: AstroState, captured_from_phase: str) -> PhaseS
         regression_warnings=regression_snap,
         variant_pool=variants_snap,
         visual_context=visual_snap,
-        presented_for_review=presented_snap,
         captured_at=datetime.now(timezone.utc).isoformat(),
         captured_from_phase=captured_from_phase,
     )
@@ -1133,6 +1132,27 @@ def advance_phase(
     current = state.get("phase", ProcessingPhase.INGEST)
     next_phase = _NEXT_PHASE.get(current, ProcessingPhase.COMPLETE)
 
+    # Guard: an open HITL gate is a collaboration checkpoint. The agent may
+    # keep experimenting and presenting candidates, but it must not step over
+    # the gate until the human has approved or otherwise resolved it. If the
+    # operator disables that HITL checkpoint mid-gate, do not trap the run in
+    # stale review_session state.
+    hitl_still_enabled = review_ctl.active_review_blocks_autonomy(state)
+    if review_ctl.active_review_session(state) and hitl_still_enabled:
+        msg = (
+            f"Cannot advance from {current.value.upper()}: a HITL review gate "
+            "is still open. Select and explain candidate(s) with "
+            "present_for_review, respond to the human's feedback, or wait for "
+            "structured approval before calling advance_phase again."
+        )
+        logger.warning(
+            f"advance_phase BLOCKED: {current.value} → {next_phase.value} — "
+            "review_session is open"
+        )
+        return Command(update={
+            "messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)],
+        })
+
     # Guard: export_final MUST be called before the pipeline can reach COMPLETE.
     if next_phase == ProcessingPhase.COMPLETE:
         if not state.get("metadata", {}).get("export_done"):
@@ -1266,18 +1286,16 @@ def advance_phase(
 
     return Command(update={
         "phase": next_phase,
+        "active_hitl": False,
+        "review_session": review_ctl.close_review_session(
+            state.get("review_session"),
+            reason="phase_advanced",
+        ),
         # Variant pool is per-HITL-gate. Phase advance clears it so the next
         # phase starts with an empty pool. The approved variant has already
         # been promoted to current_image (either by hitl_check on variant
         # approval, or by the tool itself in autonomous mode).
         "variant_pool": [],
-        # presented_for_review is the agent's curation set for the gate
-        # we're leaving — clear so the next phase starts with no carry-over
-        # candidates. Replace([]) because the field uses
-        # _list_extend_or_replace (extend by default); without Replace,
-        # an empty new list would no-op the reducer and leave stale
-        # entries in place.
-        "presented_for_review": Replace([]),
         # visual_context is the VLM working set. Phase advance is the natural
         # release point: prior-phase visuals are no longer decision-relevant.
         "visual_context": [],

@@ -19,6 +19,7 @@ from langgraph.graph import END, StateGraph
 from muphrid.config import make_llm
 from muphrid.graph.nodes import (
     agent_chat,
+    auto_checkpoint,
     hitl_check,
     make_action_node,
     make_agent_node,
@@ -121,6 +122,7 @@ def build_graph(
     # ── Add nodes ─────────────────────────────────────────────────────────
     builder.add_node("phase_router", phase_router)
     builder.add_node("agent", agent_node)
+    builder.add_node("auto_checkpoint", auto_checkpoint)
     builder.add_node("action", action_node)
     builder.add_node("variant_snapshot", variant_snapshot)
     builder.add_node("hitl_check", hitl_check)
@@ -136,17 +138,24 @@ def build_graph(
         "agent",
         route_after_agent,
         {
-            "action": "action",
+            "action": "auto_checkpoint",
             "hitl_check": "hitl_check",
             "agent_chat": "agent_chat",
             "__end__": END,
         },
     )
 
+    # auto_checkpoint → action → variant_snapshot → hitl_check
+    # auto_checkpoint bookmarks the pre-call current_image before post-stack
+    # image-mutating tools. It is metadata-only so ToolNode still sees the
+    # original AIMessage tool_calls as the latest message.
+    builder.add_edge("auto_checkpoint", "action")
+
     # action → variant_snapshot → hitl_check
     # variant_snapshot captures HITL-mapped tool outputs into the variant pool
-    # and enriches their ToolMessages with a pool summary for the agent. It's
-    # mode-agnostic — runs in both HITL and autonomous modes.
+    # for HITL review, autonomous commit_variant decisions, and the Gradio
+    # workbench filmstrip. It is mode-agnostic — runs in both HITL and
+    # autonomous modes.
     builder.add_edge("action", "variant_snapshot")
     builder.add_edge("variant_snapshot", "hitl_check")
 

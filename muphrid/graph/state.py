@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import operator
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from langgraph.graph.message import add_messages
 
@@ -26,7 +26,7 @@ from langgraph.graph.message import add_messages
 # langchain auto-generates a tool args schema that includes AstroState
 # (e.g. on the async Gradio path). typing_extensions.TypedDict is a
 # drop-in replacement and is correct on all supported Python versions.
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 
 def _merge_dicts(old: dict, new: dict) -> dict:
@@ -74,7 +74,6 @@ def Replace(value):  # noqa: N802 — function-style API, mirrors a constructor
 
     Usage:
         return Command(update={"metrics": Replace(restored_metrics)})
-        return Command(update={"presented_for_review": Replace([])})
 
     Implementation note: Replace is a plain dict (`{"__muphrid_replace__":
     True, "value": value}`), not a custom class. This matters because
@@ -122,33 +121,6 @@ def _dict_merge_or_replace(old, new):
         return new.get("value")
     if isinstance(new, dict) and isinstance(old, dict):
         return _merge_dicts(old, new)
-    return new
-
-
-def _list_extend_or_replace(old, new):
-    """
-    Reducer for list-valued fields where parallel writers should accumulate
-    AND clearers (rewind_phase, advance_phase, commit_variant) need a way
-    to fully reset.
-
-      * Replace(v)            → v (full replacement)
-      * list + list           → old + new (extend, append-style)
-      * non-list new          → return new (matches default replace semantics)
-
-    Use Replace([]) to clear, Replace(snapshot) to restore.
-
-    Currently only `presented_for_review` uses this reducer. Other list
-    fields (variant_pool, visual_context, regression_warnings) have a
-    single writer per super-step that recomputes the full new list from
-    scratch — additive composition would be incorrect there. If you ever
-    add a second additive writer to one of those, switch its reducer to
-    this one.
-    """
-    old = _replace_unwrap(old)
-    if _is_replace(new):
-        return new.get("value")
-    if isinstance(new, list) and isinstance(old, list):
-        return old + new
     return new
 
 
@@ -417,7 +389,6 @@ class PhaseSnapshot(TypedDict):
     regression_warnings:    list
     variant_pool:           list
     visual_context:         list
-    presented_for_review:   list  # the agent's HITL-gate curation set
     captured_at:            str
     captured_from_phase:    str
 
@@ -514,23 +485,73 @@ class Variant(TypedDict):
     rationale:    str | None    # populated only after this variant is committed
 
 
-class PresentedVariant(TypedDict):
+class ReviewHumanEvent(TypedDict, total=False):
     """
-    One entry in `state.presented_for_review` — a pool variant the agent
-    has explicitly surfaced for human approval at the current HITL gate.
+    A typed human event delivered while a HITL review session is paused.
 
-    Per-variant attribution: each call to `present_for_review` may add one
-    or more variants, each carrying the rationale the agent supplied with
-    that call. When the agent later adds more variants in a follow-up
-    call, those new entries carry their own (possibly different) rationale.
-    The UI renders each variant alongside its specific rationale so the
-    agent's evolving reasoning is visible.
-
-    Lifecycle: cleared on phase advance, variant commit, and rewind.
+    This replaces treating every resume value as ambiguous text. Chat
+    questions, revision feedback, and approval clicks remain model-visible,
+    but the graph controller can apply the correct state transition without
+    parsing UX intent out of prose.
     """
-    variant_id:    str           # references Variant.id in state.variant_pool
-    rationale:     str           # agent's commentary at the moment this entry was added
-    presented_at:  str           # ISO 8601
+    type: Literal["question", "feedback", "approve_variant", "approve_current"]
+    text: str
+    variant_id: NotRequired[str]
+    rationale: NotRequired[str]
+    received_at: NotRequired[str]
+
+
+class ReviewProposalCandidate(TypedDict):
+    """One approvable candidate in a review proposal artifact."""
+    variant_id:   str
+    rationale:    str
+    presented_at: str
+
+
+class ReviewProposal(TypedDict, total=False):
+    """
+    First-class artifact rendered by clients during a HITL review.
+
+    This artifact is the canonical UI and approval contract: which candidates
+    are approvable, what the agent recommends, and what tradeoffs or metrics
+    should be shown alongside the images.
+    """
+    candidates:        list[ReviewProposalCandidate]
+    recommendation:    str | None
+    rationale:         str
+    tradeoffs:         list[str]
+    metric_highlights: dict
+    updated_at:        str
+
+
+class ReviewSession(TypedDict, total=False):
+    """
+    Explicit HITL Review Mode state.
+
+    This session is the source of truth for open review gates, turn policy,
+    proposal artifacts, and typed human events.
+    """
+    gate_id:               str
+    hitl_key:              str
+    tool_name:             str
+    phase:                 str
+    title:                 str
+    status:                Literal[
+        "review_open",
+        "awaiting_agent_response",
+        "awaiting_curation",
+        "awaiting_human_approval",
+        "closed",
+    ]
+    opened_at:             str
+    updated_at:            str
+    closed_at:             NotRequired[str]
+    close_reason:          NotRequired[str]
+    last_human_event:      ReviewHumanEvent | None
+    turn_policy:           str
+    tool_runs_since_human: int
+    visible_response_required: bool
+    proposal:              ReviewProposal
 
 
 # ── Session context (human-provided at startup) ────────────────────────────────
@@ -604,10 +625,9 @@ class HITLPayload(TypedDict):
       * variant_pool — every variant produced this segment. Read-only
         history; presenters render it as a "what the agent has tried"
         panel without Approve buttons.
-      * proposal — the agent's curated subset (from
-        state.presented_for_review). Each entry pairs a Variant with the
-        rationale the agent supplied when surfacing it. Approve buttons
-        render here.
+      * proposal — the agent's curated subset from review_session.proposal.
+        Each entry pairs a Variant with the rationale the agent supplied when
+        surfacing it. Approve buttons render here.
     """
     type:           str             # "data_review", "image_review", or "agent_chat"
     title:          str             # human-readable title (from hitl_config.toml)
@@ -617,6 +637,9 @@ class HITLPayload(TypedDict):
     agent_text:     str             # agent's response text (for multi-turn HITL display)
     variant_pool:   list[Variant]   # passive history — every variant produced this segment
     proposal:       list[dict]      # agent's curation: each item = {variant, rationale, presented_at}
+    review_session: NotRequired[ReviewSession | None]  # canonical Review Mode state
+    review_state:   NotRequired[str]  # "ready" or "needs_curation"
+    approval_allowed: NotRequired[bool]  # false when pool is only observational
 
 
 # ── Top-level graph state ──────────────────────────────────────────────────────
@@ -645,11 +668,14 @@ class AstroState(TypedDict):
     # Accumulated HITL preferences — written by hitl_node, read by planner
     user_feedback: dict
 
-    # Active HITL conversation flag — set by hitl_check when interrupt fires,
-    # cleared on approval. While True, the agent routes back to hitl_check
-    # (not agent_chat) even when it responds without tool calls, so the
-    # human can chat freely before approving or requesting revision.
+    # Derived HITL conversation flag for logs/legacy inspection. Review policy
+    # must read review_session instead.
     active_hitl: bool
+
+    # Canonical HITL review session. This makes review state explicit instead
+    # of inferring gate identity, turn policy, and proposal eligibility from
+    # recent messages.
+    review_session: ReviewSession | None
 
     # Variant pool — passive history of every variant produced this segment.
     # Built automatically by variant_snapshot from HITL-mapped tool execution.
@@ -657,23 +683,6 @@ class AstroState(TypedDict):
     # is NOT the approve set. Cleared on phase advance and variant commit.
     # Default LangGraph "replace" semantics: nodes return the full new list.
     variant_pool: list[Variant]
-
-    # Presented-for-review set — the agent's explicit curation of pool
-    # entries it wants the human to weigh in on at the current HITL gate.
-    # Populated by the `present_for_review` tool (the curation gesture);
-    # NOT auto-populated. Approve buttons in the UI render from this list,
-    # not from variant_pool. Empty until the agent explicitly picks. Each
-    # entry pairs a variant_id from the pool with the rationale the agent
-    # gave when adding it (per-call attribution — multiple add-mode calls
-    # accumulate separate rationales). Cleared at the same lifecycle points
-    # as variant_pool: phase advance, variant commit, rewind.
-    #
-    # Reducer is _list_extend_or_replace so mode='add' calls compose
-    # cleanly under parallel execution, while clearer/restorer code paths
-    # use Replace([]) / Replace(snapshot) to fully reset.
-    presented_for_review: Annotated[
-        list["PresentedVariant"], _list_extend_or_replace
-    ]
 
     # Visual context — non-variant working set of images for the VLM
     # (present_images calls, phase-carry anchors). Active HITL gate variants
@@ -783,8 +792,8 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
         messages=[],
         user_feedback={},
         active_hitl=False,
+        review_session=None,
         variant_pool=[],
-        presented_for_review=[],
         visual_context=[],
         regression_warnings=[],
     )

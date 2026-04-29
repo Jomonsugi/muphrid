@@ -140,11 +140,15 @@ LINEAR_TOOLS = [
     remove_green_noise,
     noise_reduction,
     deconvolution,
+    save_checkpoint,
+    restore_checkpoint,
 ]
 
 STRETCH_TOOLS = [
     stretch_image,
     select_stretch_variant,
+    save_checkpoint,
+    restore_checkpoint,
 ]
 
 NONLINEAR_TOOLS = [

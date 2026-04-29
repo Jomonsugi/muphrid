@@ -7,16 +7,19 @@ current_image. Calling the same tool repeatedly therefore chains
 cumulatively — each call processes the previous output, not the
 original input.
 
-save_checkpoint records a name → current_image path mapping in
-metadata.checkpoints. The checkpoint is a pointer to a FITS that
-already exists on disk; no copy is made.
+The graph automatically records "auto:*" checkpoints before post-stack
+image-modifying tools. save_checkpoint is the manual companion for
+deliberate named bookmarks: it records a name → current_image path
+mapping in metadata.checkpoints. The checkpoint is a pointer to a FITS
+that already exists on disk; no copy is made.
 
 restore_checkpoint sets paths.current_image to the recorded path,
 making the next image-modifying tool read from the bookmarked file.
 The displaced FITS remains on disk and is still recoverable from
 prior tool output messages.
 
-Available in every phase. Naming is the agent's choice.
+Available in post-stack image-processing phases where a human would
+reasonably want undo/bookmark behavior: linear, stretch, and nonlinear.
 """
 
 from __future__ import annotations
@@ -59,11 +62,14 @@ def save_checkpoint(
     state: Annotated[dict, InjectedState] = None,
 ) -> Command:
     """
-    Record current_image under a name in metadata.checkpoints.
+    Record current_image under a deliberate name in metadata.checkpoints.
 
     The checkpoint stores the FITS path, not the file contents — no copy
     is made. Restoring this checkpoint later sets current_image back to
     the recorded path.
+
+    You do not need to call this before routine image-modifying tools; the
+    graph automatically creates "auto:*" checkpoints for normal undo.
 
     Returns the saved name and the full set of currently-bookmarked
     checkpoints. Re-using an existing name overwrites the prior entry.
@@ -132,8 +138,10 @@ def restore_checkpoint(
         return Command(update={
             "messages": [ToolMessage(
                 content=(
-                    "No checkpoints saved yet. Call save_checkpoint to bookmark "
-                    "the current image before attempting to restore."
+                    "No checkpoints are available yet. The graph creates "
+                    "automatic checkpoints before post-stack image-modifying "
+                    "tools, and save_checkpoint can create deliberate named "
+                    "bookmarks."
                 ),
                 tool_call_id=tool_call_id,
             )],

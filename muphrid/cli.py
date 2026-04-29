@@ -25,7 +25,7 @@ from langgraph.types import Command
 
 from muphrid.config import check_dependencies, load_settings
 from muphrid.graph.graph import build_graph
-from muphrid.graph.hitl import APPROVE_SENTINEL
+from muphrid.graph import review as review_ctl
 from muphrid.graph.state import (
     AstroState,
     ProcessingPhase,
@@ -521,20 +521,63 @@ def _run_graph(
             typer.echo(f"HITL: {interrupt_payload.get('title', 'Review')}")
             typer.echo(f"Type: {interrupt_type}")
             typer.echo(f"Tool: {interrupt_payload.get('tool_name', 'unknown')}")
+            if interrupt_payload.get("review_state") == "needs_curation":
+                typer.echo(
+                    "Review state: agent still needs to select and present "
+                    "candidate(s) before approval is available."
+                )
 
             images = interrupt_payload.get("images", [])
             if images:
                 typer.echo(f"Images: {images}")
 
+            proposal = interrupt_payload.get("proposal", []) or []
+            proposal_ids: list[str] = []
+            if proposal:
+                typer.echo("\nPresented candidates:")
+                for entry in proposal:
+                    variant = entry.get("variant", {}) if isinstance(entry, dict) else {}
+                    vid = variant.get("id")
+                    if not vid:
+                        continue
+                    proposal_ids.append(vid)
+                    label = variant.get("label", "")
+                    rationale = entry.get("rationale", "") if isinstance(entry, dict) else ""
+                    typer.echo(f"  {vid}: {label}")
+                    if rationale:
+                        typer.echo(f"    {rationale}")
+
             typer.echo(f"{'=' * 60}")
 
             if autonomous:
                 typer.echo("[autonomous] Auto-approving.")
-                response = APPROVE_SENTINEL
+                response = {"type": "approve_current", "text": "Auto-approve"}
             else:
-                response = typer.prompt("approve (a) or message").strip()
-                if response.lower() in ("a", "approve"):
-                    response = APPROVE_SENTINEL
+                approval_allowed = interrupt_payload.get("approval_allowed", True)
+                if approval_allowed and proposal_ids:
+                    prompt = "approve <variant_id> or message"
+                else:
+                    prompt = "approve (a) or message" if approval_allowed else "message"
+                response = typer.prompt(prompt).strip()
+                if approval_allowed:
+                    lowered = response.lower()
+                    if proposal_ids:
+                        parts = response.split()
+                        if lowered in ("a", "approve") and len(proposal_ids) == 1:
+                            response = review_ctl.approval_resume_event(proposal_ids[0])
+                        elif len(parts) == 2 and parts[0].lower() in ("a", "approve"):
+                            requested = parts[1]
+                            if requested in proposal_ids:
+                                response = review_ctl.approval_resume_event(requested)
+                            else:
+                                typer.echo(
+                                    f"Variant '{requested}' is not in the presented set; "
+                                    "treating input as feedback."
+                                )
+                    elif lowered in ("a", "approve"):
+                        response = {"type": "approve_current", "text": "Approve current"}
+                if isinstance(response, str):
+                    response = review_ctl.feedback_resume_event(response)
 
         # Resume with human response
         stream_input = Command(resume=response)

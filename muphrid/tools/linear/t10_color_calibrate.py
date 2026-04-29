@@ -471,7 +471,14 @@ def _read_wcs_from_fits(fits_path: Path, pixel_size_um: float | None = None) -> 
             header = hdul[0].header
             pltsolvd = bool(header.get("PLTSOLVD", False))
 
-            wcs = WCS(header)
+            # Siril can write solved WCS keywords onto RGB FITS files where
+            # the data/header still has NAXIS=3 (color plane + two spatial
+            # axes). Astropy rejects SIP/distortion tables on a full 3D WCS
+            # with "distortions only work in 2 dimensions", even though the
+            # celestial solution itself is valid. Ask explicitly for the
+            # 2D celestial WCS so plate_solve/color_calibrate work on RGB
+            # products as well as mono/2D FITS.
+            wcs = WCS(header, naxis=2)
             crval = wcs.wcs.crval if wcs.has_celestial else None
 
             ra = float(crval[0]) if crval is not None and len(crval) >= 1 else None

@@ -49,8 +49,8 @@ from langgraph.types import Command
 
 from muphrid.config import check_dependencies, load_settings, make_llm
 from muphrid.graph.graph import build_graph
+from muphrid.graph import review as review_ctl
 from muphrid.graph.hitl import (
-    build_variant_approval,
     set_autonomous,
     set_vlm_autonomous,
     set_vlm_retention_max,
@@ -264,6 +264,146 @@ def _convert_fits_to_preview(
     return preview_paths
 
 
+def _working_dir_from_variants(variants: list[dict], fallback: str = "") -> str:
+    """Return a usable working directory from explicit state or variant paths."""
+    if fallback:
+        return fallback
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        fp = v.get("file_path")
+        if fp:
+            return str(Path(fp).parent)
+    return ""
+
+
+def _variant_gallery_items(
+    variants: list[dict],
+    working_dir: str,
+    is_linear: bool,
+    *,
+    prefix: str = "",
+) -> list[tuple]:
+    """Build Gradio gallery entries for variant dicts."""
+    if not variants:
+        return []
+    wd = _working_dir_from_variants(variants, working_dir)
+    if not wd:
+        return []
+
+    paths = [v.get("file_path") for v in variants if isinstance(v, dict) and v.get("file_path")]
+    if not paths:
+        return []
+
+    try:
+        preview_paths = _convert_fits_to_preview(paths, wd, is_linear)
+    except Exception as e:
+        logger.warning(f"Variant preview generation failed: {e}")
+        return []
+
+    items: list[tuple] = []
+    path_idx = 0
+    for v in variants:
+        if not isinstance(v, dict) or not v.get("file_path"):
+            continue
+        if path_idx >= len(preview_paths):
+            break
+        preview = preview_paths[path_idx]
+        path_idx += 1
+        if not Path(preview).exists():
+            continue
+        vid = v.get("id", "?")
+        label = v.get("label", "")
+        caption = f"{vid} — {label}" if label else str(vid)
+        if prefix:
+            caption = f"{prefix}{caption}"
+        items.append((preview, caption))
+    return items
+
+
+def _proposal_variants(proposal: list[dict]) -> list[dict]:
+    """Extract Variant dicts from HITL proposal entries."""
+    out: list[dict] = []
+    for entry in proposal or []:
+        if not isinstance(entry, dict):
+            continue
+        variant = entry.get("variant")
+        if isinstance(variant, dict):
+            out.append(variant)
+    return out
+
+
+def _proposal_from_review_session(
+    review_session: dict | None,
+    variant_pool: list[dict],
+) -> list[dict]:
+    """Resolve ReviewSession proposal candidates into UI proposal entries."""
+    if not review_ctl.review_is_open(review_session):
+        return []
+    artifact = (review_session or {}).get("proposal", {}) or {}
+    candidates = artifact.get("candidates", []) or []
+    pool_by_id = {
+        v.get("id"): v for v in variant_pool or []
+        if isinstance(v, dict) and v.get("id")
+    }
+    resolved: list[dict] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        vid = candidate.get("variant_id")
+        variant = pool_by_id.get(vid)
+        if variant is None:
+            continue
+        resolved.append({
+            "variant": variant,
+            "rationale": candidate.get("rationale", ""),
+            "presented_at": candidate.get("presented_at", ""),
+            "recommendation": artifact.get("recommendation"),
+            "tradeoffs": artifact.get("tradeoffs", []),
+            "metric_highlights": artifact.get("metric_highlights", {}),
+            "proposal_rationale": artifact.get("rationale", ""),
+        })
+    return resolved
+
+
+def _append_chat_once(chat_messages: list[dict], role: str, content: str) -> None:
+    """Append a chat message unless it is an immediate duplicate."""
+    text = (content or "").strip()
+    if not text:
+        return
+    if chat_messages:
+        last = chat_messages[-1]
+        if last.get("role") == role and last.get("content") == text:
+            return
+    chat_messages.append({"role": role, "content": text})
+
+
+def _proposal_rationale_summary(proposal: list[dict]) -> str:
+    """Fallback chat summary when a proposal has rationale but no agent text."""
+    if not proposal:
+        return ""
+    lines = ["**Agent-presented candidate rationale:**"]
+    for entry in proposal:
+        if not isinstance(entry, dict):
+            continue
+        variant = entry.get("variant") or {}
+        if not isinstance(variant, dict):
+            continue
+        vid = variant.get("id", "?")
+        label = variant.get("label", "")
+        rationale = (entry.get("rationale", "") or "").strip()
+        recommendation = entry.get("recommendation")
+        heading = f"- **{vid}**"
+        if label:
+            heading += f" — {label}"
+        if recommendation == vid:
+            heading += " (recommended)"
+        if rationale:
+            heading += f": {rationale}"
+        lines.append(heading)
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 # ── Stream chunk parsing (sync, defensive) ───────────────────────────────────
 
 
@@ -272,30 +412,30 @@ def _parse_stream_chunks(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    pool_gallery_images: list[tuple],
     variant_pool: list[dict],
     proposal: list[dict],
     working_dir: str,
     is_linear: bool,
-    active_hitl: bool = False,
+    in_review: bool = False,
 ) -> tuple[dict | None, bool]:
     """
     Parse a single stream chunk (stream_mode="updates") and update the UI lists.
 
-    Returns (interrupt_payload_or_None, updated_active_hitl).
+    Returns (interrupt_payload_or_None, updated_in_review).
     Routes agent text to chat during HITL, activity log during autonomous.
 
     The variant_pool and proposal lists are mutated in place from any state
     updates carried in this chunk. That gives the UI a live view of the
     pool growing while the agent runs, even in autonomous phases where no
-    HITL interrupt fires — the user can watch their image accumulate with
-    each successful HITL-mapped tool call. Same goes for the gallery: new
-    variant previews are appended as the pool grows so the human always
-    has a visual companion to the pool panel.
+    HITL interrupt fires. The bottom pool filmstrip mirrors this workbench
+    history; the main gallery stays reserved for presented review candidates
+    and explicit present_images context.
 
     Defensive: handles None values, non-dict updates, unexpected chunk formats.
     """
     if "__interrupt__" in chunk:
-        return chunk["__interrupt__"][0].value, active_hitl
+        return chunk["__interrupt__"][0].value, in_review
 
     for node_name, update in chunk.items():
         if node_name == "__interrupt__":
@@ -303,11 +443,18 @@ def _parse_stream_chunks(
         if not isinstance(update, dict):
             continue
 
-        # Track active_hitl from state updates
-        if "active_hitl" in update:
-            active_hitl = update["active_hitl"]
+        if "review_session" in update:
+            review_session = update.get("review_session")
+            if review_ctl.review_is_open(review_session):
+                in_review = True
+                resolved = _proposal_from_review_session(review_session, variant_pool)
+                if resolved:
+                    proposal.clear()
+                    proposal.extend(resolved)
+            elif review_session and review_session.get("status") == "closed":
+                in_review = False
 
-        # Live pool/proposal/gallery updates — autonomous-mode visibility.
+        # Live pool/proposal updates — autonomous-mode visibility.
         # Without these, variant_pool_state and proposal_state are only
         # refreshed at HITL gates (from interrupt_payload), so a user
         # running a phase autonomously sees nothing until they stop. With
@@ -318,68 +465,18 @@ def _parse_stream_chunks(
             if isinstance(new_pool, list):
                 # Replace semantics — variant_pool reducer is plain replace
                 # (the upstream variant_snapshot computes the full new list),
-                # so mirror that here. Detect newly-added variants for
-                # gallery-merge below.
-                old_ids = {v.get("id") for v in variant_pool if isinstance(v, dict)}
+                # so mirror that here and rebuild the pool filmstrip.
                 variant_pool.clear()
                 variant_pool.extend(new_pool)
-                new_variants = [
-                    v for v in new_pool
-                    if isinstance(v, dict) and v.get("id") not in old_ids
-                ]
 
-                # Auto-merge new variant previews into the gallery. Skip
-                # this when working_dir is unknown (rare — only when a
-                # session was registered without a dataset path); previews
-                # need a working_dir to materialize.
-                if new_variants and working_dir:
-                    new_paths = [v.get("file_path") for v in new_variants if v.get("file_path")]
-                    if new_paths:
-                        try:
-                            preview_paths = _convert_fits_to_preview(
-                                new_paths, working_dir, is_linear
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f"_parse_stream_chunks: preview generation "
-                                f"failed for new variants: {e}"
-                            )
-                            preview_paths = []
-                        existing_in_gallery = {
-                            str(entry[0]) for entry in gallery_images
-                            if isinstance(entry, (tuple, list)) and entry
-                        }
-                        for v, p in zip(new_variants, preview_paths):
-                            if Path(p).exists() and str(p) not in existing_in_gallery:
-                                gallery_images.append(
-                                    (p, f"{v.get('id', '?')} — {v.get('label', '')}")
-                                )
-
-        if "presented_for_review" in update:
-            new_presented = update.get("presented_for_review")
-            if isinstance(new_presented, list):
-                # Resolve each PresentedVariant entry's variant_id back to
-                # its full Variant dict from the current pool — same shape
-                # the HITLPayload uses, so the proposal panel renders
-                # consistently with HITL and autonomous runs.
-                pool_by_id = {
-                    v.get("id"): v for v in variant_pool if isinstance(v, dict) and v.get("id")
-                }
-                resolved = []
-                for entry in new_presented:
-                    if not isinstance(entry, dict):
-                        continue
-                    vid = entry.get("variant_id")
-                    variant = pool_by_id.get(vid)
-                    if variant is None:
-                        continue
-                    resolved.append({
-                        "variant": variant,
-                        "rationale": entry.get("rationale", ""),
-                        "presented_at": entry.get("presented_at", ""),
-                    })
-                proposal.clear()
-                proposal.extend(resolved)
+                # Auto-refresh the bottom workbench filmstrip from the pool.
+                # The main review gallery is reserved for agent-presented
+                # candidates/context; raw pool history stays observational.
+                pool_gallery_images.clear()
+                if new_pool:
+                    pool_gallery_images.extend(
+                        _variant_gallery_items(new_pool, working_dir, is_linear)
+                    )
 
         messages = update.get("messages", [])
         for msg in messages:
@@ -394,10 +491,12 @@ def _parse_stream_chunks(
                         })
                 agent_text = text_content(msg.content)
                 if agent_text.strip():
-                    if active_hitl:
-                        # During HITL: skip — the post-stream HITL panel renders
-                        # this same text with the tool title and review footer.
-                        pass
+                    if in_review:
+                        # During HITL, assistant text is part of the
+                        # collaboration. Show it even when the same message
+                        # also contains tool calls; otherwise the UI feels
+                        # like a silent command queue.
+                        _append_chat_once(chat_messages, "assistant", agent_text)
                     else:
                         # Autonomous: agent text goes to ACTIVITY LOG
                         activity_log.append({
@@ -481,7 +580,7 @@ def _parse_stream_chunks(
                 "content": f"--- Phase: **{phase_name.upper()}** ---",
             })
 
-    return None, active_hitl
+    return None, in_review
 
 
 # ── Core streaming handler (async generator) ────────────────────────────────
@@ -494,51 +593,60 @@ async def _stream_graph(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    pool_gallery_images: list[tuple],
     variant_pool: list[dict],
     proposal: list[dict],
     working_dir: str,
     is_linear: bool,
 ):
     """
-    Core async streaming loop. Yields (chat, activity, gallery, pool, proposal).
+    Core async streaming loop. Yields
+    (chat, activity, review_gallery, pool_gallery, pool, proposal).
 
     Two distinct UI surfaces populated from the HITL payload:
       * variant_pool — passive history (every variant produced this segment)
       * proposal     — agent's curation (only what was passed to
                        present_for_review). Approve buttons attach here.
 
-    Both are replaced fresh from each HITL payload — never mutated in
-    place — so the @gr.render blocks redraw cleanly when state changes.
-    Both are empty outside of an active HITL gate.
+    The proposal is replaced fresh from each HITL payload. The pool can also
+    update outside HITL as a live workbench/observability surface.
     """
     interrupt_payload = None
-    active_hitl = False
+    in_review = False
 
     # Snapshot gallery content before streaming so we can detect whether
     # present_images updated it during this round.
     gallery_before_stream = list(gallery_images)
 
     async for chunk in graph.astream(stream_input, config=config, stream_mode="updates"):
-        result, active_hitl = _parse_stream_chunks(
-            chunk, chat_messages, activity_log, gallery_images,
+        result, in_review = _parse_stream_chunks(
+            chunk, chat_messages, activity_log, gallery_images, pool_gallery_images,
             variant_pool, proposal,
-            working_dir, is_linear, active_hitl,
+            working_dir, is_linear, in_review,
         )
         if result is not None:
             interrupt_payload = result
 
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal
 
     # After stream ends, handle any interrupt payload for UI display
     if interrupt_payload is not None:
         title = interrupt_payload.get("title", "Review")
         images = interrupt_payload.get("images", [])
+        agent_text = (interrupt_payload.get("agent_text", "") or "").strip()
 
         # Refresh both panels from the payload. Backend already cleared
         # them on phase advance / variant approval, so each new gate
         # starts with the right state.
         variant_pool = list(interrupt_payload.get("variant_pool", []) or [])
         proposal = list(interrupt_payload.get("proposal", []) or [])
+        approval_allowed = bool(interrupt_payload.get("approval_allowed", True))
+        review_state = interrupt_payload.get("review_state", "ready")
+
+        pool_gallery_images.clear()
+        pool_gallery_images.extend(
+            _variant_gallery_items(variant_pool, working_dir, is_linear)
+        )
 
         # Keep the gallery in sync with the variant panel. If the agent
         # called present_images during this stream, its curated comparison
@@ -566,12 +674,12 @@ async def _stream_graph(
                     working_dir = str(Path(img).parent)
                     break
 
-        # Gallery population + canonical labeling.
+        # Main review gallery population + canonical labeling.
         #
         # Two invariants we hold here:
-        #   (1) Every variant in the approve panel has a gallery preview.
-        #       The agent does not have to call present_images for this —
-        #       the system populates variants automatically.
+        #   (1) Every agent-presented variant in the approve panel has a
+        #       gallery preview. Raw pool entries are shown only in the bottom
+        #       workbench filmstrip.
         #   (2) Every gallery entry whose source matches a variant has the
         #       variant id visible in its caption. This is the fix for
         #       the user's "neither matches the image" confusion: the
@@ -579,7 +687,8 @@ async def _stream_graph(
         #       to start with "T14_v1" too. The agent's descriptive label
         #       (e.g. "GHS D3 SP0.15") is preserved when it provided one
         #       via present_images — we just prefix it with the id.
-        if variant_pool and working_dir:
+        review_variants = _proposal_variants(proposal)
+        if review_variants and working_dir:
             # Compute predicted preview paths for every variant once and
             # build a lookup: preview_path → (variant_id, variant_label).
             # Reusing this map below avoids the cost of re-converting and
@@ -588,13 +697,13 @@ async def _stream_graph(
             # variant". _convert_fits_to_preview is idempotent — it
             # generates JPGs once and returns cached paths thereafter,
             # so calling it here is cheap even when previews already exist.
-            variant_paths = [v["file_path"] for v in variant_pool if v.get("file_path")]
+            variant_paths = [v["file_path"] for v in review_variants if v.get("file_path")]
             preview_paths = (
                 _convert_fits_to_preview(variant_paths, working_dir, is_linear)
                 if variant_paths else []
             )
             variant_info_by_preview: dict[str, tuple[str, str]] = {}
-            for v, p in zip(variant_pool, preview_paths):
+            for v, p in zip(review_variants, preview_paths):
                 if Path(p).exists():
                     variant_info_by_preview[str(p)] = (
                         v.get("id", "?"),
@@ -611,7 +720,7 @@ async def _stream_graph(
                 # Case A: present_images was NOT called this stream — replace
                 # gallery wholesale from variant_pool with canonical captions.
                 gallery_images.clear()
-                for v, p in zip(variant_pool, preview_paths):
+                for v, p in zip(review_variants, preview_paths):
                     if Path(p).exists():
                         gallery_images.append((p, f"{v['id']} — {v.get('label', '')}"))
             else:
@@ -620,7 +729,7 @@ async def _stream_graph(
                 #   2) Normalize captions: any existing gallery entry whose
                 #      path matches a known variant gets the id prefixed,
                 #      preserving the agent's descriptive label.
-                for v, p in zip(variant_pool, preview_paths):
+                for v, p in zip(review_variants, preview_paths):
                     if Path(p).exists() and str(p) not in existing_preview_paths:
                         gallery_images.append(
                             (p, f"{v['id']} — {v.get('label', '')}")
@@ -663,16 +772,34 @@ async def _stream_graph(
                 if Path(p).exists():
                     gallery_images.append((p, f"Variant {i + 1}"))
 
-        # Show HITL review prompt in chat. Agent text is rendered earlier
-        # in the streaming loop during active HITL — we don't repeat it here.
-        if variant_pool:
+        # Show HITL review prompt in chat. Agent text is first-class in
+        # collaboration mode; if the model only provided rationale through
+        # present_for_review, surface that rationale conversationally too.
+        if agent_text:
+            _append_chat_once(chat_messages, "assistant", agent_text)
+        elif proposal:
+            _append_chat_once(
+                chat_messages,
+                "assistant",
+                _proposal_rationale_summary(proposal),
+            )
+
+        if review_state == "needs_curation":
             footer = (
-                f"**{title}** — {len(variant_pool)} variant"
-                f"{'s' if len(variant_pool) != 1 else ''} ready for review.\n\n"
+                f"**{title}** — agent needs to select candidates.\n\n"
                 f"---\n"
-                f"*Pick a variant from the panel to commit and advance, "
-                f"or send feedback to iterate. Type a rationale in the box "
-                f"to record it with your approval.*"
+                f"*The pool filmstrip below is visible for inspection, but "
+                f"nothing is approvable yet. Ask the agent what to compare, "
+                f"or tell it to present the candidate(s) it recommends.*"
+            )
+        elif proposal and approval_allowed:
+            footer = (
+                f"**{title}** — {len(proposal)} candidate"
+                f"{'s' if len(proposal) != 1 else ''} presented for review.\n\n"
+                f"---\n"
+                f"*Pick a presented candidate to commit and advance, "
+                f"or send feedback to iterate. Use the Proposal panel's "
+                f"approval note if you want to record why you approved it.*"
             )
         else:
             footer = (
@@ -683,7 +810,74 @@ async def _stream_graph(
 
         chat_messages.append({"role": "assistant", "content": footer})
 
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal
+
+
+async def _recover_active_hitl_ui(
+    config: dict,
+    state: dict,
+    chat_messages: list[dict],
+    gallery_images: list[tuple],
+    pool_gallery_images: list[tuple],
+    variant_pool: list[dict],
+    proposal: list[dict],
+    *,
+    message: str,
+) -> bool:
+    """
+    Re-render a paused HITL gate after a streaming failure or timeout.
+
+    If the graph already reached interrupt(), the checkpoint has enough state
+    for the UI to recover without consuming the human response slot.
+    """
+    if not config:
+        return False
+
+    try:
+        snapshot = await _GRAPH.aget_state(config)
+        saved_values = snapshot.values if snapshot else {}
+    except Exception as e:
+        logger.warning(f"HITL recovery state read failed: {e}")
+        return False
+
+    if not review_ctl.review_is_open(saved_values.get("review_session")):
+        return False
+
+    saved_pool = list(saved_values.get("variant_pool", []) or [])
+    saved_proposal = _proposal_from_review_session(
+        saved_values.get("review_session"), saved_pool
+    )
+
+    variant_pool.clear()
+    variant_pool.extend(saved_pool)
+    proposal.clear()
+    proposal.extend(saved_proposal)
+
+    wd = state.get("working_dir") or (
+        saved_values.get("dataset", {}).get("working_dir", "")
+        if isinstance(saved_values.get("dataset"), dict) else ""
+    )
+    if not wd and saved_pool:
+        first_path = saved_pool[0].get("file_path") if isinstance(saved_pool[0], dict) else None
+        if first_path:
+            wd = str(Path(first_path).parent)
+    is_linear = bool((saved_values.get("metrics", {}) or {}).get("is_linear_estimate", True))
+
+    if wd:
+        try:
+            pool_gallery_images.clear()
+            pool_gallery_images.extend(_variant_gallery_items(saved_pool, wd, is_linear))
+            gallery_images.clear()
+            gallery_images.extend(
+                _variant_gallery_items(_proposal_variants(saved_proposal), wd, is_linear)
+            )
+            state["working_dir"] = wd
+            state["is_linear"] = is_linear
+        except Exception as e:
+            logger.warning(f"HITL recovery preview generation failed: {e}")
+
+    chat_messages.append({"role": "assistant", "content": message})
+    return True
 
 
 # ── Event handlers (async generators, direct binding) ────────────────────────
@@ -705,12 +899,13 @@ async def start_session(
     chat_messages: list[dict] = []
     activity_log: list[dict] = []
     gallery_images: list[tuple] = []
+    pool_gallery_images: list[tuple] = []
     variant_pool: list[dict] = []
     proposal: list[dict] = []
 
     if not dataset_path or not target_name:
         chat_messages.append({"role": "assistant", "content": "Please provide both a dataset path and target name."})
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
         return
 
     # Block session start if dependencies are missing (checked at app startup)
@@ -719,7 +914,7 @@ async def start_session(
             "role": "assistant",
             "content": f"**Cannot start — missing dependencies.**\n\n{_DEPENDENCY_ERROR}",
         })
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
         return
 
     # Parse remove_stars dropdown value
@@ -732,7 +927,7 @@ async def start_session(
 
     thread_id = _make_thread_id(target_name)
     chat_messages.append({"role": "assistant", "content": f"Starting session **{thread_id}**\n\nIngesting dataset from `{dataset_path}`..."})
-    yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
+    yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
 
     try:
         # Apply equipment overrides from UI to os.environ
@@ -812,20 +1007,30 @@ async def start_session(
         provider = os.environ.get("LLM_PROVIDER", "unknown")
         logger.info(f"Pipeline starting: model={model}, provider={provider}, thread={thread_id}")
 
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
 
         # Stream the graph
-        async for chat_msgs, act_log, gal_imgs, vpool, vprop in _stream_graph(
+        async for chat_msgs, act_log, gal_imgs, pool_gal_imgs, vpool, vprop in _stream_graph(
             _GRAPH, config, initial_state,
-            chat_messages, activity_log, gallery_images, variant_pool, proposal,
+            chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal,
             working_dir, state.get("is_linear", True),
         ):
-            yield chat_msgs, act_log, gal_imgs, vpool, vprop, state
+            yield chat_msgs, act_log, gal_imgs, pool_gal_imgs, vpool, vprop, state
 
     except Exception as e:
         logger.exception(f"Session error: {e}")
-        chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
+        recovered = await _recover_active_hitl_ui(
+            state.get("config") or {}, state, chat_messages, gallery_images,
+            pool_gallery_images, variant_pool, proposal,
+            message=(
+                f"Streaming stopped before the current turn completed: `{e}`\n\n"
+                "If the graph reached an HITL pause, the review state has "
+                "been restored below."
+            ),
+        )
+        if not recovered:
+            chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
 
 
 async def send_message(
@@ -833,6 +1038,7 @@ async def send_message(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    pool_gallery_images: list[tuple],
     variant_pool: list[dict],
     proposal: list[dict],
     state: dict,
@@ -864,6 +1070,8 @@ async def send_message(
     # Gradio 6 Gallery.preprocess(None) returns None for empty gallery.
     if gallery_images is None:
         gallery_images = []
+    if pool_gallery_images is None:
+        pool_gallery_images = []
     if variant_pool is None:
         variant_pool = []
     if proposal is None:
@@ -877,7 +1085,7 @@ async def send_message(
         # gr.skip() for msg_input so we don't disturb whatever the user
         # has actually typed (spaces, partial draft, etc).
         gr.Warning("Type something before sending.", duration=3)
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state, gr.skip()
         return
 
     config = state.get("config")
@@ -889,7 +1097,7 @@ async def send_message(
             "role": "assistant",
             "content": "No active session. Start a new session or resume one first.",
         })
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state, gr.skip()
         return
 
     # Echo the user's message FIRST and clear the textbox in the SAME yield.
@@ -900,22 +1108,32 @@ async def send_message(
     # erases keystrokes mid-typing as the agent processes the previous
     # turn in the background.)
     chat_messages.append({"role": "user", "content": user_text})
-    yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, ""
+    yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state, ""
 
     try:
-        async for chat_msgs, act_log, gal_imgs, vpool, vprop in _stream_graph(
-            _GRAPH, config, Command(resume=user_text),
-            chat_messages, activity_log, gallery_images, variant_pool, proposal,
+        async for chat_msgs, act_log, gal_imgs, pool_gal_imgs, vpool, vprop in _stream_graph(
+            _GRAPH, config, Command(resume=review_ctl.feedback_resume_event(user_text)),
+            chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal,
             working_dir, is_linear,
         ):
             # gr.skip() means "leave msg_input alone" — the textbox is
             # already empty from the echo yield above; the user may have
             # started typing their next message while we stream.
-            yield chat_msgs, act_log, gal_imgs, vpool, vprop, state, gr.skip()
+            yield chat_msgs, act_log, gal_imgs, pool_gal_imgs, vpool, vprop, state, gr.skip()
     except Exception as e:
         logger.exception(f"Send message error: {e}")
-        chat_messages.append({"role": "assistant", "content": f"Error during streaming: {e}"})
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
+        recovered = await _recover_active_hitl_ui(
+            config, state, chat_messages, gallery_images, pool_gallery_images,
+            variant_pool, proposal,
+            message=(
+                f"Model streaming stopped before the HITL turn completed: `{e}`\n\n"
+                "The active review state was restored from the checkpoint. "
+                "You can approve a presented candidate or send feedback again."
+            ),
+        )
+        if not recovered:
+            chat_messages.append({"role": "assistant", "content": f"Error during streaming: {e}"})
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state, gr.skip()
 
 
 async def approve_variant_action(
@@ -925,20 +1143,23 @@ async def approve_variant_action(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    pool_gallery_images: list[tuple],
     variant_pool: list[dict],
     proposal: list[dict],
     state: dict,
 ):
     """
-    Handle a variant Approve button click — resume the graph with a structured
-    APPROVE_VARIANT sentinel that names the chosen variant and carries the
-    textbox content as the human's rationale.
+    Handle a variant Approve button click — resume the graph with a typed
+    ReviewHumanEvent that names the chosen variant and carries the proposal
+    panel's optional approval note as the human's rationale.
 
-    The backend's hitl_check parses the sentinel, calls promote_variant to
+    The backend's hitl_check applies the event, calls promote_variant to
     move the chosen variant's file to current_image, and clears the pool.
     """
     if gallery_images is None:
         gallery_images = []
+    if pool_gallery_images is None:
+        pool_gallery_images = []
     if variant_pool is None:
         variant_pool = []
     if proposal is None:
@@ -950,7 +1171,7 @@ async def approve_variant_action(
 
     if not config:
         chat_messages.append({"role": "assistant", "content": "No active session."})
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state, gr.skip()
         return
 
     # Echo the human's choice into chat for the audit trail
@@ -964,29 +1185,108 @@ async def approve_variant_action(
             "role": "user",
             "content": f"Approving **{variant_id}** ({variant_label}).",
         })
-    # Clear the textbox HERE (the rationale is now consumed/echoed).
-    # Subsequent yields use gr.skip() to leave whatever the user types
-    # next alone — see the matching note in send_message.
-    yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, ""
-
-    # Clear the variant panel immediately so the user sees feedback that
-    # their approval was registered before the backend finishes streaming.
-    variant_pool = []
-    yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
-
-    sentinel = build_variant_approval(variant_id, rationale.strip())
+    # Clear the approval note HERE (the rationale is now consumed/echoed).
+    # Subsequent yields use gr.skip() to avoid clobbering any new note the
+    # user starts typing while the graph resumes.
+    yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state, ""
 
     try:
-        async for chat_msgs, act_log, gal_imgs, vpool, vprop in _stream_graph(
-            _GRAPH, config, Command(resume=sentinel),
-            chat_messages, activity_log, gallery_images, variant_pool, proposal,
+        async for chat_msgs, act_log, gal_imgs, pool_gal_imgs, vpool, vprop in _stream_graph(
+            _GRAPH,
+            config,
+            Command(resume=review_ctl.approval_resume_event(
+                variant_id, rationale.strip()
+            )),
+            chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal,
             working_dir, is_linear,
         ):
-            yield chat_msgs, act_log, gal_imgs, vpool, vprop, state, gr.skip()
+            yield chat_msgs, act_log, gal_imgs, pool_gal_imgs, vpool, vprop, state, gr.skip()
     except Exception as e:
         logger.exception(f"Variant approve error: {e}")
-        chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
+        recovered = await _recover_active_hitl_ui(
+            config, state, chat_messages, gallery_images, pool_gallery_images,
+            variant_pool, proposal,
+            message=(
+                f"Approval hit an error before the gate closed: `{e}`\n\n"
+                "The active review state was restored from the checkpoint. "
+                "You can approve again or send feedback."
+            ),
+        )
+        if not recovered:
+            chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state, gr.skip()
+
+
+def _proposal_choice_options(proposal: list[dict]) -> list[tuple[str, str]]:
+    """Build stable dropdown choices for presented candidates."""
+    choices: list[tuple[str, str]] = []
+    for entry in proposal or []:
+        if not isinstance(entry, dict):
+            continue
+        variant = entry.get("variant")
+        if not isinstance(variant, dict):
+            continue
+        vid = variant.get("id")
+        if not vid:
+            continue
+        label = variant.get("label", "")
+        display = f"{vid} — {label}" if label else str(vid)
+        choices.append((display, str(vid)))
+    return choices
+
+
+def update_approval_controls(proposal: list[dict], streaming: bool):
+    """
+    Keep approval controls stable outside @gr.render.
+
+    Gradio dynamic render functions can redraw their component tree when state
+    changes. Event handlers attached to components inside that tree may become
+    stale on the client. The approval action is a state transition, so it uses
+    fixed top-level controls that are only updated from proposal_state.
+    """
+    choices = _proposal_choice_options(proposal)
+    enabled = bool(choices) and not bool(streaming)
+    value = choices[0][1] if choices else None
+    return (
+        gr.update(choices=choices, value=value, interactive=enabled),
+        gr.update(value="", interactive=enabled),
+        gr.update(interactive=enabled),
+    )
+
+
+async def approve_selected_variant_action(
+    variant_id: str | None,
+    rationale: str,
+    chat_messages: list[dict],
+    activity_log: list[dict],
+    gallery_images: list[tuple],
+    pool_gallery_images: list[tuple],
+    variant_pool: list[dict],
+    proposal: list[dict],
+    state: dict,
+):
+    """Approve the candidate selected in the stable Proposal controls."""
+    if not variant_id:
+        gr.Warning("Select a presented candidate to approve.", duration=3)
+        yield (
+            chat_messages, activity_log, gallery_images, pool_gallery_images,
+            variant_pool, proposal, state, gr.skip(),
+        )
+        return
+
+    variant_label = ""
+    for entry in proposal or []:
+        variant = entry.get("variant") if isinstance(entry, dict) else None
+        if isinstance(variant, dict) and variant.get("id") == variant_id:
+            variant_label = str(variant.get("label", ""))
+            break
+
+    async for result in approve_variant_action(
+        variant_id, variant_label, rationale,
+        chat_messages, activity_log, gallery_images, pool_gallery_images,
+        variant_pool, proposal, state,
+    ):
+        yield result
 
 
 async def resume_session(
@@ -994,6 +1294,7 @@ async def resume_session(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    pool_gallery_images: list[tuple],
     variant_pool: list[dict],
     proposal: list[dict],
     state: dict,
@@ -1001,6 +1302,8 @@ async def resume_session(
     """Resume a session from an existing checkpoint."""
     if gallery_images is None:
         gallery_images = []
+    if pool_gallery_images is None:
+        pool_gallery_images = []
     if variant_pool is None:
         variant_pool = []
     if proposal is None:
@@ -1009,7 +1312,7 @@ async def resume_session(
         # Don't clear UI state for the validation-error case — preserve
         # whatever was on screen so the user keeps their context.
         chat_messages.append({"role": "assistant", "content": "Please enter a thread ID to resume."})
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
         return
 
     # Clear UI state from any prior session in this Gradio process before
@@ -1022,6 +1325,7 @@ async def resume_session(
     chat_messages.clear()
     activity_log.clear()
     gallery_images.clear()
+    pool_gallery_images.clear()
     variant_pool.clear()
     proposal.clear()
 
@@ -1046,55 +1350,55 @@ async def resume_session(
     }
 
     chat_messages.append({"role": "assistant", "content": f"Resuming session **{resume_id}**..."})
-    yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
+    yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
 
     # Active-HITL-aware resume. Inspect the saved state BEFORE streaming.
-    # If the run was paused at an HITL gate (active_hitl=True), do NOT
+    # If the run was paused at a review_session gate, do NOT
     # send a Command(resume=...) value into the graph — any value would
-    # be treated as the human's response to the pending interrupt, which
-    # silently consumes the gate (an empty string was misread as feedback,
-    # a directive-sounding string was misread as approval). Instead,
-    # re-render the gate UI from saved state so the human can take real
-    # action; the existing send_message and approve_variant_click paths
-    # then carry the actual response into the graph via Command(resume=...).
+    # be treated as the human's response to the pending interrupt and
+    # silently consume the gate. Instead, re-render the gate UI from saved
+    # state so the human can take real action; send_message carries
+    # feedback, while approve_variant_click carries structured approval.
     try:
         snapshot = await _GRAPH.aget_state(config)
         saved_values = snapshot.values if snapshot else {}
-        is_paused_at_hitl = bool(saved_values.get("active_hitl"))
+        is_paused_at_hitl = review_ctl.review_is_open(saved_values.get("review_session"))
+        is_legacy_hitl = bool(saved_values.get("active_hitl")) and not is_paused_at_hitl
     except Exception as e:
         logger.warning(f"resume_session: aget_state failed (non-fatal): {e}")
         saved_values = {}
         is_paused_at_hitl = False
+        is_legacy_hitl = False
+
+    if is_legacy_hitl:
+        chat_messages.append({
+            "role": "assistant",
+            "content": (
+                "**This saved checkpoint predates Review Mode state.** It has "
+                "`active_hitl=True` but no open `review_session`, so the app "
+                "cannot safely reconstruct the approval contract or consume a "
+                "resume value as human approval. Start from a clean cloned "
+                "checkpoint before the gate, or rerun this phase with the "
+                "current Review Mode implementation."
+            ),
+        })
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
+        return
 
     if is_paused_at_hitl:
         # Re-render the gate UI from saved state instead of streaming.
         saved_pool = list(saved_values.get("variant_pool", []) or [])
-        # Reconstruct the proposal panel from presented_for_review entries.
-        # Each entry references a variant by id; resolve back to the full
-        # Variant dict from the saved pool. Same shape the live HITL
-        # payload uses — proposal_state expects [{variant, rationale,
-        # presented_at}].
-        saved_presented = list(saved_values.get("presented_for_review", []) or [])
-        pool_by_id = {v.get("id"): v for v in saved_pool if v.get("id")}
-        saved_proposal = []
-        for entry in saved_presented:
-            vid = entry.get("variant_id") if isinstance(entry, dict) else None
-            if not vid:
-                continue
-            variant = pool_by_id.get(vid)
-            if variant is None:
-                continue
-            saved_proposal.append({
-                "variant": variant,
-                "rationale": entry.get("rationale", ""),
-                "presented_at": entry.get("presented_at", ""),
-            })
+        saved_proposal = _proposal_from_review_session(
+            saved_values.get("review_session"), saved_pool
+        )
         proposal.clear()
         proposal.extend(saved_proposal)
         if saved_pool:
             variant_pool.clear()
             variant_pool.extend(saved_pool)
-            # Materialize previews so the gallery shows the variants
+            # Materialize previews for the bottom workbench filmstrip and,
+            # separately, the main review gallery if the agent had already
+            # presented candidates.
             try:
                 wd = state.get("working_dir") or (
                     saved_values.get("dataset", {}).get("working_dir", "")
@@ -1108,19 +1412,15 @@ async def resume_session(
                     is_linear_resumed = bool(
                         (saved_values.get("metrics", {}) or {}).get("is_linear_estimate", True)
                     )
-                    paths_for_preview = [
-                        v["file_path"] for v in saved_pool if v.get("file_path")
-                    ]
-                    if paths_for_preview:
-                        preview_paths = _convert_fits_to_preview(
-                            paths_for_preview, wd, is_linear_resumed
-                        )
-                        gallery_images.clear()
-                        for v, p in zip(saved_pool, preview_paths):
-                            if Path(p).exists():
-                                gallery_images.append(
-                                    (p, f"{v['id']} — {v.get('label', '')}")
-                                )
+                    pool_gallery_images.clear()
+                    pool_gallery_images.extend(
+                        _variant_gallery_items(saved_pool, wd, is_linear_resumed)
+                    )
+                    review_variants = _proposal_variants(saved_proposal)
+                    gallery_images.clear()
+                    gallery_images.extend(
+                        _variant_gallery_items(review_variants, wd, is_linear_resumed)
+                    )
                     state["working_dir"] = wd
             except Exception as e:
                 logger.warning(
@@ -1130,29 +1430,30 @@ async def resume_session(
         chat_messages.append({
             "role": "assistant",
             "content": (
-                "**Session paused at an HITL gate.** Review the variants in "
-                "the panel and approve one (or send feedback to iterate). "
+                "**Session paused at an HITL gate.** Review the presented "
+                "candidate(s), or use the pool filmstrip for context/debugging. "
+                "Approve a presented candidate or send feedback to iterate. "
                 "Pasting the resume thread does not auto-advance — your "
                 "response is what closes the gate."
             ),
         })
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
         return
 
     # Not paused at a gate — safe to stream a continuation. Empty resume
     # value is inert: it doesn't get treated as approval or feedback by
     # any hitl_check path because no interrupt is currently waiting.
     try:
-        async for chat_msgs, act_log, gal_imgs, vpool, vprop in _stream_graph(
+        async for chat_msgs, act_log, gal_imgs, pool_gal_imgs, vpool, vprop in _stream_graph(
             _GRAPH, config, Command(resume=""),
-            chat_messages, activity_log, gallery_images, variant_pool, proposal,
+            chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal,
             state.get("working_dir", ""), state.get("is_linear", True),
         ):
-            yield chat_msgs, act_log, gal_imgs, vpool, vprop, state
+            yield chat_msgs, act_log, gal_imgs, pool_gal_imgs, vpool, vprop, state
     except Exception as e:
         logger.exception(f"Resume error: {e}")
         chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
 
 
 async def _check_resume_diffs(
@@ -1160,6 +1461,7 @@ async def _check_resume_diffs(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    pool_gallery_images: list[tuple],
     variant_pool: list[dict],
     proposal: list[dict],
     state: dict,
@@ -1168,10 +1470,12 @@ async def _check_resume_diffs(
     Check for settings diffs before resuming. If diffs found, show warning
     and make Confirm Resume button visible. If no diffs, proceed with resume.
 
-    Yields: (chat, activity, gallery, variant_pool, state, confirm_btn_update)
+    Yields: (chat, activity, review_gallery, pool_gallery, variant_pool, proposal, state, confirm_btn_update)
     """
     if gallery_images is None:
         gallery_images = []
+    if pool_gallery_images is None:
+        pool_gallery_images = []
     if variant_pool is None:
         variant_pool = []
     if proposal is None:
@@ -1181,7 +1485,7 @@ async def _check_resume_diffs(
 
     if not resume_id.strip():
         chat_messages.append({"role": "assistant", "content": "Please enter a thread ID to resume."})
-        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, confirm_hidden
+        yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state, confirm_hidden
         return
 
     # Look up the original session's settings
@@ -1206,11 +1510,14 @@ async def _check_resume_diffs(
                     f"or update the tabs and click **Resume** to re-check."
                 ),
             })
-            yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, confirm_visible
+            yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state, confirm_visible
             return
 
     # No diffs (or no snapshot found) — proceed directly
-    async for result in resume_session(resume_id, chat_messages, activity_log, gallery_images, variant_pool, state):
+    async for result in resume_session(
+        resume_id, chat_messages, activity_log, gallery_images,
+        pool_gallery_images, variant_pool, proposal, state,
+    ):
         yield *result, confirm_hidden
 
 
@@ -1494,15 +1801,12 @@ def build_app() -> gr.Blocks:
                     #    submit button matches gr.ChatInterface and the
                     #    Cursor / Claude-coding-agent style: Enter for newline,
                     #    button (or Shift+Enter) to send.
-                    #  * elem_id used by the variant-panel rationale binding
-                    #    so the same textbox content travels with the Approve
-                    #    click (see render_variant_panel below).
                     with gr.Row():
                         msg_input = gr.Textbox(
                             placeholder=(
-                                "Reply to the agent, or type a rationale to "
-                                "record alongside an Approve click. "
-                                "Shift+Enter or click Send."
+                                "Ask a question or request another iteration. "
+                                "Approval happens in the Proposal panel."
+                                " Shift+Enter or click Send."
                             ),
                             lines=2,
                             max_lines=20,
@@ -1515,7 +1819,7 @@ def build_app() -> gr.Blocks:
 
                 with gr.Column(scale=1):
                     gallery = gr.Gallery(
-                        label="Image Review",
+                        label="HITL Review / Presented Candidates",
                         columns=2,
                         height=400,
                         allow_preview=True,
@@ -1530,25 +1834,39 @@ def build_app() -> gr.Blocks:
                         buttons=[],
                     )
 
-            # ── Pool panel (read-only history) ────────────────────────────
-            # Every variant the agent has produced this segment, listed with
-            # its label and key metrics. NO Approve buttons here — this is
-            # status, not a control surface. The user can refer to variant
-            # ids in chat ("approve T14_v2 please") which the agent then
-            # actions via present_for_review.
-            #
-            # The panel populates passively as the agent runs HITL-mapped
-            # tools; nothing the agent does affects this panel directly.
-            with gr.Group():
+            with gr.Accordion("Agent Workbench / Pool", open=False):
+                pool_gallery = gr.Gallery(
+                    label="Pool Filmstrip",
+                    columns=8,
+                    height=170,
+                    allow_preview=True,
+                    buttons=["download"],
+                    object_fit="contain",
+                    interactive=False,
+                )
+                gr.Markdown(
+                    "*Live workbench history for transparency/debugging. "
+                    "Images here are not approvable until the agent presents them for review.*"
+                )
+
+                # ── Pool details (read-only history) ──────────────────────────
+                # Every variant the agent has produced this segment, listed with
+                # its label and key metrics. NO Approve buttons here — this is
+                # status, not a control surface. The user can refer to variant
+                # ids in chat when asking questions or requesting iterations, but
+                # approval is only available from the Proposal panel.
+                #
+                # The panel populates passively as the agent runs HITL-mapped
+                # tools; nothing the agent does affects this panel directly.
                 @gr.render(inputs=variant_pool_state)
                 def render_pool_panel(variants):
                     if not variants:
                         gr.Markdown(
-                            "### Pool\n*No variants yet this segment. "
+                            "*No variants yet this segment. "
                             "The pool fills automatically as the agent iterates.*"
                         )
                         return
-                    gr.Markdown(f"### Pool ({len(variants)} variant{'s' if len(variants) != 1 else ''})")
+                    gr.Markdown(f"*{len(variants)} variant{'s' if len(variants) != 1 else ''} in the current workbench.*")
                     for v in variants:
                         vid = v.get("id", "?")
                         label = v.get("label", "")
@@ -1570,9 +1888,7 @@ def build_app() -> gr.Blocks:
 
             # ── Proposal panel (the agent's curation, with Approve buttons) ──
             # Driven by `proposal_state`, which the streaming layer
-            # populates from the HITLPayload's `proposal` field. The
-            # backend builds that from `state.presented_for_review`, which
-            # the agent populates only via the `present_for_review` tool.
+            # populates from the ReviewSession proposal artifact.
             #
             # Empty until the agent calls present_for_review. The
             # empty-state message is the explicit signal that the agent
@@ -1585,9 +1901,9 @@ def build_app() -> gr.Blocks:
             # shows the rationale it was presented with, so the agent's
             # iterative reasoning is visible alongside each candidate.
             #
-            # Approve button click chains to lock streaming, run
-            # approve_variant_action, then unlock — same pattern as
-            # msg_input.submit.
+            # Approval controls live outside this dynamic render block.
+            # The render block is display-only; the fixed controls below
+            # avoid stale Gradio fn_index handlers when proposal_state redraws.
             with gr.Group():
                 @gr.render(inputs=[proposal_state, is_streaming_state])
                 def render_proposal_panel(proposal, streaming):
@@ -1600,18 +1916,43 @@ def build_app() -> gr.Blocks:
                     if not proposal:
                         gr.Markdown(
                             "### Proposal\n*Agent hasn't surfaced anything for "
-                            "review at this gate yet. The pool above shows what "
-                            "it's been working on; chat with the agent to ask "
-                            "it to present a candidate.*"
+                            "review at this gate yet. The workbench filmstrip "
+                            "shows what it's been working on; chat with the "
+                            "agent to ask it to present candidates.*"
                         )
                         return
                     gr.Markdown(
                         f"### Proposal ({len(proposal)} for review)\n"
-                        f"*The agent is asking for your input on these.*"
+                        f"*Send questions or revision requests in chat. To "
+                        f"approve, use the stable approval controls below.*"
                     )
+                    artifact_entry = proposal[0] if proposal else {}
+                    proposal_rationale = (
+                        artifact_entry.get("proposal_rationale", "") or ""
+                    ).strip()
+                    recommendation = artifact_entry.get("recommendation")
+                    tradeoffs = artifact_entry.get("tradeoffs", []) or []
+                    metric_highlights = artifact_entry.get("metric_highlights", {}) or {}
+                    summary_lines = []
+                    if recommendation:
+                        summary_lines.append(f"**Recommended:** `{recommendation}`")
+                    if proposal_rationale:
+                        summary_lines.append(f"> {proposal_rationale}")
+                    if tradeoffs:
+                        summary_lines.append("**Tradeoffs**")
+                        summary_lines.extend(f"- {t}" for t in tradeoffs)
+                    if metric_highlights:
+                        bits = [f"{k}={v}" for k, v in metric_highlights.items()]
+                        if bits:
+                            summary_lines.append(
+                                f"**Proposal metrics:** {' · '.join(bits)}"
+                            )
+                    if summary_lines:
+                        gr.Markdown("\n".join(summary_lines))
                     for entry in proposal:
                         v = entry.get("variant", {}) or {}
                         rationale = entry.get("rationale", "") or ""
+                        recommendation = entry.get("recommendation")
                         vid = v.get("id", "?")
                         label = v.get("label", "")
                         metrics = v.get("metrics", {}) or {}
@@ -1631,55 +1972,34 @@ def build_app() -> gr.Blocks:
                                 desc += f"  \n*{metric_str}*"
                             if rationale:
                                 desc += f"  \n> {rationale}"
+                            if recommendation == vid:
+                                desc += "  \n`Recommended`"
                             gr.Markdown(desc)
-                            btn = gr.Button(
-                                f"Approve {vid}",
-                                variant="primary",
-                                size="sm",
-                                scale=0,
-                            )
-                            # Closure pattern (same rationale as before):
-                            # capture vid + label so each button knows
-                            # which variant it commits. Inputs include
-                            # the ratio nale textbox (msg_input) so the
-                            # human's optional typed comment travels
-                            # along as the approval rationale.
-                            async def _approve(
-                                rationale_text, chat, act, gal, pool, prop, sess,
-                                _vid=vid, _label=label,
-                            ):
-                                async for result in approve_variant_action(
-                                    _vid, _label, rationale_text,
-                                    chat, act, gal, pool, prop, sess,
-                                ):
-                                    yield result
-                            btn.click(
-                                fn=lambda: True, inputs=None,
-                                outputs=[is_streaming_state],
-                            ).then(
-                                fn=_approve,
-                                inputs=[
-                                    msg_input,
-                                    chatbot,
-                                    activity,
-                                    gallery,
-                                    variant_pool_state,
-                                    proposal_state,
-                                    session_state,
-                                ],
-                                outputs=[
-                                    chatbot,
-                                    activity,
-                                    gallery,
-                                    variant_pool_state,
-                                    proposal_state,
-                                    session_state,
-                                    msg_input,
-                                ],
-                            ).then(
-                                fn=lambda: False, inputs=None,
-                                outputs=[is_streaming_state],
-                            )
+
+            with gr.Group():
+                gr.Markdown("### Approval")
+                approval_candidate = gr.Dropdown(
+                    label="Presented candidate",
+                    choices=[],
+                    value=None,
+                    interactive=False,
+                )
+                approval_note = gr.Textbox(
+                    label="Approval note (optional)",
+                    placeholder=(
+                        "Why this candidate is approved, e.g. best gradient "
+                        "balance without clipping. This is recorded with the "
+                        "approval action, not sent as chat feedback."
+                    ),
+                    lines=2,
+                    max_lines=8,
+                    interactive=False,
+                )
+                approve_candidate_btn = gr.Button(
+                    "Approve selected candidate",
+                    variant="primary",
+                    interactive=False,
+                )
 
         # ── Session Notes tab ────────────────────────────────────────
         with gr.Tab("Session Notes"):
@@ -1908,6 +2228,16 @@ def build_app() -> gr.Blocks:
             inputs=[is_streaming_state],
             outputs=[working_banner, msg_input],
         )
+        proposal_state.change(
+            fn=update_approval_controls,
+            inputs=[proposal_state, is_streaming_state],
+            outputs=[approval_candidate, approval_note, approve_candidate_btn],
+        )
+        is_streaming_state.change(
+            fn=update_approval_controls,
+            inputs=[proposal_state, is_streaming_state],
+            outputs=[approval_candidate, approval_note, approve_candidate_btn],
+        )
 
         # Helpers to flip the streaming flag at the start and end of each
         # streaming binding via .then() chains. The async generators
@@ -1937,7 +2267,7 @@ def build_app() -> gr.Blocks:
                 pixel_size, sensor_type, focal_length,
                 session_state,
             ],
-            outputs=[chatbot, activity, gallery, variant_pool_state, proposal_state, session_state],
+            outputs=[chatbot, activity, gallery, pool_gallery, variant_pool_state, proposal_state, session_state],
         ).then(
             fn=_stream_end, inputs=None, outputs=[is_streaming_state],
         )
@@ -1947,14 +2277,43 @@ def build_app() -> gr.Blocks:
             fn=_stream_start, inputs=None, outputs=[is_streaming_state],
         ).then(
             fn=send_message,
-            inputs=[msg_input, chatbot, activity, gallery, variant_pool_state, proposal_state, session_state],
-            outputs=[chatbot, activity, gallery, variant_pool_state, proposal_state, session_state, msg_input],
+            inputs=[msg_input, chatbot, activity, gallery, pool_gallery, variant_pool_state, proposal_state, session_state],
+            outputs=[chatbot, activity, gallery, pool_gallery, variant_pool_state, proposal_state, session_state, msg_input],
         ).then(
             fn=_stream_end, inputs=None, outputs=[is_streaming_state],
         )
 
         # Bare Approve button is removed — approval is variant-specific via the
-        # variant panel above. The textbox carries the rationale.
+        # stable Proposal approval controls above. The proposal-local approval
+        # note carries the rationale; chat remains feedback/questions only.
+        approve_candidate_btn.click(
+            fn=_stream_start, inputs=None, outputs=[is_streaming_state],
+        ).then(
+            fn=approve_selected_variant_action,
+            inputs=[
+                approval_candidate,
+                approval_note,
+                chatbot,
+                activity,
+                gallery,
+                pool_gallery,
+                variant_pool_state,
+                proposal_state,
+                session_state,
+            ],
+            outputs=[
+                chatbot,
+                activity,
+                gallery,
+                pool_gallery,
+                variant_pool_state,
+                proposal_state,
+                session_state,
+                approval_note,
+            ],
+        ).then(
+            fn=_stream_end, inputs=None, outputs=[is_streaming_state],
+        )
 
         # Resume: apply settings, check diffs, warn if changed
         _apply_inputs = [
@@ -1973,8 +2332,8 @@ def build_app() -> gr.Blocks:
             inputs=_apply_inputs,
         ).then(
             fn=_check_resume_diffs,
-            inputs=[resume_id, chatbot, activity, gallery, variant_pool_state, proposal_state, session_state],
-            outputs=[chatbot, activity, gallery, variant_pool_state, proposal_state, session_state, confirm_resume_btn],
+            inputs=[resume_id, chatbot, activity, gallery, pool_gallery, variant_pool_state, proposal_state, session_state],
+            outputs=[chatbot, activity, gallery, pool_gallery, variant_pool_state, proposal_state, session_state, confirm_resume_btn],
         )
 
         # Confirm Resume: lock controls → stream → unlock.
@@ -1985,8 +2344,8 @@ def build_app() -> gr.Blocks:
             fn=_stream_start, inputs=None, outputs=[is_streaming_state],
         ).then(
             fn=resume_session,
-            inputs=[resume_id, chatbot, activity, gallery, variant_pool_state, proposal_state, session_state],
-            outputs=[chatbot, activity, gallery, variant_pool_state, proposal_state, session_state],
+            inputs=[resume_id, chatbot, activity, gallery, pool_gallery, variant_pool_state, proposal_state, session_state],
+            outputs=[chatbot, activity, gallery, pool_gallery, variant_pool_state, proposal_state, session_state],
         ).then(
             fn=_stream_end, inputs=None, outputs=[is_streaming_state],
         )

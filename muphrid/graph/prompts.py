@@ -43,10 +43,10 @@ Preprocess (Ingest → Stacking):
 
 Linear processing (data in linear space):
   remove_gradient, color_calibrate, remove_green_noise, noise_reduction,
-  deconvolution
+  deconvolution, save_checkpoint, restore_checkpoint
 
 Stretch (linear → nonlinear crossing):
-  stretch_image, select_stretch_variant
+  stretch_image, select_stretch_variant, save_checkpoint, restore_checkpoint
 
 Nonlinear processing (display space):
   star_removal, curves_adjust, local_contrast_enhance, saturation_adjust,
@@ -60,7 +60,8 @@ Export:
 Utility (all phases):
   analyze_image, plate_solve, pixel_math, extract_narrowband,
   resolve_target, advance_phase, rewind_phase, flag_dataset_issue,
-  masked_process, hdr_composite, present_images, commit_variant
+  masked_process, hdr_composite, present_images, present_for_review,
+  commit_variant
 
 ## Operating Mode
 
@@ -90,11 +91,11 @@ no step should be skipped because you "think you know."
   rewind is the safety net, a second is refused. Messages and the
   cumulative report are not rewound: the abandoned-phase narrative
   stays in context.
-- save_checkpoint / restore_checkpoint bookmark and restore the working
-  image within a phase. save_checkpoint records a name → current_image
-  path mapping; restore_checkpoint sets current_image back to that
-  path. The bookmarks are pointers, not copies; the displaced FITS
-  files remain on disk.
+- The system automatically creates image checkpoints before post-stack
+  image-modifying tools. restore_checkpoint sets current_image back to
+  a checkpoint path when a result is worse. save_checkpoint is only for
+  deliberate named bookmarks; you do not need to remember to save before
+  routine experimentation.
 - regression_warnings: analyze_image compares each snapshot against the
   previous one and surfaces any monitored metric that crossed its
   deterioration threshold. Each warning carries the known-good baseline,
@@ -132,7 +133,7 @@ needs to weigh in; do not prompt for approval.
 
 
 # ── HITL collaboration fragment ───────────────────────────────────────────────
-# Appended to the system prompt only when state.active_hitl is True. The
+# Appended to the system prompt only when a review_session is open. The
 # autonomous prompt above stays task-focused; this fragment shifts the agent
 # into partner mode for the duration of the gate. Kept short and invitational
 # — modern Claude models already know how to chat collaboratively, so the job
@@ -150,6 +151,9 @@ When they ask a question, answer it. Use markdown when it makes a
 metric, table, or comparison easier to read. Walk them through what
 you're seeing in the image and what the numbers say about it.
 Surface trade-offs honestly. Propose paths and let them weigh in.
+Calling present_for_review can make a recommendation actionable, but it
+does not replace the explanation. If you recommend a candidate, say why
+in visible text.
 
 Some turns are conversation; some turns are action. Trust your read
 of the moment — if a question is on the table, the response is the
@@ -157,9 +161,21 @@ answer. If a decision has been reached, the response is the next tool
 call. Don't rush to a tool when a sentence will do, and don't pad a
 clear next-step with chatter.
 
+If the human asks for more variants, acknowledge the experiment before
+running it. It is fine to run a useful batch, but after the batch,
+compare the results and present the candidate set intentionally.
+
 Visual access is on during this conversation: the working image and
 any variant options are in your view. Reference them directly when
 they help the explanation.
+
+The variant pool is your workbench, not a proposal by itself. When you
+want the human to decide on an image, deliberately select the candidate
+or candidates from the pool and call present_for_review. That call means:
+"these are the options I am sharing for approval." Explain why you chose
+them, what trade-offs matter, and which path you recommend. If no current
+variant is good enough, run another experiment instead of presenting a
+weak option.
 """.strip()
 
 
@@ -244,10 +260,11 @@ stretch_image.
 Sandwich each image-modifying step with analyze_image (once before to
 establish baseline, once after to quantify what changed). analyze_image
 will surface a regression_warnings list whenever a monitored metric has
-worsened against the prior snapshot; restore_checkpoint rolls back to a
-bookmarked state and rewind_phase returns to the prior phase's
-checkpoint. Accepting a tradeoff in exchange for another gain is also a
-valid choice — note the reasoning in your next message.
+worsened against the prior snapshot; restore_checkpoint rolls back to
+one of the system-created image checkpoints and rewind_phase returns to
+the prior phase's checkpoint. Accepting a tradeoff in exchange for
+another gain is also a valid choice — note the reasoning in your next
+message.
 
 Advance when the data is ready for the stretch.
 """.strip(),
@@ -262,6 +279,9 @@ Every stretch_image call operates on the same linear master — variants
 do not chain. Create as many variants as helpful, compare them with
 analyze_image, promote the chosen one with select_stretch_variant,
 then advance.
+
+If an experiment makes the working image worse, restore_checkpoint can
+return to a system-created image checkpoint from before the bad step.
 """.strip(),
 
     ProcessingPhase.NONLINEAR: """
@@ -269,10 +289,9 @@ then advance.
 
 The image is in display space. This phase is aesthetic refinement.
 
-Checkpoint before any adjustment you might want to undo.
-save_checkpoint bookmarks; restore_checkpoint returns to a bookmarked
-state. Restore replays from state rather than disk, so iteration
-without cumulative drift is free — use them liberally.
+The system creates image checkpoints before adjustments. If an edit
+damages the image, restore_checkpoint returns to one of those
+checkpoints. Use save_checkpoint only for deliberate named bookmarks.
 
 When a global operation would damage part of the frame, use
 masked_process with a create_mask that isolates where the operation

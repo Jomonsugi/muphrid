@@ -283,7 +283,6 @@ def rewind_phase(
     restored_warnings = copy.deepcopy(snapshot.get("regression_warnings") or [])
     restored_variants = copy.deepcopy(snapshot.get("variant_pool") or [])
     restored_visuals = copy.deepcopy(snapshot.get("visual_context") or [])
-    restored_presented = copy.deepcopy(snapshot.get("presented_for_review") or [])
 
     # Note on metadata reducer: AstroState declares metadata as
     # Annotated[Metadata, _merge_dicts]. The reducer deep-merges new into
@@ -342,7 +341,9 @@ def rewind_phase(
         except Exception as e:
             logger.warning(f"Audit report versioning failed (non-fatal): {e}")
 
-    was_in_hitl = bool(state.get("active_hitl"))
+    from muphrid.graph import review as review_ctl
+
+    was_in_hitl = bool(review_ctl.active_review_session(state))
     result: dict = {
         "previous_phase": current.value,
         "target_phase": target.value,
@@ -381,12 +382,13 @@ def rewind_phase(
         "regression_warnings": restored_warnings,
         "variant_pool": restored_variants,
         "visual_context": restored_visuals,
-        # presented_for_review uses _list_extend_or_replace; wrap in
-        # Replace to fully reset to the snapshot rather than appending.
-        "presented_for_review": Replace(restored_presented),
         # Any in-flight HITL gate is dissolved by the phase change. Clear
         # the flag so the agent's next text response routes normally.
         "active_hitl": False,
+        "review_session": review_ctl.close_review_session(
+            state.get("review_session"),
+            reason="phase_rewound",
+        ),
         "messages": [ToolMessage(
             content=json.dumps(result, indent=2, default=str),
             tool_call_id=tool_call_id,

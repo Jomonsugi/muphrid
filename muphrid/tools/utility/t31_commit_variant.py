@@ -41,6 +41,7 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from muphrid.graph import review as review_ctl
 from muphrid.graph.state import AstroState
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,38 @@ def commit_variant(
 
     state = state or {}
     pool = list(state.get("variant_pool", []) or [])
+
+    if review_ctl.active_review_session(state):
+        _hitl_key, active_gate_tool = review_ctl.active_review_tool(state)
+
+        if active_gate_tool is not None and review_ctl.active_review_blocks_autonomy(state):
+            presented_ids = sorted(
+                review_ctl.proposal_candidate_ids(state.get("review_session"))
+            )
+            blocked_payload = {
+                "status": "blocked",
+                "reason": "review_session_requires_human_approval",
+                "message": (
+                    "A HITL review gate is open, so commit_variant is disabled. "
+                    "Only the human can commit a presented candidate during this "
+                    "gate. If the current proposal is not good enough, discuss "
+                    "the tradeoffs or generate another variant and call "
+                    "present_for_review again."
+                ),
+                "active_gate_tool": active_gate_tool,
+                "requested_variant_id": variant_id,
+                "presented_variant_ids": presented_ids,
+            }
+            logger.warning(
+                f"commit_variant blocked during active HITL gate "
+                f"{active_gate_tool!r} for variant {variant_id!r}"
+            )
+            return Command(update={
+                "messages": [ToolMessage(
+                    content=json.dumps(blocked_payload),
+                    tool_call_id=tool_call_id,
+                )],
+            })
 
     result = build_variant_promotion_update(state, variant_id)
     if result is None:

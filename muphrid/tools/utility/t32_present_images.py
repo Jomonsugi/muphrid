@@ -156,7 +156,9 @@ def present_images(
     # still happens — when an HITL gate opens later, those references can
     # become visible via the gate's visibility rules.
     state = state or {}
-    in_hitl = bool(state.get("active_hitl"))
+    from muphrid.graph import review as review_ctl
+
+    in_hitl = bool(review_ctl.active_review_session(state))
     visual_will_render = in_hitl or vlm_autonomous()
 
     # Build the result the presenter layer reads from the ToolMessage stream
