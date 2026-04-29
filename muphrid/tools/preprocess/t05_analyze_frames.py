@@ -37,8 +37,31 @@ from langchain_core.tools import tool
 from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
+from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
+
+
+class AnalyzeFramesInput(BaseModel):
+    """analyze_frames takes no LLM-facing arguments — all real inputs come
+    from state. The optional ``note`` field exists *only* to keep this
+    schema non-empty, which avoids a short-circuit in langchain-core's
+    `BaseTool._to_args_and_kwargs` (base.py: ``if ... and not
+    get_fields(self.args_schema): return (), {}``). When the schema has
+    zero fields, that path discards the state and tool_call_id that
+    LangGraph just injected via `_inject_tool_args`, and the function is
+    invoked with literally no args — producing the cryptic
+    ``analyze_frames() missing 2 required positional arguments`` error.
+    A single optional field keeps us off that branch. The field is
+    ignored by the tool body."""
+
+    note: str | None = Field(
+        default=None,
+        description=(
+            "Optional. Ignored by the tool. May be left empty or omitted. "
+            "All real inputs come from graph state."
+        ),
+    )
 
 
 # ── .seq parser ────────────────────────────────────────────────────────────────
@@ -299,10 +322,11 @@ def _compute_summary(frame_metrics: dict[str, dict], seq_data: dict) -> dict:
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool
+@tool(args_schema=AnalyzeFramesInput)
 def analyze_frames(
-    tool_call_id: Annotated[str, InjectedToolCallId],
-    state: Annotated[AstroState, InjectedState],
+    note: str | None = None,  # noqa: ARG001 — schema-only, see AnalyzeFramesInput
+    tool_call_id: Annotated[str, InjectedToolCallId] = "",
+    state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
     """
     Extract per-frame registration data from a Siril .seq file.
@@ -383,7 +407,10 @@ def analyze_frames(
         }
 
     import json
+    # Delta-only emit. The metrics reducer (_dict_merge_or_replace) composes
+    # this with whatever's already in state.metrics, so we never spread the
+    # existing dict and never risk clobbering a parallel sibling tool's key.
     return Command(update={
-        "metrics": {**state["metrics"], "frame_stats": frame_metrics, "frame_summary": summary},
+        "metrics": {"frame_stats": frame_metrics, "frame_summary": summary},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2), tool_call_id=tool_call_id)],
     })

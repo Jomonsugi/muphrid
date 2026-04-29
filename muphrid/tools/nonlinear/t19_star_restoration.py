@@ -192,6 +192,6 @@ def star_restoration(
         summary["source_image"] = str(synthstar_options.source_image_path)  # type: ignore[union-attr]
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(output_path)},
+        "paths": {"current_image": str(output_path)},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

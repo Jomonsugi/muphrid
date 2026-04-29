@@ -506,6 +506,6 @@ def deconvolution(
         }
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(output_path), "pre_decon_image": str(original_image_path)},
+        "paths": {"current_image": str(output_path), "pre_decon_image": str(original_image_path)},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

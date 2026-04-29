@@ -19,13 +19,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
+from pydantic import BaseModel, Field
 
-from muphrid.graph.state import AstroState, PhaseSnapshot, ProcessingPhase, RegressionWarning
+from muphrid.graph.state import AstroState, PhaseSnapshot, ProcessingPhase, RegressionWarning, Replace
+
+
+# ── Pydantic input schema ──────────────────────────────────────────────────────
+# An explicit args_schema is required so langchain doesn't auto-generate one
+# that pulls state: Annotated[AstroState, InjectedState] into the LLM-facing
+# fields. Without it, recent langchain-core / Pydantic versions include
+# AstroState in the schema; the LLM doesn't pass state, validation fails,
+# and the agent sees "33 missing fields" instead of being able to call
+# advance_phase. This pattern repeats across every @tool that takes state.
+
+class AdvancePhaseInput(BaseModel):
+    reason: str = Field(
+        description=(
+            "Brief explanation of why this phase is complete and the data "
+            "is ready for the next stage. Captured into processing_log.md "
+            "and the per-phase audit report."
+        ),
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +65,13 @@ _PHASE_ORDER = [
 _NEXT_PHASE = {
     _PHASE_ORDER[i]: _PHASE_ORDER[i + 1]
     for i in range(len(_PHASE_ORDER) - 1)
+}
+
+# Stable per-phase number used in audit-report filenames so a directory
+# listing sorts the reports in pipeline order. INGEST = 01.
+PHASE_NUMBER: dict[str, str] = {
+    p.value: f"{i + 1:02d}" for i, p in enumerate(_PHASE_ORDER)
+    if p != ProcessingPhase.COMPLETE
 }
 
 
@@ -399,6 +425,7 @@ def _build_phase_snapshot(state: AstroState, captured_from_phase: str) -> PhaseS
     })
     regression_snap = copy.deepcopy(state.get("regression_warnings") or [])
     variants_snap = copy.deepcopy(state.get("variant_pool") or [])
+    presented_snap = copy.deepcopy(state.get("presented_for_review") or [])
     visual_snap = copy.deepcopy(state.get("visual_context") or [])
 
     return PhaseSnapshot(
@@ -408,6 +435,7 @@ def _build_phase_snapshot(state: AstroState, captured_from_phase: str) -> PhaseS
         regression_warnings=regression_snap,
         variant_pool=variants_snap,
         visual_context=visual_snap,
+        presented_for_review=presented_snap,
         captured_at=datetime.now(timezone.utc).isoformat(),
         captured_from_phase=captured_from_phase,
     )
@@ -561,9 +589,529 @@ def _write_phase_report(
         f.write("\n".join(lines) + "\n")
 
 
+# ── Audit-focused per-phase report writer ──────────────────────────────────────
+#
+# The processing_log.md helper above is a chronological journal — what
+# happened in time order across the whole run. Auditors looking for "what
+# went wrong in the linear phase" want a different view: one self-contained
+# Markdown file per phase, retrievable by phase name. These files live at
+# <working_dir>/reports/NN_<phase>.md and capture the same evidence the
+# processing_log gets, plus richer detail (HITL conversations verbatim,
+# metrics deltas, per-tool result fields). They are written at advance_phase
+# time alongside the chronological journal entry — both views, both useful.
+
+
+def audit_report_path(working_dir: str, phase_value: str) -> Path:
+    """
+    Return the canonical audit-report path for a given phase. Reports live
+    under <working_dir>/reports/ and are named with the phase's stable
+    pipeline number so a directory listing sorts them in run order.
+    Unknown phases fall back to a 99_<phase>.md slot rather than raising —
+    the report writer should never block an otherwise-successful advance.
+    """
+    num = PHASE_NUMBER.get(phase_value, "99")
+    return Path(working_dir) / "reports" / f"{num}_{phase_value}.md"
+
+
+def _next_audit_version_path(base_path: Path) -> Path:
+    """
+    Find the next available .v<N>.md filename for `base_path`. If
+    NN_phase.v1.md exists, returns NN_phase.v2.md, etc.
+    """
+    if not base_path.exists():
+        return base_path
+    stem = base_path.stem  # e.g. "06_linear"
+    parent = base_path.parent
+    n = 1
+    while True:
+        candidate = parent / f"{stem}.v{n}.md"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def version_existing_audit_reports(working_dir: str, from_phase_value: str) -> list[str]:
+    """
+    Rename existing audit reports for `from_phase_value` onward in pipeline
+    order to their next .vN. Used by rewind_phase: when the agent rewinds
+    to phase X, every report from X forward represents an abandoned attempt
+    that should be preserved separately so the new attempt can write a
+    fresh NN_<phase>.md.
+
+    Returns the list of phase values whose reports were versioned.
+    """
+    reports_dir = Path(working_dir) / "reports"
+    if not reports_dir.exists():
+        return []
+
+    # Pipeline order, starting from from_phase_value forward (inclusive)
+    try:
+        start_idx = next(
+            i for i, p in enumerate(_PHASE_ORDER) if p.value == from_phase_value
+        )
+    except StopIteration:
+        return []
+
+    versioned: list[str] = []
+    for p in _PHASE_ORDER[start_idx:]:
+        if p == ProcessingPhase.COMPLETE:
+            break
+        report = audit_report_path(working_dir, p.value)
+        if report.exists():
+            target = _next_audit_version_path(report)
+            try:
+                report.rename(target)
+                versioned.append(p.value)
+            except OSError as e:
+                logger.warning(
+                    f"audit report version-rename failed for {report.name}: {e}"
+                )
+    return versioned
+
+
+def _scan_hitl_conversations(messages: list, phase_start: int) -> list[dict]:
+    """
+    Walk the message stream from `phase_start` to the end, collecting any
+    HITL conversation turns. A HITL conversation is identified by the
+    presence of HumanMessage entries that aren't the initial human prompt.
+    Each entry returned describes one approval / interaction:
+
+        {
+          "tool_name": str | None,    # the HITL-mapped tool that triggered (best-effort)
+          "approval_kind": str,       # "variant" | "bare" | "feedback"
+          "variant_id": str | None,
+          "rationale": str | None,
+          "human_messages": [str, ...],
+          "agent_messages_during_gate": [str, ...],
+        }
+
+    Reads the message list as-is. The first item in messages is typically
+    the initial HumanMessage (dataset prompt) which is excluded.
+    """
+    conversations: list[dict] = []
+    in_gate = False
+    current: dict | None = None
+
+    for i in range(phase_start, len(messages)):
+        msg = messages[i]
+        is_human = isinstance(msg, HumanMessage)
+        is_ai = isinstance(msg, AIMessage)
+        is_tool = isinstance(msg, ToolMessage)
+
+        # The initial dataset-context HumanMessage at index 0 is always
+        # outside the HITL scope; we start at phase_start which is past it.
+        if is_human and i > 0:
+            content = str(getattr(msg, "content", "") or "")
+            if not in_gate:
+                in_gate = True
+                current = {
+                    "tool_name": None,
+                    "approval_kind": "feedback",
+                    "variant_id": None,
+                    "rationale": None,
+                    "human_messages": [],
+                    "agent_messages_during_gate": [],
+                }
+                conversations.append(current)
+            # Detect approval-sentinel content
+            if content.startswith("__APPROVE_VARIANT__"):
+                payload = content[len("__APPROVE_VARIANT__"):].strip()
+                try:
+                    data = json.loads(payload)
+                    current["approval_kind"] = "variant"
+                    current["variant_id"] = data.get("id")
+                    current["rationale"] = data.get("rationale", "")
+                except Exception:
+                    pass
+            elif content.startswith("__APPROVE__"):
+                current["approval_kind"] = "bare"
+                note = content[len("__APPROVE__"):].strip()
+                if note:
+                    current["rationale"] = note
+            else:
+                current["human_messages"].append(content)
+            continue
+
+        if in_gate and is_ai:
+            text = str(getattr(msg, "content", "") or "").strip()
+            if text:
+                current["agent_messages_during_gate"].append(text)
+            # If the AI emits tool calls, the gate is closing as the
+            # agent moves on. We don't reset in_gate yet — the agent's
+            # response IS the gate's resolution.
+            continue
+
+        if in_gate and is_tool:
+            # The first ToolMessage after a HITL conversation marks the
+            # gate's exit. Capture the triggering tool name if we haven't.
+            name = getattr(msg, "name", None)
+            if name and current["tool_name"] is None:
+                current["tool_name"] = name
+            in_gate = False
+            current = None
+
+    # Drop entries that have no human content (initial filter race).
+    return [c for c in conversations if c["human_messages"] or c["variant_id"]]
+
+
+def _extract_phase_metrics_arc(
+    messages: list, phase_start: int
+) -> tuple[dict | None, dict | None, list[dict]]:
+    """
+    Find the first and last analyze_image ToolMessage payloads in the
+    phase, plus any regression_warnings entries that fired during the
+    phase. Returns (first_metrics, last_metrics, fired_warnings).
+
+    first_metrics and last_metrics are the parsed JSON dicts from
+    analyze_image; fired_warnings is a flat list of warning entries
+    encountered (deduplicated by (metric, baseline) — same warning
+    repeated across multiple analyses isn't double-counted).
+    """
+    first: dict | None = None
+    last: dict | None = None
+    seen_warnings: list[dict] = []
+    seen_keys: set[tuple] = set()
+
+    for i in range(phase_start, len(messages)):
+        msg = messages[i]
+        if not isinstance(msg, ToolMessage):
+            continue
+        if getattr(msg, "name", None) != "analyze_image":
+            continue
+        try:
+            content = str(getattr(msg, "content", "") or "")
+            data = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if first is None:
+            first = data
+        last = data
+        for w in (data.get("regression_warnings") or []):
+            if isinstance(w, dict):
+                key = (w.get("metric"), w.get("baseline"))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    seen_warnings.append(w)
+
+    return first, last, seen_warnings
+
+
+def _scan_phase_calls_with_results(messages: list) -> tuple[list[dict], int]:
+    """
+    Like _scan_phase_calls but also captures the result JSON of each tool
+    call (the next ToolMessage in the stream) and returns the phase_start
+    index so other helpers can re-walk the same window.
+    """
+    phase_start = 0
+    for i, msg in enumerate(messages):
+        if (
+            isinstance(msg, ToolMessage)
+            and getattr(msg, "name", None) == "advance_phase"
+            and "Cannot advance" not in str(msg.content)
+        ):
+            phase_start = i + 1
+
+    calls: list[dict] = []
+    for i in range(phase_start, len(messages)):
+        msg = messages[i]
+        if not (isinstance(msg, AIMessage) and msg.tool_calls):
+            continue
+        reasoning = str(msg.content).strip() if msg.content else ""
+        for tc in msg.tool_calls:
+            if tc["name"] == "advance_phase":
+                continue
+            args = {k: v for k, v in tc.get("args", {}).items()
+                    if k not in ("tool_call_id", "state")}
+            # Find the matching ToolMessage by tool_call_id
+            tc_id = tc.get("id")
+            result_summary: str | None = None
+            for j in range(i + 1, len(messages)):
+                m = messages[j]
+                if isinstance(m, ToolMessage) and m.tool_call_id == tc_id:
+                    raw = str(getattr(m, "content", "") or "")
+                    # Truncate to keep reports scannable; full content lives
+                    # in the message history if a deeper dive is needed.
+                    if len(raw) > 600:
+                        result_summary = raw[:600].rstrip() + "  …(truncated)"
+                    else:
+                        result_summary = raw
+                    break
+            calls.append({
+                "name": tc["name"],
+                "args": args,
+                "reasoning": reasoning,
+                "result": result_summary,
+            })
+    return calls, phase_start
+
+
+def _format_metric_arc(
+    first: dict | None, last: dict | None
+) -> list[str]:
+    """Render a metrics-arc Markdown table from the first/last analyses."""
+    if not first or not last:
+        return []
+    keys = (
+        "snr_estimate",
+        "current_noise",
+        "wavelet_noise",
+        "current_fwhm",
+        "background_flatness",
+        "gradient_magnitude",
+        "channel_imbalance",
+        "clipped_shadows_pct",
+        "clipped_highlights_pct",
+        "star_count",
+    )
+    rows: list[str] = []
+    for k in keys:
+        f_val = first.get(k)
+        l_val = last.get(k)
+        if f_val is None and l_val is None:
+            continue
+
+        def _fmt(v):
+            if v is None:
+                return "—"
+            if isinstance(v, float):
+                return f"{v:.4g}"
+            return str(v)
+
+        delta = "—"
+        try:
+            if f_val is not None and l_val is not None:
+                d = float(l_val) - float(f_val)
+                delta = f"{d:+.4g}"
+        except (TypeError, ValueError):
+            pass
+        rows.append(f"| `{k}` | {_fmt(f_val)} | {_fmt(l_val)} | {delta} |")
+
+    if not rows:
+        return []
+    return [
+        "| Metric | Phase Start | Phase End | Δ |",
+        "|--------|-------------|-----------|---|",
+        *rows,
+    ]
+
+
+def _write_audit_phase_report(
+    *,
+    phase_value: str,
+    working_dir: str,
+    state: AstroState,
+    messages: list,
+    reason: str,
+    advance_reasoning: str,
+    outstanding_warnings: list[RegressionWarning] | None,
+) -> Path | None:
+    """
+    Write the audit-focused per-phase report to <working_dir>/reports/
+    NN_<phase>.md. Returns the path written, or None if writing failed.
+
+    This is the auditor's view: per-phase, self-contained, structured for
+    "what went right / wrong in this phase" review by a human or a
+    reviewing-coding-agent. Companion to _write_phase_report which feeds
+    the chronological processing_log.md.
+    """
+    report_path = audit_report_path(working_dir, phase_value)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Pull session / dataset / model context for the header
+    session = state.get("session") or {}
+    dataset = state.get("dataset") or {}
+    acquisition = dataset.get("acquisition_meta", {}) or {}
+    metadata = state.get("metadata") or {}
+
+    target = session.get("target_name") or "(unknown target)"
+    bortle = session.get("bortle")
+    sqm = session.get("sqm_reading")
+    notes = session.get("notes")
+
+    # Mode: read the live autonomous flag (set by CLI / Gradio at runtime).
+    # The earlier "state.get('autonomous_mode')" read returned None because
+    # autonomous lives in a process-global runtime override, not on state.
+    try:
+        from muphrid.graph.hitl import is_autonomous
+        autonomous = is_autonomous()
+    except Exception:
+        autonomous = False
+
+    # Model / provider: read from the resolved Settings rather than env
+    # vars directly. load_settings() applies the .env + processing.toml
+    # cascade, so this picks up values the user set in either surface.
+    # Falls back to env var read if Settings can't be loaded for any reason.
+    model_name = "(unknown)"
+    provider = "(unknown)"
+    try:
+        from muphrid.config import load_settings
+        _s = load_settings()
+        model_name = _s.llm_model or model_name
+        provider = _s.llm_provider or provider
+    except Exception:
+        import os as _os
+        model_name = _os.environ.get("LLM_MODEL", model_name)
+        provider = _os.environ.get("LLM_PROVIDER", provider)
+
+    # Phase work
+    calls, phase_start = _scan_phase_calls_with_results(messages)
+    first_metrics, last_metrics, fired_warnings = _extract_phase_metrics_arc(
+        messages, phase_start
+    )
+    hitl_conversations = _scan_hitl_conversations(messages, phase_start)
+
+    # Header
+    num = PHASE_NUMBER.get(phase_value, "99")
+    lines: list[str] = [
+        f"# {num} — {phase_value.upper()}",
+        "",
+        "## Header",
+        f"- Target: {target}",
+        f"- Model: {model_name} (provider: {provider})",
+        f"- Mode: {'autonomous' if autonomous else 'HITL-enabled'}",
+        f"- Phase advanced at: {now}",
+        f"- Advance reason: {reason}",
+    ]
+    if acquisition:
+        cam = acquisition.get("camera_model") or acquisition.get("sensor_type") or ""
+        focal = acquisition.get("focal_length_mm")
+        sensor = acquisition.get("sensor_type")
+        if cam or focal or sensor:
+            equip_bits: list[str] = []
+            if cam:
+                equip_bits.append(str(cam))
+            if focal:
+                equip_bits.append(f"{focal}mm")
+            if sensor:
+                equip_bits.append(str(sensor))
+            lines.append(f"- Equipment: {' / '.join(equip_bits)}")
+    if bortle is not None:
+        lines.append(f"- Bortle: {bortle}")
+    if sqm is not None:
+        lines.append(f"- SQM: {sqm}")
+    if notes:
+        lines.append(f"- Notes: {notes}")
+    lines.append("")
+
+    # Advance-time reasoning
+    if advance_reasoning:
+        lines.append("## Advance-Time Reasoning")
+        lines.append("")
+        for para in advance_reasoning.splitlines():
+            lines.append(f"> {para}" if para.strip() else ">")
+        lines.append("")
+
+    # Tool activity
+    lines.append("## Tool Activity")
+    lines.append("")
+    if not calls:
+        lines.append("*No tool calls in this phase.*")
+        lines.append("")
+    else:
+        for i, call in enumerate(calls, 1):
+            lines.append(f"### {i}. `{call['name']}`")
+            if call["reasoning"]:
+                for line in call["reasoning"].splitlines():
+                    lines.append(f"> {line}" if line.strip() else ">")
+                lines.append("")
+            arg_lines = _fmt_args(call["args"])
+            if arg_lines:
+                lines.append("**Parameters:**")
+                lines.extend(arg_lines)
+                lines.append("")
+            else:
+                lines.append("*(no arguments)*")
+                lines.append("")
+            if call.get("result"):
+                lines.append("**Result:**")
+                lines.append("")
+                lines.append("```")
+                lines.append(str(call["result"]))
+                lines.append("```")
+                lines.append("")
+
+    # HITL conversations
+    if hitl_conversations:
+        lines.append("## HITL Conversations")
+        lines.append("")
+        for j, conv in enumerate(hitl_conversations, 1):
+            label_bits: list[str] = []
+            if conv.get("tool_name"):
+                label_bits.append(f"tool: `{conv['tool_name']}`")
+            label_bits.append(f"resolution: {conv['approval_kind']}")
+            lines.append(f"### Conversation {j} ({', '.join(label_bits)})")
+            lines.append("")
+            if conv.get("variant_id"):
+                lines.append(f"- Approved variant: `{conv['variant_id']}`")
+            if conv.get("rationale"):
+                lines.append(f"- Human rationale: {conv['rationale']!r}")
+            if conv["human_messages"]:
+                lines.append("")
+                lines.append("**Human messages:**")
+                for hm in conv["human_messages"]:
+                    for line in str(hm).splitlines():
+                        lines.append(f"> {line}" if line.strip() else ">")
+            if conv["agent_messages_during_gate"]:
+                lines.append("")
+                lines.append("**Agent responses during gate:**")
+                for am in conv["agent_messages_during_gate"]:
+                    for line in str(am).splitlines():
+                        lines.append(f"> {line}" if line.strip() else ">")
+            lines.append("")
+
+    # Metrics arc
+    metric_lines = _format_metric_arc(first_metrics, last_metrics)
+    if metric_lines:
+        lines.append("## Metrics Arc")
+        lines.append("")
+        lines.extend(metric_lines)
+        lines.append("")
+
+    # Regression warnings
+    fired_count = len(fired_warnings)
+    outstanding = list(outstanding_warnings or [])
+    lines.append("## Regression Warnings")
+    lines.append("")
+    lines.append(f"- During phase: {fired_count} fired")
+    if fired_count:
+        for w in fired_warnings:
+            summary = w.get("summary") or ""
+            phase_origin = w.get("phase_origin") or ""
+            tag = f" (origin phase: {phase_origin})" if phase_origin and phase_origin != phase_value else ""
+            lines.append(f"  - {summary}{tag}")
+    lines.append(f"- Outstanding at advance: {len(outstanding)}")
+    for w in outstanding:
+        summary = w.get("summary") or ""
+        phase_origin = w.get("phase_origin") or ""
+        tag = f" (origin phase: {phase_origin})" if phase_origin and phase_origin != phase_value else ""
+        lines.append(f"  - {summary}{tag}")
+    lines.append("")
+
+    # Outcome
+    paths = state.get("paths") or {}
+    current_image = paths.get("current_image")
+    rewind_counts = (metadata.get("phase_rewind_counts") or {}).get(phase_value, 0)
+    lines.append("## Outcome")
+    lines.append("")
+    if current_image:
+        lines.append(f"- Final current_image: `{current_image}`")
+    lines.append(f"- Times this phase has been rewound to: {rewind_counts}")
+
+    try:
+        report_path.write_text("\n".join(lines) + "\n")
+        return report_path
+    except OSError as e:
+        logger.warning(f"audit report write failed for {report_path}: {e}")
+        return None
+
+
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool
+@tool(args_schema=AdvancePhaseInput)
 def advance_phase(
     reason: str,
     tool_call_id: Annotated[str, InjectedToolCallId] = None,
@@ -677,6 +1225,23 @@ def advance_phase(
         except Exception as e:
             logger.warning(f"Phase report write failed (non-fatal): {e}")
 
+        # Write the per-phase audit report alongside the chronological log.
+        # This is the auditor-facing structured view; processing_log.md is
+        # the chronological journal. Both are written; both are useful for
+        # different inspection patterns.
+        try:
+            _write_audit_phase_report(
+                phase_value=current.value,
+                working_dir=working_dir,
+                state=state,
+                messages=state.get("messages", []),
+                reason=reason,
+                advance_reasoning=advance_reasoning,
+                outstanding_warnings=outstanding_warnings,
+            )
+        except Exception as e:
+            logger.warning(f"Audit phase report write failed (non-fatal): {e}")
+
     result: dict = {
         "previous_phase": current.value,
         "new_phase": next_phase.value,
@@ -706,6 +1271,13 @@ def advance_phase(
         # been promoted to current_image (either by hitl_check on variant
         # approval, or by the tool itself in autonomous mode).
         "variant_pool": [],
+        # presented_for_review is the agent's curation set for the gate
+        # we're leaving — clear so the next phase starts with no carry-over
+        # candidates. Replace([]) because the field uses
+        # _list_extend_or_replace (extend by default); without Replace,
+        # an empty new list would no-op the reducer and leave stale
+        # entries in place.
+        "presented_for_review": Replace([]),
         # visual_context is the VLM working set. Phase advance is the natural
         # release point: prior-phase visuals are no longer decision-relevant.
         "visual_context": [],

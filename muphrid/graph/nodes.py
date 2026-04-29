@@ -42,7 +42,7 @@ from muphrid.graph.prompts import HITL_PARTNER_FRAGMENT as _HITL_PARTNER_FRAGMEN
 from muphrid.graph.prompts import PHASE_PROMPTS as _PHASE_PROMPTS
 from muphrid.graph.prompts import SYSTEM_BASE as _SYSTEM_BASE
 from muphrid.graph.registry import all_tools, tools_for_phase
-from muphrid.graph.state import AstroState, HITLPayload, ProcessingPhase, Variant, VisualRef
+from muphrid.graph.state import AstroState, HITLPayload, ProcessingPhase, Replace, Variant, VisualRef
 
 logger = logging.getLogger(__name__)
 
@@ -435,6 +435,75 @@ class StuckLoopError(RuntimeError):
     """Raised when the agent calls the same tool too many times consecutively."""
 
 
+class TextLoopError(RuntimeError):
+    """Raised when the agent emits too many text-only responses without progress."""
+
+
+def _check_text_loop(messages: list) -> None:
+    """
+    Hard-fail when the agent emits N consecutive text-only AIMessages with
+    no HumanMessage and no tool calls in between. Catches the "agent
+    talking to itself" pattern that the tool-based stuck-loop detector
+    misses (M20 trace: 8 text-only responses in a row narrating the same
+    image comparison, no tool calls, no human input, until the model API
+    rejected the bloated payload).
+
+    Why "no HumanMessage between" is the right signal:
+      During an HITL gate the agent CAN legitimately produce many
+      text-only responses while conversing — but those interleave with
+      HumanMessages from the user. A run of text-only AIMessages with
+      no HumanMessage interruption means the agent is running its own
+      loop, not collaborating. We don't gate on similarity because the
+      agent's phrasing varies even when it's stuck, and Jaccard /
+      n-gram measures are too sensitive to word-choice differences.
+
+    Tunables (env vars):
+      MAX_CONSECUTIVE_TEXT_ONLY — N (default 5, 0 disables)
+    """
+    import os
+    env_n = os.environ.get("MAX_CONSECUTIVE_TEXT_ONLY", "")
+    if env_n.strip() == "0":
+        return
+    try:
+        max_n = int(env_n) if env_n else 5
+    except ValueError:
+        max_n = 5
+    if max_n <= 1:
+        return
+
+    # Walk the tail backward. Count text-only AIMessages until we hit:
+    #   - A HumanMessage (conversation interleave — resets the run)
+    #   - An AIMessage with tool_calls (agent did something — resets)
+    #   - A ToolMessage (tool ran — resets)
+    run_texts: list[str] = []
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            if msg.tool_calls:
+                break
+            text = str(msg.content or "").strip()
+            if text:
+                run_texts.append(text)
+            # else: empty AIMessage doesn't count toward the run but also
+            # doesn't reset it — keep walking.
+        elif isinstance(msg, (HumanMessage, ToolMessage)):
+            break
+
+    if len(run_texts) < max_n:
+        return
+
+    raise TextLoopError(
+        f"Agent has emitted {len(run_texts)} consecutive text-only "
+        f"responses (limit {max_n}) without a human reply or a tool call. "
+        f"This pattern is the narration-loop the tool-based stuck-loop "
+        f"detector doesn't catch — the agent is talking to itself "
+        f"instead of advancing the work. Most recent response "
+        f"(first 200 chars):\n"
+        f"  {run_texts[0][:200]!r}\n"
+        f"To override, set MAX_CONSECUTIVE_TEXT_ONLY=0 in .env. "
+        f"To raise the trigger threshold, set MAX_CONSECUTIVE_TEXT_ONLY=N."
+    )
+
+
 class NudgeLimitError(RuntimeError):
     """Raised when the agent refuses to call tools after repeated nudges."""
 
@@ -796,6 +865,103 @@ def _rescue_raw_tool_calls(response: AIMessage) -> AIMessage:
     return AIMessage(content=hint, tool_calls=[])
 
 
+# Sentinel content used when a model returns an AIMessage with neither text
+# nor tool_calls. Persisting an empty AIMessage poisons subsequent calls
+# regardless of backend: OpenAI-compatible providers (Together, OpenAI,
+# DeepSeek) reject with HTTP 400 "Input validation error", and Anthropic's
+# Messages API rejects with "all messages must have non-empty content" — the
+# rule is a wire-format invariant, not a provider quirk. Substituting a
+# non-empty placeholder keeps the conversation valid for any backend while
+# still signalling to the agent_chat nudger that this turn was a no-op.
+_EMPTY_RESPONSE_PLACEHOLDER = (
+    "(no response — I should call a tool or respond with text on the next turn)"
+)
+
+
+def _is_empty_ai_message(msg: AIMessage) -> bool:
+    """True iff the AIMessage has no usable content AND no tool_calls."""
+    content = msg.content
+    if isinstance(content, str):
+        text_empty = not content.strip()
+    elif isinstance(content, list):
+        # Multi-part content (text + image blocks): empty iff every part is
+        # an empty string or a non-text part. We're permissive with non-text
+        # blocks because removing those would change semantics we don't own.
+        text_empty = all(
+            (isinstance(part, str) and not part.strip()) or
+            (isinstance(part, dict) and (
+                part.get("type") == "text" and not (part.get("text") or "").strip()
+            ))
+            for part in content
+        )
+    else:
+        text_empty = not content
+    return text_empty and not (msg.tool_calls or [])
+
+
+def _normalize_empty_response(response: AIMessage) -> AIMessage:
+    """
+    Replace empty AIMessage(content='', tool_calls=[]) with a placeholder
+    so the conversation never contains a malformed assistant turn.
+
+    Why: every chat completion API in use rejects conversations that
+    contain an assistant turn with no content and no tool_calls. The
+    OpenAI-compatible providers return HTTP 400 "Input validation error";
+    Anthropic's Messages API returns "all messages must have non-empty
+    content". The moment one such turn is persisted, every subsequent
+    invoke on that thread fails until the message is surgically removed
+    from the checkpoint. Normalizing at the source means state never
+    holds a turn that would poison the next call, regardless of which
+    backend is configured.
+
+    This pairs with `_strip_empty_ai_messages` (defense-in-depth, applied
+    to the messages list before invoke) so existing poisoned checkpoints
+    can recover.
+    """
+    if not isinstance(response, AIMessage):
+        return response
+    if not _is_empty_ai_message(response):
+        return response
+    logger.warning(
+        "agent_node: model returned empty response (no content, no tool_calls) — "
+        "substituting placeholder to keep conversation valid for next invoke"
+    )
+    return AIMessage(
+        content=_EMPTY_RESPONSE_PLACEHOLDER,
+        tool_calls=[],
+        # Preserve any other attributes the model attached (id, etc.) so
+        # tracing/logging stays consistent.
+        additional_kwargs=getattr(response, "additional_kwargs", None) or {},
+        response_metadata=getattr(response, "response_metadata", None) or {},
+    )
+
+
+def _strip_empty_ai_messages(messages: list) -> list:
+    """
+    Remove any AIMessage with empty content AND no tool_calls from the
+    messages list before sending to the model.
+
+    This is a recovery path for checkpoints that were already poisoned
+    before `_normalize_empty_response` existed (or in case it's bypassed
+    by a future code path). The empty turn stays in the persisted state
+    for audit; we just hide it from the model on the way out.
+    """
+    out = []
+    dropped = 0
+    for m in messages:
+        if isinstance(m, AIMessage) and _is_empty_ai_message(m):
+            dropped += 1
+            continue
+        out.append(m)
+    if dropped:
+        logger.info(
+            f"_strip_empty_ai_messages: filtered {dropped} empty AIMessage(s) "
+            f"from invoke input (state preserved; only the wire payload is "
+            f"sanitized)"
+        )
+    return out
+
+
 def make_agent_node(model_factory):
     """
     Create the agent node with a model factory for phase-gated tool binding.
@@ -812,6 +978,14 @@ def make_agent_node(model_factory):
 
         # Stuck-loop detection: hard fail if the agent repeats the same tool call.
         _check_stuck_loop(raw_messages)
+
+        # Text-loop detection: hard fail if the agent emits N consecutive
+        # text-only responses with high pairwise similarity. Catches the
+        # narration-loop pattern that the tool-based stuck-loop detector
+        # misses (observed in M20 trace: 8 near-identical "Top: teal /
+        # Bottom: bronze" responses without progress, eventually crashing
+        # the model API on token-limit overflow).
+        _check_text_loop(raw_messages)
 
         # Per-phase tool call cap: count tool calls since the last advance_phase
         # and fail if the limit is exceeded.
@@ -895,8 +1069,23 @@ def make_agent_node(model_factory):
         # captured the conclusions; raw JSON is dead weight after phase ends.
         messages = _prune_phase_analysis(messages)
 
+        # Defense-in-depth: filter out any prior empty AIMessage (no content,
+        # no tool_calls) before invoking the model. Both OpenAI-compatible
+        # providers (Together, OpenAI, DeepSeek) and Anthropic reject
+        # conversations that contain such turns. A single empty AI turn
+        # poisoned by a previous agent stall would block every subsequent
+        # invocation on this thread until manually surgically removed from
+        # the checkpoint. Stripping at invoke time recovers gracefully.
+        # Note: this only filters; the AIMessage stays in checkpoint state
+        # so the audit trail is preserved. We just don't show it to the
+        # model. Pair with the post-invoke normalization below — together
+        # they prevent the bad message from being persisted in the first
+        # place AND let us recover existing checkpoints.
+        messages = _strip_empty_ai_messages(messages)
+
         response = model.invoke(messages)
         response = _rescue_raw_tool_calls(response)
+        response = _normalize_empty_response(response)
 
         # Phase gate enforcement: reject any tool call not available in the
         # current phase. This catches DeepSeek rescue reconstructing calls
@@ -1436,26 +1625,31 @@ def build_variant_promotion_update(
     paths = dict(state.get("paths", {}) or {})
     paths["current_image"] = variant["file_path"]
 
-    # Append a phase_carry entry to visual_context so the agent retains a
-    # visual anchor on what it chose to keep. Other entries are preserved.
-    working_dir = state.get("dataset", {}).get("working_dir", "")
-    is_linear = state.get("metrics", {}).get("is_linear_estimate", True)
-    phase_value = state.get("phase")
-    if hasattr(phase_value, "value"):
-        phase_value = phase_value.value
-    existing_visual = list(state.get("visual_context", []) or [])
-    approved_preview = _resolve_variant_preview(variant, working_dir, is_linear)
-    if approved_preview:
-        existing_visual.append(VisualRef(
-            path=approved_preview,
-            label=f"Carried forward: {variant.get('label') or variant['id']}",
-            source="phase_carry",
-            phase=str(phase_value) if phase_value else "",
-        ))
+    # Drop the now-promoted variant's hitl_variant entry (variant_pool is
+    # being cleared, but visual_context may have older present_images /
+    # phase_carry entries we want to preserve). Drop ANY existing
+    # phase_carry entries too — they were a pre-#44 mechanism for keeping
+    # a chosen variant visible, but the auto-current-image source now
+    # projects paths.current_image automatically. Keeping a phase_carry
+    # in addition causes a stale-comparison artifact: when the next tool
+    # moves current_image to a new file, phase_carry still points at the
+    # old variant's preview, the VLM sees both, and the agent gets stuck
+    # narrating a now-irrelevant before/after. (Was #66 in the to-do list.)
+    existing_visual = [
+        r for r in (state.get("visual_context", []) or [])
+        if r.get("source") not in ("hitl_variant", "phase_carry")
+    ]
 
     update: dict[str, Any] = {
         "paths": paths,
         "variant_pool": [],
+        # presented_for_review (the agent's HITL-gate curation set) clears
+        # alongside the pool — committing a variant ends the gate, so any
+        # candidates the agent had surfaced for the human are no longer
+        # relevant. Wrap in Replace because the field uses
+        # _list_extend_or_replace; an empty list without Replace would
+        # extend (no-op), leaving stale entries.
+        "presented_for_review": Replace([]),
         "visual_context": existing_visual,
         # metadata is merged via _merge_dicts, so partial updates are safe —
         # other metadata fields are preserved and only last_committed_variant
@@ -1706,8 +1900,8 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
 
     # Self-correct the pool before exposing it to the UI: drop any dangling
     # entries whose files have been removed (e.g., across a session restart
-    # with cleanup_previous_runs=true). The UI must never render an Approve
-    # button for a non-existent file.
+    # with cleanup_previous_runs=true). The pool drives the read-only
+    # "history" panel; the proposal (below) drives the Approve buttons.
     raw_pool_for_payload = list(state.get("variant_pool", []) or [])
     payload_pool, dropped_at_payload = _validate_variant_pool(raw_pool_for_payload)
     if dropped_at_payload:
@@ -1715,6 +1909,32 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
             f"hitl_check: dropped {len(dropped_at_payload)} dangling variant(s) "
             f"before payload: {dropped_at_payload}"
         )
+
+    # Build the proposal: resolve each presented_for_review entry's
+    # variant_id back to its full Variant dict (from the validated pool)
+    # and pair it with the rationale the agent supplied. Entries whose
+    # variant_id no longer exists in the pool (e.g. after a backend
+    # cleanup) are silently dropped — better an empty/short proposal
+    # than a broken Approve button.
+    pool_by_id = {v.get("id"): v for v in payload_pool if v.get("id")}
+    presented_entries = list(state.get("presented_for_review", []) or [])
+    proposal: list[dict] = []
+    for entry in presented_entries:
+        vid = entry.get("variant_id") if isinstance(entry, dict) else None
+        if not vid:
+            continue
+        variant = pool_by_id.get(vid)
+        if variant is None:
+            logger.info(
+                f"hitl_check: dropped presented_for_review entry {vid!r} "
+                f"— variant no longer in validated pool"
+            )
+            continue
+        proposal.append({
+            "variant": variant,
+            "rationale": entry.get("rationale", ""),
+            "presented_at": entry.get("presented_at", ""),
+        })
 
     payload = HITLPayload(
         type=cfg["type"],
@@ -1724,6 +1944,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         context=messages[-6:],
         agent_text=_agent_text,
         variant_pool=payload_pool,
+        proposal=proposal,
     )
 
     # VLM visibility is state-driven. variant_snapshot has already updated
@@ -1742,8 +1963,8 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     # ── Variant approval ─────────────────────────────────────────────
     # The Gradio variant panel sends a structured sentinel naming the
     # specific variant being committed plus an optional rationale from
-    # the textbox. Promote the chosen variant's file to current_image,
-    # clear the pool, and surface the rationale to memory extraction.
+    # the textbox. Promote the chosen variant's file to current_image
+    # and clear the pool.
     if is_variant_approval(response_text):
         variant_id, rationale = parse_variant_approval(response_text)
         if variant_id is None:
@@ -1772,9 +1993,6 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                 "active_hitl": True,
             }
 
-        # Long-term memory extraction with rationale as the note
-        _extract_hitl_memories(state, messages, tool_name, rationale or "")
-
         # Merge vlm_messages with the promotion update's messages
         update["messages"] = vlm_messages + update["messages"]
         return update
@@ -1785,9 +2003,6 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         note = extract_approval_note(response_text)
         approval_text = note if note else "Approved. Continue to the next step."
 
-        # Long-term memory extraction (v1: HITL-only)
-        _extract_hitl_memories(state, messages, tool_name, note)
-
         # Bare approval (CLI / fallback) — drop hitl_variant entries from
         # visual_context. No specific variant was named, so nothing to carry
         # forward as phase_carry.
@@ -1796,6 +2011,8 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         return {
             "active_hitl": False,
             "variant_pool": [],
+            # Same lifecycle reset as variant_pool — see promote_variant.
+            "presented_for_review": Replace([]),
             "visual_context": non_hitl,
             "messages": vlm_messages + [HumanMessage(content=approval_text)],
         }
@@ -1805,113 +2022,6 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         "messages": vlm_messages + [HumanMessage(content=response_text)],
         "active_hitl": True,
     }
-
-
-# ── Long-term memory extraction from HITL ────────────────────────────────────
-
-def _extract_hitl_memories(state: AstroState, messages: list, tool_name: str, approval_note: str):
-    """
-    Extract and store memories after HITL approval (non-blocking, non-fatal).
-
-    Called programmatically by the harness after every HITL approval.
-    Uses the agent's LLM to extract observations, failures, and preferences
-    from the HITL conversation context.
-
-    Design: Lesson #1 (programmatic saves), #9 (HITL-only for v1),
-            #10 (schema-driven extraction)
-    """
-    from muphrid.graph.hitl import is_memory_enabled
-    if not is_memory_enabled():
-        return
-
-    try:
-        from muphrid.memory.extraction import (
-            build_hitl_conversation_text,
-            extract_hitl_memory,
-        )
-        from muphrid.tools.utility.t33_memory_search import _MEMORY_STORE
-        from muphrid.config import make_llm
-
-        if _MEMORY_STORE is None:
-            return
-
-        phase = state.get("phase", ProcessingPhase.INGEST)
-        phase_str = phase.value if hasattr(phase, "value") else str(phase)
-        session = state.get("session", {})
-        dataset = state.get("dataset", {})
-        acquisition = dataset.get("acquisition_meta", {})
-
-        session_context = {
-            "target_name": session.get("target_name", "unknown"),
-            "target_type": session.get("target_type", ""),
-            "sensor": acquisition.get("camera_name", ""),
-            "sensor_type": acquisition.get("sensor_type", ""),
-        }
-
-        # Build conversation text from message history
-        conversation_text = build_hitl_conversation_text(messages, tool_name)
-        if not conversation_text.strip():
-            return
-
-        # If the user added an approval note, append it
-        if approval_note:
-            conversation_text += f"\n\n[Human approval note]\n{approval_note}"
-
-        # Extract memories using the agent's LLM
-        llm = make_llm()
-        extraction = extract_hitl_memory(
-            conversation=conversation_text,
-            tool_name=tool_name,
-            phase=phase_str,
-            session_context=session_context,
-            llm=llm,
-        )
-
-        # Get thread_id for session linkage
-        # (thread_id is in the config, not state — use a placeholder for now)
-        session_id = None
-
-        # Store extracted memories
-        for obs in extraction.observations:
-            _MEMORY_STORE.add_observation(
-                content=obs.content,
-                phase=obs.phase or phase_str,
-                session_id=session_id,
-                source="hitl",
-                parameters=obs.parameters,
-                metrics=obs.metrics,
-            )
-
-        for fail in extraction.failures:
-            _MEMORY_STORE.add_failure(
-                content=fail.content,
-                phase=fail.phase or phase_str,
-                tool=fail.tool or tool_name,
-                session_id=session_id,
-                source="hitl",
-                parameters=fail.parameters,
-                root_cause=fail.root_cause,
-                resolution=fail.resolution,
-            )
-
-        for pref in extraction.preferences:
-            _MEMORY_STORE.add_preference(
-                content=pref.content,
-                tool=pref.tool or tool_name,
-                session_id=session_id,
-                source="hitl",
-                parameters=pref.parameters,
-                target_type=session_context.get("target_type"),
-                sensor=session_context.get("sensor"),
-            )
-
-        total = len(extraction.observations) + len(extraction.failures) + len(extraction.preferences)
-        if total > 0:
-            logger.info(f"Memory: stored {total} memories from {tool_name} HITL approval")
-
-    except Exception as e:
-        # Memory extraction is never fatal — the pipeline must continue
-        logger.warning(f"Memory extraction failed (non-fatal): {e}")
 
 
 # ── agent_chat ────────────────────────────────────────────────────────────────

@@ -102,7 +102,6 @@ def _make_model_factory(base_model=None):
 
 def build_graph(
     checkpointer=None,
-    store=None,
     base_model=None,
 ):
     """
@@ -111,8 +110,6 @@ def build_graph(
     Args:
         checkpointer: LangGraph checkpointer (SqliteSaver recommended).
                       Required for HITL interrupt/resume.
-        store: LangGraph BaseStore for cross-thread long-term memory.
-               Optional — graph works without it, just no long-term memory.
         base_model: Override the LLM instance (useful for testing).
     """
     model_factory = _make_model_factory(base_model)
@@ -167,10 +164,7 @@ def build_graph(
     )
 
     # ── Compile ───────────────────────────────────────────────────────────
-    return builder.compile(
-        checkpointer=checkpointer,
-        store=store,
-    )
+    return builder.compile(checkpointer=checkpointer)
 
 
 # ── LangGraph Studio entry point ─────────────────────────────────────────────
@@ -186,13 +180,11 @@ graph = build_graph()
 
 def build_graph_with_sqlite(
     db_path: str = "checkpoints.db",
-    store=None,
     base_model=None,
 ):
     """Build the graph with a SqliteSaver checkpointer for durable persistence."""
     checkpointer = SqliteSaver.from_conn_string(db_path)
     return build_graph(
         checkpointer=checkpointer,
-        store=store,
         base_model=base_model,
     ), checkpointer

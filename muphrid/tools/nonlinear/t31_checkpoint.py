@@ -198,7 +198,7 @@ def restore_checkpoint(
     # against the restored state. The noop case leaves everything as-is
     # (no state actually changed).
     update: dict = {
-        "paths": {**state["paths"], "current_image": restore_path},
+        "paths": {"current_image": restore_path},
         "messages": [ToolMessage(
             content=json.dumps(summary, indent=2),
             tool_call_id=tool_call_id,

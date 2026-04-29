@@ -139,6 +139,7 @@ def _build_payload(
         "context": [],
         "agent_text": reason,
         "variant_pool": [],
+        "proposal": [],
     }
 
 

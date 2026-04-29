@@ -38,7 +38,6 @@ _CFG = _load_config()
 _RUNTIME_AUTONOMOUS: bool = False
 _RUNTIME_VLM_AUTONOMOUS: bool | None = None
 _RUNTIME_VLM_RETENTION_MAX: int | None = None
-_RUNTIME_MEMORY_ENABLED: bool = False
 
 
 def set_autonomous(value: bool) -> None:
@@ -57,17 +56,6 @@ def set_vlm_retention_max(value: int) -> None:
     """Called by the app to override the toml vlm_retention_max_images value."""
     global _RUNTIME_VLM_RETENTION_MAX
     _RUNTIME_VLM_RETENTION_MAX = int(value)
-
-
-def set_memory_enabled(value: bool) -> None:
-    """Called by the CLI/app to enable long-term memory."""
-    global _RUNTIME_MEMORY_ENABLED
-    _RUNTIME_MEMORY_ENABLED = value
-
-
-def is_memory_enabled() -> bool:
-    """Check if long-term memory is active for this session."""
-    return _RUNTIME_MEMORY_ENABLED
 
 
 def tool_cfg(tool_id: str) -> dict:

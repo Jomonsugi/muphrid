@@ -26,7 +26,6 @@ from langgraph.types import Command
 from muphrid.config import check_dependencies, load_settings
 from muphrid.graph.graph import build_graph
 from muphrid.graph.hitl import APPROVE_SENTINEL
-from muphrid.graph.memory import make_memory_store
 from muphrid.graph.state import (
     AstroState,
     ProcessingPhase,
@@ -259,8 +258,6 @@ def process(
             "halt; resume the run with --resume <thread_id>."
         ),
     ),
-    memory: bool = typer.Option(False, "--memory", help="Enable long-term memory (learns from HITL sessions)."),
-    rebuild_embeddings: bool = typer.Option(False, "--rebuild-embeddings", help="Rebuild vector index after model/provider change."),
     db: str = typer.Option("checkpoints.db", help="Path to SQLite checkpoint database."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
@@ -294,28 +291,14 @@ def process(
     if stop_phase is not None:
         typer.echo(f"Stop-after-phase: {stop_phase.value}")
 
-    # Initialize long-term memory if enabled
-    if memory:
-        from muphrid.memory.embeddings import EmbeddingInitError, init_memory_system
-
-        try:
-            settings_pre = load_settings()
-            rebuild = rebuild_embeddings or settings_pre.memory_rebuild_embeddings
-            init_memory_system(settings_pre, rebuild_embeddings=rebuild)
-            logger.info("Long-term memory enabled")
-        except EmbeddingInitError as e:
-            typer.echo(f"Error: Memory initialization failed.\n\n{e}", err=True)
-            raise typer.Exit(code=1)
-
     # Validate dependencies
     settings = load_settings()
     check_dependencies(settings)
 
     # Build graph
-    store = make_memory_store()
     serde = JsonPlusSerializer(allowed_msgpack_modules=[("muphrid.graph.state", "ProcessingPhase")])
     checkpointer = SqliteSaver(sqlite3.connect(db, check_same_thread=False), serde=serde)
-    graph = build_graph(checkpointer=checkpointer, store=store)
+    graph = build_graph(checkpointer=checkpointer)
 
     # Thread config
     thread_id = resume if resume else _make_thread_id(target)
@@ -357,6 +340,14 @@ def process(
 
         for warning in ingest_result.get("warnings", []):
             typer.echo(f"Warning: {warning}", err=True)
+
+        # Register the session in the shared sessions index so a later
+        # Gradio resume of this thread_id can recover the working_dir
+        # without falling back to deriving it from variant file paths.
+        from muphrid.sessions import register_session
+        working_dir_for_index = ingest_result["dataset"].get("working_dir", "")
+        if working_dir_for_index:
+            register_session(thread_id, working_dir_for_index)
 
         initial_state = make_empty_state(
             dataset=ingest_result["dataset"],

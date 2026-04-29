@@ -210,7 +210,7 @@ def _mp_build_mask_node(state: AstroState) -> dict:
     mask_input = mp_inputs.get("mask")
 
     if isinstance(mask_input, str):
-        return {"paths": {**state["paths"], "latest_mask": mask_input}}
+        return {"paths": {"latest_mask": mask_input}}
 
     # mask_input is a dict (a MaskSpec model_dump) — call create_mask.func
     from muphrid.tools.scikit.t25_create_mask import create_mask

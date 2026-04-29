@@ -181,7 +181,7 @@ def _hc_build_mask_node(state: AstroState) -> dict:
     mask_input = inputs["mask"]
 
     if isinstance(mask_input, str):
-        return {"paths": {**state["paths"], "latest_mask": mask_input}}
+        return {"paths": {"latest_mask": mask_input}}
 
     from muphrid.tools.scikit.t25_create_mask import create_mask
 
@@ -189,6 +189,13 @@ def _hc_build_mask_node(state: AstroState) -> dict:
     # synthetic state's current_image to baseline so create_mask reads
     # the right file regardless of any prior path mutations.
     baseline = inputs["_baseline_path"]
+    # Build a synthetic state for direct tool-function invocation.
+    # The full paths dict must be preserved here — the inner tool reads
+    # state["paths"] directly without going through the deep-merge
+    # reducer, so this is NOT a Command.update payload and the
+    # delta-only rule does not apply. Override only current_image so
+    # the inner tool processes the baseline (not whatever current_image
+    # happened to be when the subgraph started).
     synth = {**state, "paths": {**state["paths"], "current_image": baseline}}
     cmd = create_mask.func(
         **{k: v for k, v in mask_input.items() if v is not None or k == "mask_type"},
@@ -229,6 +236,13 @@ def _hc_run_stretch(state: AstroState, pass_key: str, output_suffix: str) -> str
         else AutostretchOptions()
     )
 
+    # Build a synthetic state for direct tool-function invocation.
+    # The full paths dict must be preserved here — the inner tool reads
+    # state["paths"] directly without going through the deep-merge
+    # reducer, so this is NOT a Command.update payload and the
+    # delta-only rule does not apply. Override only current_image so
+    # the inner tool processes the baseline (not whatever current_image
+    # happened to be when the subgraph started).
     synth = {**state, "paths": {**state["paths"], "current_image": baseline}}
     cmd = stretch_image.func(
         method=method,
@@ -413,7 +427,7 @@ def _hc_blend_node(state: AstroState) -> dict:
             output_path=output_path,
             blend_mode="luminosity",
         )
-        new_paths = {**state["paths"], "current_image": output_path}
+        new_paths = {"current_image": output_path}
     else:
         raise ValueError(
             f"hdr_composite: unknown blend_mode '{blend_mode}'. "

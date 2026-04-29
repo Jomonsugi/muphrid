@@ -406,7 +406,7 @@ _WEIGHTING_MAP = {
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool
+@tool(args_schema=SirilStackInput)
 def siril_stack(
     rejection_method: str,
     weighting: str,
@@ -415,6 +415,7 @@ def siril_stack(
     normalization: str = "addscale",
     fast_norm: bool = False,
     overlap_norm: bool = False,
+    output_norm: bool = False,
     output_32bit: bool = True,
     rgb_equal: bool = False,
     output_name: str = "master_light",
@@ -422,6 +423,7 @@ def siril_stack(
     upscale: bool = False,
     feather: int | None = None,
     rejection_maps: str | None = None,
+    total_frames_hint: int | None = None,  # noqa: ARG001 — diagnostic hint, not used in command
     tool_call_id: Annotated[str, InjectedToolCallId] = None,
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
@@ -536,7 +538,9 @@ def siril_stack(
     # (which expect [0,1]) see near-zero values → data appears destroyed.
     # Siril docs: use -output_norm for light stacking, NOT for master frames
     # (master frames are built by build_masters, not this tool).
-    if output_32bit:
+    # 32-bit output implicitly forces normalization on; the explicit
+    # output_norm field lets callers force it on for 16-bit too.
+    if output_32bit or output_norm:
         stack_parts.append("-output_norm")
 
     stack_parts.append(f"-out={output_name}")
@@ -605,6 +609,6 @@ def siril_stack(
         )
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(master_path)},
+        "paths": {"current_image": str(master_path)},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

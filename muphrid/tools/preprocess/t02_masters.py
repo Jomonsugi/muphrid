@@ -509,7 +509,15 @@ def build_masters(
     )
 
     # ── Step 6: Write master path back to state ────────────────────────────
-    masters = {**state["paths"]["masters"], ft: str(master_fits)}
+    # Emit a delta only — `{ft: path}` — never the full pre-existing masters
+    # dict. The PathState.masters reducer is part of paths' deep-merge
+    # reducer, which composes parallel updates correctly when each one
+    # touches only its own keys. Spreading the full dict (e.g.
+    # `{**state["paths"]["masters"], ft: path}`) carries explicit None
+    # values for sibling keys post-rewind, and those Nones overwrite a
+    # parallel sibling's freshly-set value during merge — last write wins,
+    # other writes lost. This was the cause of the post-rewind clobber that
+    # left only one master populated after a 3-way parallel build_masters.
 
     # Build a clear, concise result for the model.
     # Separate quality_issues (critical) from warnings (informational) so the
@@ -568,6 +576,6 @@ def build_masters(
 
     result_content = json.dumps(result, indent=2)
     return Command(update={
-        "paths": {**state["paths"], "masters": masters},
+        "paths": {"masters": {ft: str(master_fits)}},
         "messages": [ToolMessage(content=result_content, tool_call_id=tool_call_id)],
     })

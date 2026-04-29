@@ -54,12 +54,9 @@ from muphrid.graph.hitl import (
     set_autonomous,
     set_vlm_autonomous,
     set_vlm_retention_max,
-    set_memory_enabled,
-    is_memory_enabled,
     vlm_window_cap,
 )
 from muphrid.graph.content import text_content
-from muphrid.graph.memory import make_memory_store
 from muphrid.graph.state import (
     ProcessingPhase,
     SessionContext,
@@ -155,15 +152,80 @@ async def _init_async_resources():
         _DEPENDENCY_ERROR = str(e)
         logger.error(f"Dependency check failed: {e}")
 
+    # Verify the checkpoint DB is intact before LangGraph starts using it.
+    # Without this, a corrupt SQLite file (caused by a previously killed
+    # process, two Gradio instances writing concurrently, or a disk hiccup)
+    # surfaces as a cryptic "database disk image is malformed" stack trace
+    # mid-stream, after the user has already started a session and lost
+    # in-flight work. Catching it here lets us either fail loud at launch
+    # or, when LANGGRAPH_AUTO_RECOVER_DB is set, attempt the recovery
+    # routine (see scripts/recover_checkpoint_db.py — quarantines the
+    # broken file and rebuilds a clean one from readable rows).
+    _check_checkpoint_db_integrity("checkpoints.db")
+
     serde = JsonPlusSerializer(
         allowed_msgpack_modules=[("muphrid.graph.state", "ProcessingPhase")]
     )
     conn = await aiosqlite.connect("checkpoints.db")
     checkpointer = AsyncSqliteSaver(conn=conn, serde=serde)
     await checkpointer.setup()
-    store = make_memory_store()
-    _GRAPH = build_graph(checkpointer=checkpointer, store=store)
+    _GRAPH = build_graph(checkpointer=checkpointer)
     logger.info("Async resources initialized: graph + AsyncSqliteSaver")
+
+
+def _check_checkpoint_db_integrity(db_path: str) -> None:
+    """
+    Run SQLite's PRAGMA integrity_check before LangGraph opens the DB.
+
+    On corruption: log a clear, actionable error and set _DEPENDENCY_ERROR
+    so start_session refuses to begin a run that would crash anyway.
+    Recovery is a separate, deliberate action (see scripts/recover_checkpoint_db.py).
+    Auto-recovery is intentionally NOT enabled by default — silently
+    rebuilding the DB out from under a running process can mask real disk
+    issues and lose context the user might want to inspect first.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    global _DEPENDENCY_ERROR
+    p = Path(db_path)
+    if not p.exists():
+        # Fresh install — AsyncSqliteSaver.setup() will create it. Nothing to check.
+        return
+    try:
+        conn = sqlite3.connect(str(p))
+        try:
+            result = conn.execute("PRAGMA integrity_check").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as e:
+        msg = (
+            f"checkpoint DB at {p} is unreadable ({e}). "
+            f"Quarantine the file and start fresh, or run "
+            f"`python scripts/recover_checkpoint_db.py` to attempt recovery."
+        )
+        logger.error(msg)
+        _DEPENDENCY_ERROR = (_DEPENDENCY_ERROR + "\n\n" if _DEPENDENCY_ERROR else "") + msg
+        return
+
+    ok = result == [("ok",)]
+    if not ok:
+        n_issues = len(result)
+        sample = "; ".join(str(r[0])[:120] for r in result[:3])
+        msg = (
+            f"checkpoint DB at {p} reports {n_issues} integrity issue(s) — "
+            f"first: {sample}. The database is corrupted and LangGraph will "
+            f"crash mid-stream when it tries to write. Quarantine the file "
+            f"(rename to checkpoints.db.corrupt-<ts>) and let LangGraph "
+            f"create a fresh DB on next launch, or run "
+            f"`python scripts/recover_checkpoint_db.py` to extract readable "
+            f"checkpoints into a new DB before starting any session. "
+            f"Common causes: a previous Python process killed mid-write, "
+            f"two Gradio instances writing concurrently to the same file, "
+            f"or a disk-level fault."
+        )
+        logger.error(msg)
+        _DEPENDENCY_ERROR = (_DEPENDENCY_ERROR + "\n\n" if _DEPENDENCY_ERROR else "") + msg
 
 
 # ── FITS preview conversion (sync utility) ───────────────────────────────────
@@ -210,6 +272,8 @@ def _parse_stream_chunks(
     chat_messages: list[dict],
     activity_log: list[dict],
     gallery_images: list[tuple],
+    variant_pool: list[dict],
+    proposal: list[dict],
     working_dir: str,
     is_linear: bool,
     active_hitl: bool = False,
@@ -219,6 +283,15 @@ def _parse_stream_chunks(
 
     Returns (interrupt_payload_or_None, updated_active_hitl).
     Routes agent text to chat during HITL, activity log during autonomous.
+
+    The variant_pool and proposal lists are mutated in place from any state
+    updates carried in this chunk. That gives the UI a live view of the
+    pool growing while the agent runs, even in autonomous phases where no
+    HITL interrupt fires — the user can watch their image accumulate with
+    each successful HITL-mapped tool call. Same goes for the gallery: new
+    variant previews are appended as the pool grows so the human always
+    has a visual companion to the pool panel.
+
     Defensive: handles None values, non-dict updates, unexpected chunk formats.
     """
     if "__interrupt__" in chunk:
@@ -233,6 +306,80 @@ def _parse_stream_chunks(
         # Track active_hitl from state updates
         if "active_hitl" in update:
             active_hitl = update["active_hitl"]
+
+        # Live pool/proposal/gallery updates — autonomous-mode visibility.
+        # Without these, variant_pool_state and proposal_state are only
+        # refreshed at HITL gates (from interrupt_payload), so a user
+        # running a phase autonomously sees nothing until they stop. With
+        # them, the panels update each chunk, the same way chat and
+        # activity log do.
+        if "variant_pool" in update:
+            new_pool = update.get("variant_pool")
+            if isinstance(new_pool, list):
+                # Replace semantics — variant_pool reducer is plain replace
+                # (the upstream variant_snapshot computes the full new list),
+                # so mirror that here. Detect newly-added variants for
+                # gallery-merge below.
+                old_ids = {v.get("id") for v in variant_pool if isinstance(v, dict)}
+                variant_pool.clear()
+                variant_pool.extend(new_pool)
+                new_variants = [
+                    v for v in new_pool
+                    if isinstance(v, dict) and v.get("id") not in old_ids
+                ]
+
+                # Auto-merge new variant previews into the gallery. Skip
+                # this when working_dir is unknown (rare — only when a
+                # session was registered without a dataset path); previews
+                # need a working_dir to materialize.
+                if new_variants and working_dir:
+                    new_paths = [v.get("file_path") for v in new_variants if v.get("file_path")]
+                    if new_paths:
+                        try:
+                            preview_paths = _convert_fits_to_preview(
+                                new_paths, working_dir, is_linear
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"_parse_stream_chunks: preview generation "
+                                f"failed for new variants: {e}"
+                            )
+                            preview_paths = []
+                        existing_in_gallery = {
+                            str(entry[0]) for entry in gallery_images
+                            if isinstance(entry, (tuple, list)) and entry
+                        }
+                        for v, p in zip(new_variants, preview_paths):
+                            if Path(p).exists() and str(p) not in existing_in_gallery:
+                                gallery_images.append(
+                                    (p, f"{v.get('id', '?')} — {v.get('label', '')}")
+                                )
+
+        if "presented_for_review" in update:
+            new_presented = update.get("presented_for_review")
+            if isinstance(new_presented, list):
+                # Resolve each PresentedVariant entry's variant_id back to
+                # its full Variant dict from the current pool — same shape
+                # the HITLPayload uses, so the proposal panel renders
+                # consistently with HITL and autonomous runs.
+                pool_by_id = {
+                    v.get("id"): v for v in variant_pool if isinstance(v, dict) and v.get("id")
+                }
+                resolved = []
+                for entry in new_presented:
+                    if not isinstance(entry, dict):
+                        continue
+                    vid = entry.get("variant_id")
+                    variant = pool_by_id.get(vid)
+                    if variant is None:
+                        continue
+                    resolved.append({
+                        "variant": variant,
+                        "rationale": entry.get("rationale", ""),
+                        "presented_at": entry.get("presented_at", ""),
+                    })
+                proposal.clear()
+                proposal.extend(resolved)
 
         messages = update.get("messages", [])
         for msg in messages:
@@ -348,17 +495,21 @@ async def _stream_graph(
     activity_log: list[dict],
     gallery_images: list[tuple],
     variant_pool: list[dict],
+    proposal: list[dict],
     working_dir: str,
     is_linear: bool,
 ):
     """
-    Core async streaming loop. Yields (chat, activity, gallery, variant_pool).
-    Routes agent text to chat (HITL) or activity log (autonomous).
-    Handles interrupt payloads for HITL display.
+    Core async streaming loop. Yields (chat, activity, gallery, pool, proposal).
 
-    variant_pool is replaced fresh from each HITL payload (not mutated in
-    place) so the UI's variant panel re-renders via @gr.render when it
-    changes. Empty list outside of HITL.
+    Two distinct UI surfaces populated from the HITL payload:
+      * variant_pool — passive history (every variant produced this segment)
+      * proposal     — agent's curation (only what was passed to
+                       present_for_review). Approve buttons attach here.
+
+    Both are replaced fresh from each HITL payload — never mutated in
+    place — so the @gr.render blocks redraw cleanly when state changes.
+    Both are empty outside of an active HITL gate.
     """
     interrupt_payload = None
     active_hitl = False
@@ -370,22 +521,24 @@ async def _stream_graph(
     async for chunk in graph.astream(stream_input, config=config, stream_mode="updates"):
         result, active_hitl = _parse_stream_chunks(
             chunk, chat_messages, activity_log, gallery_images,
+            variant_pool, proposal,
             working_dir, is_linear, active_hitl,
         )
         if result is not None:
             interrupt_payload = result
 
-        yield chat_messages, activity_log, gallery_images, variant_pool
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal
 
     # After stream ends, handle any interrupt payload for UI display
     if interrupt_payload is not None:
         title = interrupt_payload.get("title", "Review")
         images = interrupt_payload.get("images", [])
 
-        # Refresh the variant pool from the payload — replaces any prior
-        # pool in the UI. Backend already cleared it on phase advance or
-        # variant approval, so this naturally reflects the current gate.
+        # Refresh both panels from the payload. Backend already cleared
+        # them on phase advance / variant approval, so each new gate
+        # starts with the right state.
         variant_pool = list(interrupt_payload.get("variant_pool", []) or [])
+        proposal = list(interrupt_payload.get("proposal", []) or [])
 
         # Keep the gallery in sync with the variant panel. If the agent
         # called present_images during this stream, its curated comparison
@@ -396,15 +549,113 @@ async def _stream_graph(
         # agent never narrated or presented images.
         gallery_refreshed = (gallery_images != gallery_before_stream)
 
-        if variant_pool and working_dir and not gallery_refreshed:
+        # Resumed sessions originating from a CLI run never went through
+        # _register_session, so working_dir falls back to "" in the UI
+        # state. The variant entries themselves carry full FITS paths
+        # whose parent directory IS the working_dir, so derive it from
+        # there as a fallback for preview generation.
+        if not working_dir and variant_pool:
+            for v in variant_pool:
+                fp = v.get("file_path")
+                if fp:
+                    working_dir = str(Path(fp).parent)
+                    break
+        if not working_dir and images:
+            for img in images:
+                if img:
+                    working_dir = str(Path(img).parent)
+                    break
+
+        # Gallery population + canonical labeling.
+        #
+        # Two invariants we hold here:
+        #   (1) Every variant in the approve panel has a gallery preview.
+        #       The agent does not have to call present_images for this —
+        #       the system populates variants automatically.
+        #   (2) Every gallery entry whose source matches a variant has the
+        #       variant id visible in its caption. This is the fix for
+        #       the user's "neither matches the image" confusion: the
+        #       Approve button says "T14_v1" so the gallery caption needs
+        #       to start with "T14_v1" too. The agent's descriptive label
+        #       (e.g. "GHS D3 SP0.15") is preserved when it provided one
+        #       via present_images — we just prefix it with the id.
+        if variant_pool and working_dir:
+            # Compute predicted preview paths for every variant once and
+            # build a lookup: preview_path → (variant_id, variant_label).
+            # Reusing this map below avoids the cost of re-converting and
+            # gives both the merge logic AND the caption normalizer a
+            # single source of truth for "this preview belongs to that
+            # variant". _convert_fits_to_preview is idempotent — it
+            # generates JPGs once and returns cached paths thereafter,
+            # so calling it here is cheap even when previews already exist.
             variant_paths = [v["file_path"] for v in variant_pool if v.get("file_path")]
-            if variant_paths:
-                preview_paths = _convert_fits_to_preview(variant_paths, working_dir, is_linear)
+            preview_paths = (
+                _convert_fits_to_preview(variant_paths, working_dir, is_linear)
+                if variant_paths else []
+            )
+            variant_info_by_preview: dict[str, tuple[str, str]] = {}
+            for v, p in zip(variant_pool, preview_paths):
+                if Path(p).exists():
+                    variant_info_by_preview[str(p)] = (
+                        v.get("id", "?"),
+                        v.get("label", ""),
+                    )
+
+            # Existing-gallery lookup (ignore non-tuple entries defensively).
+            existing_preview_paths = {
+                str(entry[0]) for entry in gallery_images
+                if isinstance(entry, (tuple, list)) and entry
+            }
+
+            if not gallery_refreshed:
+                # Case A: present_images was NOT called this stream — replace
+                # gallery wholesale from variant_pool with canonical captions.
                 gallery_images.clear()
                 for v, p in zip(variant_pool, preview_paths):
                     if Path(p).exists():
                         gallery_images.append((p, f"{v['id']} — {v.get('label', '')}"))
+            else:
+                # Case B/C: present_images WAS called. Two passes:
+                #   1) Append any variant whose preview isn't already shown.
+                #   2) Normalize captions: any existing gallery entry whose
+                #      path matches a known variant gets the id prefixed,
+                #      preserving the agent's descriptive label.
+                for v, p in zip(variant_pool, preview_paths):
+                    if Path(p).exists() and str(p) not in existing_preview_paths:
+                        gallery_images.append(
+                            (p, f"{v['id']} — {v.get('label', '')}")
+                        )
+                # Caption normalization pass — runs over the FULL gallery
+                # (both pre-existing and just-appended entries) so every
+                # variant-backed preview is consistently labeled.
+                for i, entry in enumerate(gallery_images):
+                    if not (isinstance(entry, (tuple, list)) and len(entry) >= 2):
+                        continue
+                    path, current_caption = entry[0], entry[1]
+                    info = variant_info_by_preview.get(str(path))
+                    if info is None:
+                        # Not a variant preview — agent's reference image
+                        # (e.g. the linear-stage original); leave caption alone.
+                        continue
+                    vid, vlabel = info
+                    # If the caption already begins with the variant id,
+                    # we're done. Otherwise, preserve the agent's chosen
+                    # descriptive label by prefixing it with the id.
+                    caption_str = str(current_caption or "")
+                    if caption_str.startswith(vid):
+                        continue
+                    if caption_str and caption_str != vlabel:
+                        # Agent supplied a meaningful descriptive label —
+                        # keep it, just identify which variant it is.
+                        new_caption = f"{vid}: {caption_str}"
+                    else:
+                        # No agent label or it's redundant with the variant
+                        # label — fall back to the canonical id+label form.
+                        new_caption = f"{vid} — {vlabel}"
+                    gallery_images[i] = (path, new_caption)
         elif images and working_dir and not gallery_images:
+            # No variants but the interrupt payload had images (older flow
+            # or non-variant HITL gate). Show those.
             preview_paths = _convert_fits_to_preview(images, working_dir, is_linear)
             if gallery_images is None:
                 gallery_images = []
@@ -432,7 +683,7 @@ async def _stream_graph(
 
         chat_messages.append({"role": "assistant", "content": footer})
 
-        yield chat_messages, activity_log, gallery_images, variant_pool
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal
 
 
 # ── Event handlers (async generators, direct binding) ────────────────────────
@@ -455,10 +706,11 @@ async def start_session(
     activity_log: list[dict] = []
     gallery_images: list[tuple] = []
     variant_pool: list[dict] = []
+    proposal: list[dict] = []
 
     if not dataset_path or not target_name:
         chat_messages.append({"role": "assistant", "content": "Please provide both a dataset path and target name."})
-        yield chat_messages, activity_log, gallery_images, variant_pool, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
         return
 
     # Block session start if dependencies are missing (checked at app startup)
@@ -467,7 +719,7 @@ async def start_session(
             "role": "assistant",
             "content": f"**Cannot start — missing dependencies.**\n\n{_DEPENDENCY_ERROR}",
         })
-        yield chat_messages, activity_log, gallery_images, variant_pool, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
         return
 
     # Parse remove_stars dropdown value
@@ -480,7 +732,7 @@ async def start_session(
 
     thread_id = _make_thread_id(target_name)
     chat_messages.append({"role": "assistant", "content": f"Starting session **{thread_id}**\n\nIngesting dataset from `{dataset_path}`..."})
-    yield chat_messages, activity_log, gallery_images, variant_pool, state
+    yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
 
     try:
         # Apply equipment overrides from UI to os.environ
@@ -560,33 +812,20 @@ async def start_session(
         provider = os.environ.get("LLM_PROVIDER", "unknown")
         logger.info(f"Pipeline starting: model={model}, provider={provider}, thread={thread_id}")
 
-        yield chat_messages, activity_log, gallery_images, variant_pool, state
-
-        # Initialize memory if enabled — fail loud, don't start with degraded search
-        if is_memory_enabled():
-            err = _init_memory()
-            if err:
-                chat_messages.append({
-                    "role": "assistant",
-                    "content": (
-                        f"**Memory initialization failed — session cannot start.**\n\n{err}"
-                    ),
-                })
-                yield chat_messages, activity_log, gallery_images, variant_pool, state
-                return
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
 
         # Stream the graph
-        async for chat_msgs, act_log, gal_imgs, vpool in _stream_graph(
+        async for chat_msgs, act_log, gal_imgs, vpool, vprop in _stream_graph(
             _GRAPH, config, initial_state,
-            chat_messages, activity_log, gallery_images, variant_pool,
+            chat_messages, activity_log, gallery_images, variant_pool, proposal,
             working_dir, state.get("is_linear", True),
         ):
-            yield chat_msgs, act_log, gal_imgs, vpool, state
+            yield chat_msgs, act_log, gal_imgs, vpool, vprop, state
 
     except Exception as e:
         logger.exception(f"Session error: {e}")
         chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, variant_pool, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
 
 
 async def send_message(
@@ -595,17 +834,50 @@ async def send_message(
     activity_log: list[dict],
     gallery_images: list[tuple],
     variant_pool: list[dict],
+    proposal: list[dict],
     state: dict,
 ):
-    """Handle user message during HITL — resume graph with feedback."""
-    # Gradio 6 Gallery.preprocess(None) returns None for empty gallery
+    """
+    Handle a user feedback message during a HITL gate — resume the graph
+    with the typed text as the interrupt response.
+
+    Failure modes that this function explicitly handles instead of silently
+    dropping (see Issue #71 for the regression that motivated each):
+
+      * Empty / whitespace-only submit: surface a toast so the user knows
+        the click registered. Without this, users typing into a placeholder-
+        empty textbox saw the box clear with no chat-history echo and no
+        warning, indistinguishable from a successful send.
+      * No active session yet: append a chat message naming the missing
+        prerequisite. Same rationale — silent drop is worse than a noisy
+        guard rail.
+      * Streaming exception: catch and append the error to chat so the
+        human sees what went wrong and the textbox isn't permanently
+        disabled.
+
+    Note on Gradio 6 Chatbot/Textbox interaction: chat_messages is the
+    same list object across the streaming yields — _stream_graph mutates
+    it in place via _parse_stream_chunks. The user message we append on
+    line ~? therefore survives all subsequent yields; if you ever see the
+    user message disappear, look for accidental list reassignment.
+    """
+    # Gradio 6 Gallery.preprocess(None) returns None for empty gallery.
     if gallery_images is None:
         gallery_images = []
     if variant_pool is None:
         variant_pool = []
+    if proposal is None:
+        proposal = []
+    if chat_messages is None:
+        chat_messages = []
 
-    if not user_text.strip():
-        yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
+    if not user_text or not user_text.strip():
+        # Surface as a Gradio Warning toast — visible feedback that the
+        # submit fired, rather than silently clearing the textbox. Use
+        # gr.skip() for msg_input so we don't disturb whatever the user
+        # has actually typed (spaces, partial draft, etc).
+        gr.Warning("Type something before sending.", duration=3)
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
         return
 
     config = state.get("config")
@@ -613,24 +885,37 @@ async def send_message(
     is_linear = state.get("is_linear", True)
 
     if not config:
-        chat_messages.append({"role": "assistant", "content": "No active session. Start a new session first."})
-        yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
+        chat_messages.append({
+            "role": "assistant",
+            "content": "No active session. Start a new session or resume one first.",
+        })
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
         return
 
+    # Echo the user's message FIRST and clear the textbox in the SAME yield.
+    # This is the only point where we want msg_input to be overwritten —
+    # after this we use gr.skip() so background streaming yields don't
+    # clobber whatever the user starts typing next. (Bug we hit: lots of
+    # streaming chunks each yield an empty string for msg_input, which
+    # erases keystrokes mid-typing as the agent processes the previous
+    # turn in the background.)
     chat_messages.append({"role": "user", "content": user_text})
-    yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
+    yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, ""
 
     try:
-        async for chat_msgs, act_log, gal_imgs, vpool in _stream_graph(
+        async for chat_msgs, act_log, gal_imgs, vpool, vprop in _stream_graph(
             _GRAPH, config, Command(resume=user_text),
-            chat_messages, activity_log, gallery_images, variant_pool,
+            chat_messages, activity_log, gallery_images, variant_pool, proposal,
             working_dir, is_linear,
         ):
-            yield chat_msgs, act_log, gal_imgs, vpool, state, ""
+            # gr.skip() means "leave msg_input alone" — the textbox is
+            # already empty from the echo yield above; the user may have
+            # started typing their next message while we stream.
+            yield chat_msgs, act_log, gal_imgs, vpool, vprop, state, gr.skip()
     except Exception as e:
         logger.exception(f"Send message error: {e}")
-        chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
+        chat_messages.append({"role": "assistant", "content": f"Error during streaming: {e}"})
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
 
 
 async def approve_variant_action(
@@ -641,6 +926,7 @@ async def approve_variant_action(
     activity_log: list[dict],
     gallery_images: list[tuple],
     variant_pool: list[dict],
+    proposal: list[dict],
     state: dict,
 ):
     """
@@ -655,6 +941,8 @@ async def approve_variant_action(
         gallery_images = []
     if variant_pool is None:
         variant_pool = []
+    if proposal is None:
+        proposal = []
 
     config = state.get("config")
     working_dir = state.get("working_dir", "")
@@ -662,7 +950,7 @@ async def approve_variant_action(
 
     if not config:
         chat_messages.append({"role": "assistant", "content": "No active session."})
-        yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
         return
 
     # Echo the human's choice into chat for the audit trail
@@ -676,26 +964,29 @@ async def approve_variant_action(
             "role": "user",
             "content": f"Approving **{variant_id}** ({variant_label}).",
         })
-    yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
+    # Clear the textbox HERE (the rationale is now consumed/echoed).
+    # Subsequent yields use gr.skip() to leave whatever the user types
+    # next alone — see the matching note in send_message.
+    yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, ""
 
     # Clear the variant panel immediately so the user sees feedback that
     # their approval was registered before the backend finishes streaming.
     variant_pool = []
-    yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
+    yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
 
     sentinel = build_variant_approval(variant_id, rationale.strip())
 
     try:
-        async for chat_msgs, act_log, gal_imgs, vpool in _stream_graph(
+        async for chat_msgs, act_log, gal_imgs, vpool, vprop in _stream_graph(
             _GRAPH, config, Command(resume=sentinel),
-            chat_messages, activity_log, gallery_images, variant_pool,
+            chat_messages, activity_log, gallery_images, variant_pool, proposal,
             working_dir, is_linear,
         ):
-            yield chat_msgs, act_log, gal_imgs, vpool, state, ""
+            yield chat_msgs, act_log, gal_imgs, vpool, vprop, state, gr.skip()
     except Exception as e:
         logger.exception(f"Variant approve error: {e}")
         chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, variant_pool, state, ""
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, gr.skip()
 
 
 async def resume_session(
@@ -704,6 +995,7 @@ async def resume_session(
     activity_log: list[dict],
     gallery_images: list[tuple],
     variant_pool: list[dict],
+    proposal: list[dict],
     state: dict,
 ):
     """Resume a session from an existing checkpoint."""
@@ -711,37 +1003,156 @@ async def resume_session(
         gallery_images = []
     if variant_pool is None:
         variant_pool = []
+    if proposal is None:
+        proposal = []
     if not resume_id.strip():
+        # Don't clear UI state for the validation-error case — preserve
+        # whatever was on screen so the user keeps their context.
         chat_messages.append({"role": "assistant", "content": "Please enter a thread ID to resume."})
-        yield chat_messages, activity_log, gallery_images, variant_pool, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
         return
+
+    # Clear UI state from any prior session in this Gradio process before
+    # streaming the resumed thread. The chat / activity log / gallery /
+    # variant pool are session-scoped client state, not graph state — they
+    # don't get reset by LangGraph when a different thread is resumed, so
+    # without this you'd see stale messages from whatever session ran
+    # earlier in the same Gradio process. Mutate in place so the Gradio
+    # State bindings see the updated lists.
+    chat_messages.clear()
+    activity_log.clear()
+    gallery_images.clear()
+    variant_pool.clear()
+    proposal.clear()
 
     config = {"configurable": {"thread_id": resume_id}}
     recursion_limit = int(os.environ.get("RECURSION_LIMIT", "200"))
     if recursion_limit > 0:
         config["recursion_limit"] = recursion_limit
 
+    # Recover the run's working directory from the sessions index so
+    # downstream consumers (preview generation, FITS lookups, audit
+    # report writes) have the right path. Falls back to empty if the
+    # session was never registered (e.g. CLI run that didn't go through
+    # _register_session); the graph state's dataset.working_dir is the
+    # source of truth and will be present after the first super-step.
+    resumed_working_dir = _lookup_session_dir(resume_id) or ""
+
     state = {
         "thread_id": resume_id,
         "config": config,
-        "working_dir": "",
+        "working_dir": resumed_working_dir,
         "is_linear": True,
     }
 
     chat_messages.append({"role": "assistant", "content": f"Resuming session **{resume_id}**..."})
-    yield chat_messages, activity_log, gallery_images, variant_pool, state
+    yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
 
+    # Active-HITL-aware resume. Inspect the saved state BEFORE streaming.
+    # If the run was paused at an HITL gate (active_hitl=True), do NOT
+    # send a Command(resume=...) value into the graph — any value would
+    # be treated as the human's response to the pending interrupt, which
+    # silently consumes the gate (an empty string was misread as feedback,
+    # a directive-sounding string was misread as approval). Instead,
+    # re-render the gate UI from saved state so the human can take real
+    # action; the existing send_message and approve_variant_click paths
+    # then carry the actual response into the graph via Command(resume=...).
     try:
-        async for chat_msgs, act_log, gal_imgs, vpool in _stream_graph(
-            _GRAPH, config, Command(resume="Continue from checkpoint."),
-            chat_messages, activity_log, gallery_images, variant_pool,
+        snapshot = await _GRAPH.aget_state(config)
+        saved_values = snapshot.values if snapshot else {}
+        is_paused_at_hitl = bool(saved_values.get("active_hitl"))
+    except Exception as e:
+        logger.warning(f"resume_session: aget_state failed (non-fatal): {e}")
+        saved_values = {}
+        is_paused_at_hitl = False
+
+    if is_paused_at_hitl:
+        # Re-render the gate UI from saved state instead of streaming.
+        saved_pool = list(saved_values.get("variant_pool", []) or [])
+        # Reconstruct the proposal panel from presented_for_review entries.
+        # Each entry references a variant by id; resolve back to the full
+        # Variant dict from the saved pool. Same shape the live HITL
+        # payload uses — proposal_state expects [{variant, rationale,
+        # presented_at}].
+        saved_presented = list(saved_values.get("presented_for_review", []) or [])
+        pool_by_id = {v.get("id"): v for v in saved_pool if v.get("id")}
+        saved_proposal = []
+        for entry in saved_presented:
+            vid = entry.get("variant_id") if isinstance(entry, dict) else None
+            if not vid:
+                continue
+            variant = pool_by_id.get(vid)
+            if variant is None:
+                continue
+            saved_proposal.append({
+                "variant": variant,
+                "rationale": entry.get("rationale", ""),
+                "presented_at": entry.get("presented_at", ""),
+            })
+        proposal.clear()
+        proposal.extend(saved_proposal)
+        if saved_pool:
+            variant_pool.clear()
+            variant_pool.extend(saved_pool)
+            # Materialize previews so the gallery shows the variants
+            try:
+                wd = state.get("working_dir") or (
+                    saved_values.get("dataset", {}).get("working_dir", "")
+                    if isinstance(saved_values.get("dataset"), dict) else ""
+                )
+                if not wd and saved_pool:
+                    fp = saved_pool[0].get("file_path")
+                    if fp:
+                        wd = str(Path(fp).parent)
+                if wd:
+                    is_linear_resumed = bool(
+                        (saved_values.get("metrics", {}) or {}).get("is_linear_estimate", True)
+                    )
+                    paths_for_preview = [
+                        v["file_path"] for v in saved_pool if v.get("file_path")
+                    ]
+                    if paths_for_preview:
+                        preview_paths = _convert_fits_to_preview(
+                            paths_for_preview, wd, is_linear_resumed
+                        )
+                        gallery_images.clear()
+                        for v, p in zip(saved_pool, preview_paths):
+                            if Path(p).exists():
+                                gallery_images.append(
+                                    (p, f"{v['id']} — {v.get('label', '')}")
+                                )
+                    state["working_dir"] = wd
+            except Exception as e:
+                logger.warning(
+                    f"resume_session: variant preview generation failed (non-fatal): {e}"
+                )
+
+        chat_messages.append({
+            "role": "assistant",
+            "content": (
+                "**Session paused at an HITL gate.** Review the variants in "
+                "the panel and approve one (or send feedback to iterate). "
+                "Pasting the resume thread does not auto-advance — your "
+                "response is what closes the gate."
+            ),
+        })
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
+        return
+
+    # Not paused at a gate — safe to stream a continuation. Empty resume
+    # value is inert: it doesn't get treated as approval or feedback by
+    # any hitl_check path because no interrupt is currently waiting.
+    try:
+        async for chat_msgs, act_log, gal_imgs, vpool, vprop in _stream_graph(
+            _GRAPH, config, Command(resume=""),
+            chat_messages, activity_log, gallery_images, variant_pool, proposal,
             state.get("working_dir", ""), state.get("is_linear", True),
         ):
-            yield chat_msgs, act_log, gal_imgs, vpool, state
+            yield chat_msgs, act_log, gal_imgs, vpool, vprop, state
     except Exception as e:
         logger.exception(f"Resume error: {e}")
         chat_messages.append({"role": "assistant", "content": f"Error: {e}"})
-        yield chat_messages, activity_log, gallery_images, variant_pool, state
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state
 
 
 async def _check_resume_diffs(
@@ -750,6 +1161,7 @@ async def _check_resume_diffs(
     activity_log: list[dict],
     gallery_images: list[tuple],
     variant_pool: list[dict],
+    proposal: list[dict],
     state: dict,
 ):
     """
@@ -762,12 +1174,14 @@ async def _check_resume_diffs(
         gallery_images = []
     if variant_pool is None:
         variant_pool = []
+    if proposal is None:
+        proposal = []
     confirm_hidden = gr.update(visible=False)
     confirm_visible = gr.update(visible=True)
 
     if not resume_id.strip():
         chat_messages.append({"role": "assistant", "content": "Please enter a thread ID to resume."})
-        yield chat_messages, activity_log, gallery_images, variant_pool, state, confirm_hidden
+        yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, confirm_hidden
         return
 
     # Look up the original session's settings
@@ -792,7 +1206,7 @@ async def _check_resume_diffs(
                     f"or update the tabs and click **Resume** to re-check."
                 ),
             })
-            yield chat_messages, activity_log, gallery_images, variant_pool, state, confirm_visible
+            yield chat_messages, activity_log, gallery_images, variant_pool, proposal, state, confirm_visible
             return
 
     # No diffs (or no snapshot found) — proceed directly
@@ -828,30 +1242,6 @@ def _apply_ui_settings(
     os.environ["PRUNE_PHASE_ANALYSIS"] = "true" if prune_analysis else "false"
 
 
-def _init_memory() -> str | None:
-    """Initialize long-term memory store. Returns error message or None on success."""
-    from muphrid.memory.embeddings import EmbeddingInitError, init_memory_system
-
-    try:
-        settings = load_settings()
-        init_memory_system(settings, rebuild_embeddings=settings.memory_rebuild_embeddings)
-        return None
-    except EmbeddingInitError as e:
-        set_memory_enabled(False)
-        logger.error(f"Memory initialization failed: {e}")
-        return str(e)
-
-
-def _on_memory_toggle(enabled: bool):
-    """Handle memory checkbox toggle."""
-    set_memory_enabled(enabled)
-    if enabled:
-        err = _init_memory()
-        if err:
-            import gradio as gr
-            gr.Warning(f"Memory init failed: {err}")
-
-
 def _format_model_info(model_name: str) -> str:
     """Display model defaults dynamically from _MODEL_DEFAULTS config."""
     from muphrid.config import _get_model_defaults, ConfigError
@@ -872,21 +1262,18 @@ def _format_model_info(model_name: str) -> str:
 
 # ── Session settings snapshot & diff ──────────────────────────────────────────
 
-_SESSIONS_INDEX = Path.home() / ".muphrid" / "sessions.json"
-
 
 def _build_settings_snapshot() -> dict:
     """Capture current runtime settings into a dict for later diff comparison."""
     from muphrid.graph.hitl import (
-        is_autonomous, is_memory_enabled, vlm_autonomous,
+        is_autonomous, vlm_autonomous,
         vlm_window_cap, TOOL_TO_HITL, is_enabled,
     )
     return {
         "model": os.environ.get("LLM_MODEL", ""),
         "autonomous": is_autonomous(),
-        "memory": is_memory_enabled(),
         # vlm_hitl is always True (collaboration requires it). Kept in the
-        # snapshot dict for backward-compat / display.
+        # snapshot dict for display.
         "vlm_hitl": True,
         "vlm_autonomous": vlm_autonomous(),
         "vlm_retention_max_images": vlm_window_cap(),
@@ -938,28 +1325,11 @@ def _diff_settings(old: dict, new: dict) -> list[str]:
     return diffs
 
 
-def _register_session(thread_id: str, working_dir: str):
-    """Record thread_id → working_dir mapping for resume lookup."""
-    _SESSIONS_INDEX.parent.mkdir(parents=True, exist_ok=True)
-    index = {}
-    if _SESSIONS_INDEX.exists():
-        try:
-            index = json.loads(_SESSIONS_INDEX.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    index[thread_id] = working_dir
-    _SESSIONS_INDEX.write_text(json.dumps(index, indent=2))
-
-
-def _lookup_session_dir(thread_id: str) -> str | None:
-    """Look up working_dir for a thread_id from the sessions index."""
-    if not _SESSIONS_INDEX.exists():
-        return None
-    try:
-        index = json.loads(_SESSIONS_INDEX.read_text())
-        return index.get(thread_id)
-    except (json.JSONDecodeError, OSError):
-        return None
+# Session-index helpers moved to muphrid.sessions so CLI and Gradio share them.
+from muphrid.sessions import (
+    register_session as _register_session,
+    lookup_session_dir as _lookup_session_dir,
+)
 
 
 def _save_settings_snapshot(working_dir: str):
@@ -990,17 +1360,55 @@ def build_app() -> gr.Blocks:
     env_defaults = _load_processing_defaults()
     hitl_tools = hitl_defaults.get("hitl", {})
 
+    # CSS: pulsing animation for the "Agent is working" banner. The pulse is
+    # the visual signal that the agent is alive and iterating, not the UI
+    # being frozen. Background-color modulation reads better than opacity at
+    # a glance because the surrounding chrome stays at full contrast.
+    blocks_css = """
+    @keyframes muphrid-working-pulse {
+        0%, 100% { background-color: rgba(96, 156, 247, 0.08); }
+        50%      { background-color: rgba(96, 156, 247, 0.28); }
+    }
+    .muphrid-working-banner {
+        animation: muphrid-working-pulse 1.6s ease-in-out infinite;
+        padding: 0.6rem 0.9rem;
+        border-radius: 6px;
+        border: 1px solid rgba(96, 156, 247, 0.35);
+        margin-bottom: 0.4rem;
+    }
+    """
+
+    # NOTE on css placement: in Gradio 6.0+, `css` was moved from
+    # gr.Blocks() to launch(). build_app() returns the Blocks object;
+    # the caller (main()) is responsible for passing css= to launch().
+    # We attach the CSS as an attribute on the returned Blocks so
+    # main() can pick it up without having to import blocks_css.
     with gr.Blocks(title="Muphrid") as app:
+        app._muphrid_css = blocks_css  # consumed by main() at launch time
         session_state = gr.State({
             "thread_id": None,
             "config": None,
             "working_dir": "",
             "is_linear": True,
         })
-        # Per-session variant pool. Re-set fresh from each HITL payload by the
-        # streaming wrappers. The variant panel below uses @gr.render against
-        # this state to redraw approve buttons whenever the pool changes.
+        # Per-session variant pool — passive history of every variant the
+        # agent has produced this segment. Drives the read-only "Pool"
+        # panel; the agent does not have to call any tool to populate it
+        # (variant_snapshot in the graph builds it automatically).
         variant_pool_state = gr.State([])
+        # Per-session proposal — the agent's curated subset, populated only
+        # when the agent calls the `present_for_review` tool. Drives the
+        # Approve buttons. Each entry: {"variant": Variant, "rationale":
+        # str, "presented_at": str}. Empty until the agent surfaces
+        # candidates; the panel shows an explicit empty-state message in
+        # that case rather than auto-populating from the pool.
+        proposal_state = gr.State([])
+        # Boolean flag tracking whether a graph stream is currently in flight.
+        # Drives the working-banner visibility and msg_input.interactive lock.
+        # Each async-generator handler sets True on entry, False on exit
+        # (including the except path). See render_streaming_state below for
+        # the reactive bindings.
+        is_streaming_state = gr.State(False)
 
         gr.Markdown("# Muphrid")
 
@@ -1054,17 +1462,56 @@ def build_app() -> gr.Blocks:
                 with gr.Column(scale=1):
                     chatbot = gr.Chatbot(
                         label="Muphrid",
+                        value=[],  # explicit empty list — Gradio 6 Chatbot uses messages format
                         height=600,
                         buttons=["copy", "copy_all"],
                     )
-                    msg_input = gr.Textbox(
-                        placeholder="Reply, or type a rationale before approving a variant...",
-                        lines=1,
-                        max_lines=20,
-                        show_label=False,
-                        container=False,
-                        autoscroll=True,
+                    # Pulsing "agent is working" banner. Lives BETWEEN the
+                    # message list and the input textbox so it's visually
+                    # adjacent to the control it locks. This matches the
+                    # Cursor / Claude.app pattern: the "thinking…" indicator
+                    # appears just above the input, where the user's eyes
+                    # already are when they're about to type. A banner at the
+                    # top of the column reads as a header and gets ignored
+                    # while the user looks at the bottom for the typing
+                    # affordance — exactly the wrong place to put the
+                    # "stop, controls are locked" signal.
+                    working_banner = gr.Markdown(
+                        "🔄 **Agent is working** — controls are locked while it iterates. "
+                        "Tool activity is shown on the right.",
+                        visible=False,
+                        elem_classes=["muphrid-working-banner"],
                     )
+                    # ── Chat input ──────────────────────────────────────
+                    # Design notes (every detail here is a fix for an actual bug
+                    # we observed in HITL sessions, don't simplify without a
+                    # replacement plan):
+                    #
+                    #  * lines=2 + submit_btn=True: with lines=1 the textbox
+                    #    auto-submits on Enter, which silently consumed
+                    #    rationale-in-progress when the user expected Enter to
+                    #    insert a newline. Pairing lines>=2 with an explicit
+                    #    submit button matches gr.ChatInterface and the
+                    #    Cursor / Claude-coding-agent style: Enter for newline,
+                    #    button (or Shift+Enter) to send.
+                    #  * elem_id used by the variant-panel rationale binding
+                    #    so the same textbox content travels with the Approve
+                    #    click (see render_variant_panel below).
+                    with gr.Row():
+                        msg_input = gr.Textbox(
+                            placeholder=(
+                                "Reply to the agent, or type a rationale to "
+                                "record alongside an Approve click. "
+                                "Shift+Enter or click Send."
+                            ),
+                            lines=2,
+                            max_lines=20,
+                            show_label=False,
+                            container=False,
+                            autoscroll=True,
+                            submit_btn=True,
+                            scale=10,
+                        )
 
                 with gr.Column(scale=1):
                     gallery = gr.Gallery(
@@ -1083,25 +1530,25 @@ def build_app() -> gr.Blocks:
                         buttons=[],
                     )
 
-            # ── Variant approval panel ───────────────────────────────────
-            # Re-rendered whenever variant_pool_state changes. Each variant
-            # gets one Approve button; clicking it sends a structured
-            # APPROVE_VARIANT sentinel via the streaming backend. The textbox
-            # content (if any) travels along as the human's recorded rationale.
+            # ── Pool panel (read-only history) ────────────────────────────
+            # Every variant the agent has produced this segment, listed with
+            # its label and key metrics. NO Approve buttons here — this is
+            # status, not a control surface. The user can refer to variant
+            # ids in chat ("approve T14_v2 please") which the agent then
+            # actions via present_for_review.
             #
-            # Defined after both columns so all referenced components
-            # (chatbot, msg_input, activity, gallery, session_state) are in
-            # scope when the render function is invoked.
+            # The panel populates passively as the agent runs HITL-mapped
+            # tools; nothing the agent does affects this panel directly.
             with gr.Group():
                 @gr.render(inputs=variant_pool_state)
-                def render_variant_panel(variants):
+                def render_pool_panel(variants):
                     if not variants:
                         gr.Markdown(
-                            "*No variants in the pool yet — the agent will "
-                            "produce them as it iterates through this phase.*"
+                            "### Pool\n*No variants yet this segment. "
+                            "The pool fills automatically as the agent iterates.*"
                         )
                         return
-                    gr.Markdown(f"### Variants ({len(variants)})")
+                    gr.Markdown(f"### Pool ({len(variants)} variant{'s' if len(variants) != 1 else ''})")
                     for v in variants:
                         vid = v.get("id", "?")
                         label = v.get("label", "")
@@ -1112,15 +1559,78 @@ def build_app() -> gr.Blocks:
                             if val is None:
                                 continue
                             short = key.split("_")[0]
-                            if isinstance(val, float):
-                                metric_bits.append(f"{short}={val:.3f}")
-                            else:
-                                metric_bits.append(f"{short}={val}")
+                            metric_bits.append(
+                                f"{short}={val:.3f}" if isinstance(val, float) else f"{short}={val}"
+                            )
+                        metric_str = " · ".join(metric_bits)
+                        desc = f"**{vid}** — {label}"
+                        if metric_str:
+                            desc += f"  \n*{metric_str}*"
+                        gr.Markdown(desc)
+
+            # ── Proposal panel (the agent's curation, with Approve buttons) ──
+            # Driven by `proposal_state`, which the streaming layer
+            # populates from the HITLPayload's `proposal` field. The
+            # backend builds that from `state.presented_for_review`, which
+            # the agent populates only via the `present_for_review` tool.
+            #
+            # Empty until the agent calls present_for_review. The
+            # empty-state message is the explicit signal that the agent
+            # has not yet curated a candidate — the human's path forward
+            # is to chat with the agent ("which one do you recommend?")
+            # rather than reach for a UI shortcut.
+            #
+            # Each entry is a dict {"variant": Variant, "rationale": str,
+            # "presented_at": str}. Per-variant attribution: each variant
+            # shows the rationale it was presented with, so the agent's
+            # iterative reasoning is visible alongside each candidate.
+            #
+            # Approve button click chains to lock streaming, run
+            # approve_variant_action, then unlock — same pattern as
+            # msg_input.submit.
+            with gr.Group():
+                @gr.render(inputs=[proposal_state, is_streaming_state])
+                def render_proposal_panel(proposal, streaming):
+                    if streaming:
+                        gr.Markdown(
+                            "### Proposal\n*Agent is iterating — proposals will "
+                            "be available for approval when it pauses.*"
+                        )
+                        return
+                    if not proposal:
+                        gr.Markdown(
+                            "### Proposal\n*Agent hasn't surfaced anything for "
+                            "review at this gate yet. The pool above shows what "
+                            "it's been working on; chat with the agent to ask "
+                            "it to present a candidate.*"
+                        )
+                        return
+                    gr.Markdown(
+                        f"### Proposal ({len(proposal)} for review)\n"
+                        f"*The agent is asking for your input on these.*"
+                    )
+                    for entry in proposal:
+                        v = entry.get("variant", {}) or {}
+                        rationale = entry.get("rationale", "") or ""
+                        vid = v.get("id", "?")
+                        label = v.get("label", "")
+                        metrics = v.get("metrics", {}) or {}
+                        metric_bits = []
+                        for key in ("gradient_magnitude", "snr_estimate", "signal_coverage_pct"):
+                            val = metrics.get(key)
+                            if val is None:
+                                continue
+                            short = key.split("_")[0]
+                            metric_bits.append(
+                                f"{short}={val:.3f}" if isinstance(val, float) else f"{short}={val}"
+                            )
                         metric_str = " · ".join(metric_bits)
                         with gr.Row():
                             desc = f"**{vid}** — {label}"
                             if metric_str:
                                 desc += f"  \n*{metric_str}*"
+                            if rationale:
+                                desc += f"  \n> {rationale}"
                             gr.Markdown(desc)
                             btn = gr.Button(
                                 f"Approve {vid}",
@@ -1128,26 +1638,25 @@ def build_app() -> gr.Blocks:
                                 size="sm",
                                 scale=0,
                             )
-                            # Capture vid + label in a closure so each button
-                            # knows which variant it commits without needing
-                            # gr.State() instances inside the render loop —
-                            # creating fresh gr.State on every render triggers
-                            # Svelte's effect_update_depth_exceeded infinite
-                            # loop guard and freezes the entire UI.
-                            #
-                            # The closure is an async generator (matching
-                            # approve_variant_action's signature) so Gradio's
-                            # inspect-based dispatch routes it correctly.
+                            # Closure pattern (same rationale as before):
+                            # capture vid + label so each button knows
+                            # which variant it commits. Inputs include
+                            # the ratio nale textbox (msg_input) so the
+                            # human's optional typed comment travels
+                            # along as the approval rationale.
                             async def _approve(
-                                rationale, chat, act, gal, pool, sess,
+                                rationale_text, chat, act, gal, pool, prop, sess,
                                 _vid=vid, _label=label,
                             ):
                                 async for result in approve_variant_action(
-                                    _vid, _label, rationale,
-                                    chat, act, gal, pool, sess,
+                                    _vid, _label, rationale_text,
+                                    chat, act, gal, pool, prop, sess,
                                 ):
                                     yield result
                             btn.click(
+                                fn=lambda: True, inputs=None,
+                                outputs=[is_streaming_state],
+                            ).then(
                                 fn=_approve,
                                 inputs=[
                                     msg_input,
@@ -1155,6 +1664,7 @@ def build_app() -> gr.Blocks:
                                     activity,
                                     gallery,
                                     variant_pool_state,
+                                    proposal_state,
                                     session_state,
                                 ],
                                 outputs=[
@@ -1162,9 +1672,13 @@ def build_app() -> gr.Blocks:
                                     activity,
                                     gallery,
                                     variant_pool_state,
+                                    proposal_state,
                                     session_state,
                                     msg_input,
                                 ],
+                            ).then(
+                                fn=lambda: False, inputs=None,
+                                outputs=[is_streaming_state],
                             )
 
         # ── Session Notes tab ────────────────────────────────────────
@@ -1251,16 +1765,6 @@ def build_app() -> gr.Blocks:
                     "view. Active HITL gate variants are always shown in addition to "
                     "this cap."
                 ),
-            )
-            gr.Markdown("### Long-Term Memory")
-            gr.Markdown(
-                "When enabled, the agent can search past processing sessions for relevant "
-                "experience. Memories are extracted from HITL conversations after approval. "
-                "Keep OFF during debugging — only enable when agent quality is stable."
-            )
-            memory_enabled = gr.Checkbox(
-                label="Long-term memory (agent learns from past HITL sessions)",
-                value=os.environ.get("MEMORY_ENABLED", "false").lower() == "true",
             )
             gr.Markdown("### Per-tool HITL checkpoints")
             gr.Markdown("Choose where to get involved. Every tool can be toggled independently.")
@@ -1381,7 +1885,6 @@ def build_app() -> gr.Blocks:
         autonomous_mode.change(fn=lambda v: set_autonomous(v), inputs=[autonomous_mode])
         vlm_present.change(fn=lambda v: set_vlm_autonomous(v), inputs=[vlm_present])
         vlm_retention.change(fn=lambda v: set_vlm_retention_max(int(v)), inputs=[vlm_retention])
-        memory_enabled.change(fn=_on_memory_toggle, inputs=[memory_enabled])
         llm_model.change(fn=_format_model_info, inputs=[llm_model], outputs=[model_info])
 
         # Wire all HITL checkboxes — each calls set_hitl_tool_enabled on change
@@ -1392,7 +1895,29 @@ def build_app() -> gr.Blocks:
                 inputs=[cb],
             )
 
-        # Start session: apply settings first, then stream
+        # Reactive: when is_streaming flips, toggle the working banner and
+        # lock/unlock the textbox in lockstep. Doing this via a .change()
+        # listener (rather than threading the streaming flag through every
+        # handler signature) keeps the streaming handlers simple — they just
+        # flip the flag True on entry and False on exit via .then() chains.
+        is_streaming_state.change(
+            fn=lambda streaming: (
+                gr.update(visible=bool(streaming)),
+                gr.update(interactive=not bool(streaming)),
+            ),
+            inputs=[is_streaming_state],
+            outputs=[working_banner, msg_input],
+        )
+
+        # Helpers to flip the streaming flag at the start and end of each
+        # streaming binding via .then() chains. The async generators
+        # themselves don't need to know about the flag — they just run.
+        # If a generator errors, Gradio still fires the trailing .then()
+        # with the False payload, so the UI never gets stuck "locked".
+        _stream_start = lambda: True       # noqa: E731
+        _stream_end = lambda: False        # noqa: E731
+
+        # Start session: apply settings → flip streaming on → stream → flip off
         start_btn.click(
             fn=_apply_ui_settings,
             inputs=[
@@ -1403,6 +1928,8 @@ def build_app() -> gr.Blocks:
                 llm_model,
             ],
         ).then(
+            fn=_stream_start, inputs=None, outputs=[is_streaming_state],
+        ).then(
             fn=start_session,
             inputs=[
                 dataset_path, target_name, bortle_input, sqm_input,
@@ -1410,14 +1937,20 @@ def build_app() -> gr.Blocks:
                 pixel_size, sensor_type, focal_length,
                 session_state,
             ],
-            outputs=[chatbot, activity, gallery, variant_pool_state, session_state],
+            outputs=[chatbot, activity, gallery, variant_pool_state, proposal_state, session_state],
+        ).then(
+            fn=_stream_end, inputs=None, outputs=[is_streaming_state],
         )
 
-        # Direct handler binding — no wrappers
+        # User feedback during HITL: lock controls → run handler → unlock.
         msg_input.submit(
+            fn=_stream_start, inputs=None, outputs=[is_streaming_state],
+        ).then(
             fn=send_message,
-            inputs=[msg_input, chatbot, activity, gallery, variant_pool_state, session_state],
-            outputs=[chatbot, activity, gallery, variant_pool_state, session_state, msg_input],
+            inputs=[msg_input, chatbot, activity, gallery, variant_pool_state, proposal_state, session_state],
+            outputs=[chatbot, activity, gallery, variant_pool_state, proposal_state, session_state, msg_input],
+        ).then(
+            fn=_stream_end, inputs=None, outputs=[is_streaming_state],
         )
 
         # Bare Approve button is removed — approval is variant-specific via the
@@ -1432,23 +1965,30 @@ def build_app() -> gr.Blocks:
             llm_model,
         ]
 
+        # Resume (with diff-check pre-flight): apply settings → check diffs.
+        # The diff-check itself is fast and doesn't stream, so we don't lock
+        # controls for it. The actual stream happens on confirm.
         resume_btn.click(
             fn=_apply_ui_settings,
             inputs=_apply_inputs,
         ).then(
             fn=_check_resume_diffs,
-            inputs=[resume_id, chatbot, activity, gallery, variant_pool_state, session_state],
-            outputs=[chatbot, activity, gallery, variant_pool_state, session_state, confirm_resume_btn],
+            inputs=[resume_id, chatbot, activity, gallery, variant_pool_state, proposal_state, session_state],
+            outputs=[chatbot, activity, gallery, variant_pool_state, proposal_state, session_state, confirm_resume_btn],
         )
 
-        # Confirm Resume: apply settings, skip diff check, proceed directly
+        # Confirm Resume: lock controls → stream → unlock.
         confirm_resume_btn.click(
             fn=_apply_ui_settings,
             inputs=_apply_inputs,
         ).then(
+            fn=_stream_start, inputs=None, outputs=[is_streaming_state],
+        ).then(
             fn=resume_session,
-            inputs=[resume_id, chatbot, activity, gallery, variant_pool_state, session_state],
-            outputs=[chatbot, activity, gallery, variant_pool_state, session_state],
+            inputs=[resume_id, chatbot, activity, gallery, variant_pool_state, proposal_state, session_state],
+            outputs=[chatbot, activity, gallery, variant_pool_state, proposal_state, session_state],
+        ).then(
+            fn=_stream_end, inputs=None, outputs=[is_streaming_state],
         )
 
         # Initialize async resources on app load
@@ -1468,14 +2008,20 @@ def main():
     )
     app = build_app()
     app.queue()
+    # Merge build_app's component-level CSS (e.g. the working-banner pulse
+    # animation) with main()'s layout CSS. In Gradio 6.0+, css MUST be
+    # passed to launch() — the gr.Blocks(css=...) constructor parameter
+    # was removed.
+    layout_css = """
+        .gradio-container { max-width: 100% !important; padding: 0 0.5rem !important; margin: 0 !important; }
+        .main { max-width: 100% !important; }
+        .contain { max-width: 100% !important; }
+    """
+    component_css = getattr(app, "_muphrid_css", "") or ""
     app.launch(
         theme=gr.themes.Soft(primary_hue="blue"),
         allowed_paths=["/"],  # datasets can be anywhere on disk
-        css="""
-            .gradio-container { max-width: 100% !important; padding: 0 0.5rem !important; margin: 0 !important; }
-            .main { max-width: 100% !important; }
-            .contain { max-width: 100% !important; }
-        """,
+        css=layout_css + "\n" + component_css,
     )
 
 

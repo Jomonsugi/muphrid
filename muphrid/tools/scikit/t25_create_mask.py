@@ -502,6 +502,6 @@ def create_mask(
         }
 
     return Command(update={
-        "paths": {**state["paths"], "latest_mask": str(mask_output_path)},
+        "paths": {"latest_mask": str(mask_output_path)},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

@@ -96,15 +96,42 @@ def present_images(
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
     """
-    Present images for visual inspection and comparison.
+    Present contextual imagery for visual inspection — NOT for HITL approval.
+
+    Two distinct tools, two distinct intents:
+
+      * present_for_review (T39) — surface specific pool variants for
+        human approval. Approve buttons appear. Use this when you want
+        the human to weigh in on a candidate from variant_pool. The
+        variant_id you reference must exist in the pool.
+
+      * present_images (this tool) — show CONTEXT. Reference imagery,
+        before/after comparisons, cross-phase artifacts. No Approve
+        consequence. The human can see what you're showing them but
+        cannot approve it directly.
+
+    Use present_images for things that aren't in variant_pool:
+
+      * Cross-phase comparisons — e.g. the linear-stage original
+        alongside the current stretched image so the human sees the
+        effect of stretch over multiple phases.
+      * Reference imagery you've retrieved or generated for
+        benchmarking purposes.
+      * A focused side-by-side of two specific frames you want
+        the human to look at — when no approval decision is needed.
+
+    Do NOT use this tool to surface variants for approval — that's
+    what present_for_review is for. Calling present_images on a
+    variant from the pool will show the image but will NOT make it
+    approvable; the human will see something they can't act on, which
+    is exactly the confusion this two-tool split was introduced to
+    prevent.
 
     analyze_image is your primary diagnostic tool — use it first for
-    data-driven decisions. Call present_images when visual inspection
-    is needed to evaluate results that metrics alone cannot fully capture:
-    stretch character, gradient artifacts, star rendering, color balance.
-
-    Do NOT use as a default step after every tool — most decisions are
-    fully served by analyze_image data.
+    data-driven decisions. Reach for present_images only when visual
+    inspection is needed to evaluate qualitative results that metrics
+    alone cannot capture (stretch character, gradient artifacts, star
+    rendering, color balance).
     """
     valid_images: list[ImageEntry] = []
     for img in images:

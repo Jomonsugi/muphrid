@@ -127,7 +127,6 @@ muphrid process /path/to/dataset --target "M42 Orion Nebula" --bortle 5
 | `--notes "L-eNhance, gain 100"` | Context injected every step |
 | `--resume run-m42-20260311-120000` | Resume from checkpoint |
 | `--autonomous` | Skip all HITL gates |
-| `--memory` | Enable long-term memory |
 | `--db checkpoints.db` | Custom checkpoint DB path |
 
 At a HITL gate, type `a` to approve or type feedback to continue the conversation.
@@ -136,8 +135,8 @@ At a HITL gate, type `a` to approve or type feedback to continue the conversatio
 
 ### processing.toml
 
-Model selection, safety limits, per-phase tool limits, behavior flags, memory,
-and tracing. Good defaults — most users don't need to change anything here
+Model selection, safety limits, per-phase tool limits, behavior flags, and
+tracing. Good defaults — most users don't need to change anything here
 except possibly the model.
 
 ### equipment.toml
@@ -154,31 +153,6 @@ Camera and telescope specs that can't be read from file metadata.
 Controls which pipeline steps pause for human review. Four gates are enabled
 by default: gradient removal, stretch, curves, and star restoration. You can
 toggle each tool independently or enable autonomous mode to skip all gates.
-
-## Long-term memory (optional)
-
-When enabled, the agent learns from HITL sessions — what worked, what failed,
-what you preferred. Memory is off by default. Enable it in `processing.toml`
-when the agent is producing quality results:
-
-```toml
-[memory]
-enabled = true
-embedding_provider = "ollama"       # or "fastembed"
-embedding_model = "qwen3-embedding" # must match your provider
-```
-
-**Ollama** — external service, large models, best quality. Requires
-[Ollama](https://ollama.com) installed and the model pulled
-(`ollama pull qwen3-embedding`). Muphrid auto-starts the service if needed.
-
-**FastEmbed** — in-process ONNX inference, no external service. Lighter models,
-downloaded automatically on first use. Good alternative if you don't want to
-run Ollama.
-
-The embedding model is a one-time choice. Changing it requires rebuilding the
-vector index: set `rebuild_embeddings = true` in `processing.toml` (or pass
-`--rebuild-embeddings` on the CLI), then remove the flag after one run.
 
 ## Troubleshooting
 

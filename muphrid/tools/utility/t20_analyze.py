@@ -1307,7 +1307,11 @@ def analyze_image(
 
     return Command(
         update={
-            "metrics": {**state["metrics"], **metrics_update},
+            # Delta-only emit. metrics has a Replace-aware merge reducer
+            # (state.py:_dict_merge_or_replace) so this composes with
+            # whatever's already in state.metrics; parallel writers each
+            # contribute their own keys without clobbering siblings.
+            "metrics": metrics_update,
             # Replace semantics on the top-level list: pass the full new list.
             "regression_warnings": regression_warnings_next,
             # metadata uses _merge_dicts reducer — this only touches the

@@ -163,7 +163,52 @@ def _count_calibrated_files(working_dir: Path, calibrated_seq: str) -> int:
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool
+
+class CalibrateInput(BaseModel):
+    is_cfa: bool = Field(
+        description=(
+            "True for CFA (Bayer / X-Trans) sensors. Drives whether Siril "
+            "treats the raw frames as colour-mosaiced."
+        ),
+    )
+    debayer: bool = Field(
+        description=(
+            "True to debayer during calibrate. False keeps the calibrated "
+            "frames in raw CFA layout."
+        ),
+    )
+    equalize_cfa: bool = Field(
+        description=(
+            "True applies CFA equalization (master flat per-channel "
+            "balancing). Useful for OSC sensors with imbalanced flat "
+            "response."
+        ),
+    )
+    fix_xtrans: bool = Field(
+        description=(
+            "True applies the Fujifilm X-Trans dark-frame artifact fix "
+            "(replaces hot-column patterns with sigma-clipped neighbors). "
+            "Set False for Bayer sensors."
+        ),
+    )
+    cosmetic_correction: CosmeticCorrectionOptions | None = Field(
+        default=None,
+        description=(
+            "Cosmetic correction (cosme) settings. None = skip cosmetic. "
+            "Provide a CosmeticCorrectionOptions to enable hot/cold pixel "
+            "rejection during calibrate."
+        ),
+    )
+    optimize_dark: str | None = Field(
+        default=None,
+        description=(
+            "Dark optimization mode. None = no optimization (default). "
+            "'cosme' = optimize the dark scale to minimize residuals."
+        ),
+    )
+
+
+@tool(args_schema=CalibrateInput)
 def calibrate(
     is_cfa: bool,
     debayer: bool,
@@ -324,6 +369,6 @@ def calibrate(
         summary["note"] = count_mismatch_note
 
     return Command(update={
-        "paths": {**state["paths"], "calibrated_sequence": calibrated_seq},
+        "paths": {"calibrated_sequence": calibrated_seq},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

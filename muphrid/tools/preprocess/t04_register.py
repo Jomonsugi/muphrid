@@ -470,7 +470,7 @@ def _count_registered_files(working_dir: Path, registered_seq: str) -> int:
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool
+@tool(args_schema=SirilRegisterInput)
 def siril_register(
     two_pass: bool = True,
     transformation: str = "homography",
@@ -675,6 +675,6 @@ def siril_register(
         summary["note"] = count_mismatch_note
 
     return Command(update={
-        "paths": {**state["paths"], "registered_sequence": registered_seq},
+        "paths": {"registered_sequence": registered_seq},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

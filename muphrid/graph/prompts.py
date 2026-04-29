@@ -60,7 +60,7 @@ Export:
 Utility (all phases):
   analyze_image, plate_solve, pixel_math, extract_narrowband,
   resolve_target, advance_phase, rewind_phase, flag_dataset_issue,
-  memory_search
+  masked_process, hdr_composite, present_images, commit_variant
 
 ## Operating Mode
 
@@ -128,14 +128,6 @@ better next action than a reflex call.
 Do not narrate routine tool calls. Do not re-describe output that the
 tool already summarized. HITL gates fire automatically when the user
 needs to weigh in; do not prompt for approval.
-
-## Memory
-
-When memory_search is available, it provides access to learnings from
-past processing sessions. Results from HITL conversations are
-human-validated — treat them as guidance, not rigid rules. When memory
-is empty or unavailable, proceed on data and judgment. The system does
-not depend on memory.
 """.strip()
 
 

@@ -50,7 +50,7 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from muphrid.graph.state import AstroState, PhaseSnapshot, ProcessingPhase
+from muphrid.graph.state import AstroState, PhaseSnapshot, ProcessingPhase, Replace
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +283,7 @@ def rewind_phase(
     restored_warnings = copy.deepcopy(snapshot.get("regression_warnings") or [])
     restored_variants = copy.deepcopy(snapshot.get("variant_pool") or [])
     restored_visuals = copy.deepcopy(snapshot.get("visual_context") or [])
+    restored_presented = copy.deepcopy(snapshot.get("presented_for_review") or [])
 
     # Note on metadata reducer: AstroState declares metadata as
     # Annotated[Metadata, _merge_dicts]. The reducer deep-merges new into
@@ -307,6 +308,7 @@ def rewind_phase(
         state.get("messages", []), tool_call_id
     )
     working_dir = state.get("dataset", {}).get("working_dir")
+    versioned_audit_reports: list[str] = []
     if working_dir:
         try:
             _write_rewind_log(
@@ -321,6 +323,25 @@ def rewind_phase(
         except Exception as e:
             logger.warning(f"Rewind log write failed (non-fatal): {e}")
 
+        # Version the per-phase audit reports for the target phase and any
+        # phases past it: each rename preserves the abandoned attempt as
+        # NN_<phase>.v<N>.md so the new attempt can write a fresh
+        # NN_<phase>.md without losing the audit trail of what didn't work.
+        try:
+            from muphrid.tools.utility.t30_advance_phase import (
+                version_existing_audit_reports,
+            )
+            versioned_audit_reports = version_existing_audit_reports(
+                working_dir, target.value
+            )
+            if versioned_audit_reports:
+                logger.info(
+                    f"Versioned audit reports on rewind: "
+                    f"{', '.join(versioned_audit_reports)}"
+                )
+        except Exception as e:
+            logger.warning(f"Audit report versioning failed (non-fatal): {e}")
+
     was_in_hitl = bool(state.get("active_hitl"))
     result: dict = {
         "previous_phase": current.value,
@@ -330,6 +351,7 @@ def rewind_phase(
         "snapshot_captured_from_phase": snapshot.get("captured_from_phase"),
         "phase_rewind_counts": new_rewind_counts,
         "hitl_terminated": was_in_hitl,
+        "versioned_audit_reports": versioned_audit_reports,
     }
 
     logger.info(
@@ -339,12 +361,29 @@ def rewind_phase(
 
     return Command(update={
         "phase": target,
+        # paths uses _merge_dicts (not Replace-aware): restored_paths
+        # has every PathState key explicitly set, including Nones for
+        # fields that should clear, so a deep-merge against current
+        # state effectively replaces every documented field.
         "paths": restored_paths,
-        "metrics": restored_metrics,
+        # metrics uses _dict_merge_or_replace: wrap in Replace so post-
+        # snapshot keys (e.g. analyze_image results from the abandoned
+        # phases) are dropped, not merged. Without Replace, the new
+        # merge reducer would leave them lingering.
+        "metrics": Replace(restored_metrics),
+        # metadata uses _merge_dicts: restored_metadata sets the keys
+        # we want to roll back. Keys NOT in the snapshot (e.g. user
+        # bookmarks) intentionally linger across rewind so the agent
+        # can still address them on the next attempt.
         "metadata": restored_metadata,
+        # The list-valued fields use plain replace semantics (no
+        # reducer). Direct assignment fully replaces.
         "regression_warnings": restored_warnings,
         "variant_pool": restored_variants,
         "visual_context": restored_visuals,
+        # presented_for_review uses _list_extend_or_replace; wrap in
+        # Replace to fully reset to the snapshot rather than appending.
+        "presented_for_review": Replace(restored_presented),
         # Any in-flight HITL gate is dissolved by the phase change. Clear
         # the flag so the agent's next text response routes normally.
         "active_hitl": False,

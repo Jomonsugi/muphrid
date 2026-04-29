@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from muphrid.equipment import resolve_pixel_size, resolve_target_coords
 from muphrid.graph.state import AstroState
 from muphrid.tools._siril import SirilError, run_siril_script, siril_script_path
-from muphrid.tools.linear.t10_color_calibrate import _parse_plate_solve_result
+from muphrid.tools.linear.t10_color_calibrate import _read_wcs_from_fits
 
 
 # ── Pydantic input schema ──────────────────────────────────────────────────────
@@ -343,6 +343,16 @@ def plate_solve(
         blind_res=blind_res,
     )
 
+    # plate_solve produces NO durable output by default — Siril solves
+    # in memory and discards the WCS when the script exits. We need to
+    # force a save so we can read the WCS keywords (CRVAL1/CRVAL2/CD…)
+    # straight out of the FITS header via astropy. Using a unique stem
+    # under the working dir keeps the original image untouched (this is
+    # a metadata-read tool; we don't silently mutate the user's input).
+    import uuid
+    temp_stem = f"_platesolve_{uuid.uuid4().hex[:8]}"
+    temp_fits = Path(working_dir) / f"{temp_stem}.fit"
+
     script: list[str] = [f"load {img_path.stem}"]
     if findstar is not None:
         from muphrid.tools.preprocess.t04_register import (
@@ -353,12 +363,49 @@ def plate_solve(
         if fs_cmd:
             script.append(fs_cmd)
     script.append(cmd)
+    script.append(f"save {temp_stem}")
 
     try:
         result = run_siril_script(script, working_dir=working_dir, timeout=120)
-        wcs_info = _parse_plate_solve_result(result)
+
+        # The .fit suffix is Siril's default; .fits is also possible if
+        # FITS_EXTENSION is configured otherwise. Probe both.
+        if not temp_fits.exists():
+            alt = Path(working_dir) / f"{temp_stem}.fits"
+            if alt.exists():
+                temp_fits = alt
+
+        # Read the canonical WCS keywords Siril wrote to the FITS header.
+        wcs_info = _read_wcs_from_fits(temp_fits, pixel_size_um=resolved_px_um)
         fov = _parse_field_of_view(result.stdout)
         rotation = _parse_rotation(result.stdout)
+
+        if wcs_info.get("ra") is None or wcs_info.get("dec") is None:
+            # WCS read genuinely failed — surface the specific reason
+            # (FITS missing, no WCS keys present, malformed header) so
+            # the agent can see what actually went wrong.
+            failure_summary = {
+                "status": "failed",
+                "error": "plate solving completed but WCS could not be read from FITS header",
+                "wcs_read_error": wcs_info.get("wcs_read_error"),
+                "pltsolvd": wcs_info.get("pltsolvd"),
+                "input_focal_length_mm": focal_length_mm,
+                "input_pixel_size_um": resolved_px_um,
+                "resolved_coords_hint": resolved_coords,
+                "siril_stdout_tail": (result.stdout or "")[-500:],
+            }
+            return Command(update={
+                # Delta-only emit: paths/metadata reducer composes with
+                # parallel siblings; never spread the existing dict.
+                "metadata": {
+                    "plate_solve_coords": None,
+                    "pixel_scale": None,
+                },
+                "messages": [ToolMessage(
+                    content=json.dumps(failure_summary, indent=2, default=str),
+                    tool_call_id=tool_call_id,
+                )],
+            })
 
         measured_fl = wcs_info.get("measured_focal_length_mm")
         coords = {"ra": wcs_info.get("ra"), "dec": wcs_info.get("dec")}
@@ -375,6 +422,7 @@ def plate_solve(
             "input_focal_length_mm": focal_length_mm,
             "input_pixel_size_um": resolved_px_um,
             "resolved_coords_hint": resolved_coords,
+            "wcs_source": wcs_info.get("wcs_source"),
         }
 
         # Discrepancy reporting: inform if measured value differs from user input
@@ -386,8 +434,8 @@ def plate_solve(
             )
 
         return Command(update={
+            # Delta-only emit so parallel-update composition works.
             "metadata": {
-                **state["metadata"],
                 "plate_solve_coords": coords,
                 "pixel_scale": pixel_scale,
             },
@@ -406,11 +454,21 @@ def plate_solve(
                 "siril_stdout_tail": exc.result.stdout[-500:] if exc.result.stdout else None,
             }
             return Command(update={
+                # Delta-only emit so parallel-update composition works.
                 "metadata": {
-                    **state["metadata"],
                     "plate_solve_coords": None,
                     "pixel_scale": None,
                 },
                 "messages": [ToolMessage(content=json.dumps(failure_summary, indent=2, default=str), tool_call_id=tool_call_id)],
             })
         raise
+    finally:
+        # Best-effort cleanup of the temp FITS we wrote purely for WCS
+        # extraction. Failures here are non-fatal — leaving a stale
+        # _platesolve_*.fit in the working dir is mildly untidy but
+        # better than aborting the tool over an unlink permission error.
+        try:
+            if temp_fits.exists():
+                temp_fits.unlink()
+        except OSError:
+            pass

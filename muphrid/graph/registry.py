@@ -10,7 +10,10 @@ See graph_design.md §Phase Gates & Tool Groupings for the rationale.
 
 from __future__ import annotations
 
+import inspect
 from typing import get_type_hints
+
+from langchain_core.tools.base import _is_injected_arg_type
 
 from muphrid.graph.state import ProcessingPhase
 
@@ -44,6 +47,7 @@ from muphrid.tools.nonlinear.t16_curves import curves_adjust
 from muphrid.tools.nonlinear.t17_local_contrast import local_contrast_enhance
 from muphrid.tools.nonlinear.t18_saturation import saturation_adjust
 from muphrid.tools.nonlinear.t19_star_restoration import star_restoration
+from muphrid.tools.nonlinear.t38_hsv_adjust import hsv_adjust
 from muphrid.tools.scikit.t25_create_mask import create_mask
 from muphrid.tools.scikit.t26_reduce_stars import reduce_stars
 from muphrid.tools.scikit.t27_multiscale import multiscale_process
@@ -67,6 +71,7 @@ from muphrid.tools.utility.t34_masked_process import masked_process
 from muphrid.tools.utility.t35_hdr_composite import hdr_composite
 from muphrid.tools.utility.t36_rewind_phase import rewind_phase
 from muphrid.tools.utility.t37_flag_dataset_issue import flag_dataset_issue
+from muphrid.tools.utility.t39_present_for_review import present_for_review
 
 
 # ── Tool groups ───────────────────────────────────────────────────────────────
@@ -84,6 +89,7 @@ UTILITY_TOOLS = [
     hdr_composite,
     commit_variant,
     present_images,
+    present_for_review,
     # analyze_frames and create_mask used to live in ANALYSIS and NONLINEAR
     # respectively, but they are phase-agnostic diagnostics/primitives:
     #   - analyze_frames reads the registration cache; agents reach for it
@@ -97,15 +103,6 @@ UTILITY_TOOLS = [
     analyze_frames,
     create_mask,
 ]
-
-
-def register_memory_tool():
-    """Conditionally add memory_search to UTILITY_TOOLS when memory is enabled."""
-    from muphrid.graph.hitl import is_memory_enabled
-    if is_memory_enabled():
-        from muphrid.tools.utility.t33_memory_search import memory_search
-        if memory_search not in UTILITY_TOOLS:
-            UTILITY_TOOLS.append(memory_search)
 
 
 # Preprocessing: strict per-phase gating. Each step physically depends on the
@@ -155,6 +152,7 @@ NONLINEAR_TOOLS = [
     curves_adjust,
     local_contrast_enhance,
     saturation_adjust,
+    hsv_adjust,
     star_restoration,
     # create_mask moved to UTILITY_TOOLS — see that list for rationale.
     reduce_stars,
@@ -234,6 +232,95 @@ def _fix_injected_annotations() -> None:
 
 
 _fix_injected_annotations()
+
+
+def _assert_no_schema_drift() -> None:
+    """
+    Hard-fail at module import if any registered tool has schema/function drift.
+
+    The args_schema and the wrapped function signature MUST agree on every
+    non-injected parameter. When they don't:
+
+      - Pydantic validates incoming LLM args against the schema, filling in
+        defaults for every schema field (even ones the function doesn't
+        accept).
+      - LangChain then calls `func(**validated_input)`, and Python raises
+        `TypeError: <name>() got an unexpected keyword argument 'X'`.
+      - The agent sees a non-actionable error mentioning a parameter it
+        didn't pass, retries with the same args, hits the stuck-loop
+        detector, and the run aborts.
+
+    The bug is invisible to the agent and to ordinary code review (the schema
+    looks reasonable; the function looks reasonable; only the comparison
+    reveals the mismatch). Catching it on import means the system can't even
+    start with a broken tool registered — the worst-case outcome shifts from
+    "stuck loop in production" to "loud ImportError before the agent boots."
+
+    Symmetrically, if the function declares a non-injected parameter that
+    isn't in the schema, the LLM has no way to set it — also a bug, also
+    surfaced here.
+
+    Injected params (state, tool_call_id, config, runtime) are excluded from
+    both sides since they are filled by the framework, not the LLM.
+    """
+    drifts: list[str] = []
+    seen: set[str] = set()
+    injected_arg_names = {"state", "tool_call_id", "config", "runtime"}
+    for group in [CALIBRATION_TOOLS, REGISTRATION_TOOLS, ANALYSIS_TOOLS,
+                   STACKING_TOOLS, LINEAR_TOOLS, STRETCH_TOOLS,
+                   NONLINEAR_TOOLS, EXPORT_TOOLS, UTILITY_TOOLS]:
+        for t in group:
+            if t.name in seen:
+                continue
+            seen.add(t.name)
+
+            schema = getattr(t, "args_schema", None)
+            if schema is None or not inspect.isclass(schema):
+                continue
+            schema_fields = set(getattr(schema, "model_fields", {}).keys())
+
+            func = getattr(t, "func", None) or getattr(t, "coroutine", None)
+            if func is None:
+                continue
+            try:
+                hints = get_type_hints(func, include_extras=True)
+            except Exception:
+                hints = {}
+            sig = inspect.signature(func)
+            func_params: set[str] = set()
+            for name, param in sig.parameters.items():
+                if name in injected_arg_names:
+                    continue
+                # Also skip params explicitly typed as injected via Annotated.
+                ann = hints.get(name, param.annotation)
+                if _is_injected_arg_type(ann):
+                    continue
+                func_params.add(name)
+
+            schema_only = schema_fields - func_params
+            func_only = func_params - schema_fields
+            if schema_only or func_only:
+                drifts.append(
+                    f"  - {t.name}: schema-only={sorted(schema_only) or '∅'}, "
+                    f"func-only={sorted(func_only) or '∅'}"
+                )
+
+    if drifts:
+        msg = (
+            "Schema/function drift detected in registered tools. "
+            "Every @tool's args_schema fields must match its function "
+            "signature parameters (excluding injected args). When they "
+            "diverge, Pydantic fills in defaults for schema-only fields "
+            "and the function call raises TypeError — invisible to the "
+            "agent, which retries until the stuck-loop detector aborts. "
+            "Either add the missing parameter to the function signature "
+            "or remove the field from the schema.\n\nDrifting tools:\n"
+            + "\n".join(drifts)
+        )
+        raise ImportError(msg)
+
+
+_assert_no_schema_drift()
 
 
 def all_tools() -> list:

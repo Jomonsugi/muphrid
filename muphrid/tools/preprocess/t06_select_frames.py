@@ -209,7 +209,18 @@ def _select_frames(
 
 # ── LangChain tool ─────────────────────────────────────────────────────────────
 
-@tool
+
+class SelectFramesInput(BaseModel):
+    criteria: SelectionCriteria = Field(
+        description=(
+            "Frame-acceptance thresholds. See SelectionCriteria for the "
+            "available knobs (FWHM / wFWHM / roundness / star count / "
+            "background / quality sigma cutoffs)."
+        ),
+    )
+
+
+@tool(args_schema=SelectFramesInput)
 def select_frames(
     criteria: SelectionCriteria,
     tool_call_id: Annotated[str, InjectedToolCallId],
@@ -264,6 +275,6 @@ def select_frames(
         "warnings": warnings,
     }
     return Command(update={
-        "paths": {**state["paths"], "selected_frames": accepted},
+        "paths": {"selected_frames": accepted},
         "messages": [ToolMessage(content=json.dumps(result, indent=2), tool_call_id=tool_call_id)],
     })

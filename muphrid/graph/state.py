@@ -19,7 +19,14 @@ from enum import Enum
 from typing import Annotated
 
 from langgraph.graph.message import add_messages
-from typing import TypedDict
+
+# Pydantic 2.13+ requires typing_extensions.TypedDict on Python < 3.12 —
+# typing.TypedDict's runtime introspection is missing fields the schema
+# generator reads, producing "all fields missing" validation errors when
+# langchain auto-generates a tool args schema that includes AstroState
+# (e.g. on the async Gradio path). typing_extensions.TypedDict is a
+# drop-in replacement and is correct on all supported Python versions.
+from typing_extensions import TypedDict
 
 
 def _merge_dicts(old: dict, new: dict) -> dict:
@@ -31,6 +38,118 @@ def _merge_dicts(old: dict, new: dict) -> dict:
         else:
             merged[k] = v
     return merged
+
+
+# ── Replace-aware reducers ────────────────────────────────────────────────────
+#
+# Some state fields need BOTH semantics:
+#   * additive composition (so parallel tool calls each contribute their delta
+#     and none of them clobber the others), AND
+#   * full clear / replacement (so rewind_phase can reset the field to a
+#     captured snapshot, and advance_phase can wipe phase-scoped state).
+#
+# A plain dict-merge reducer only supports composition; a plain replace
+# reducer only supports clearing. The Replace sentinel below threads the
+# needle: by default the reducer composes, but when it sees Replace(value)
+# it returns value as-is, throwing away whatever was there before.
+#
+# Use Replace from clearer/restorer code paths (rewind_phase, advance_phase
+# clears, etc.). Regular tool updates should emit plain deltas — the reducer
+# composes them without losing siblings under parallel execution.
+#
+# This pattern is documented in CLAUDE.md "Tool state updates" section so
+# that future contributors don't reintroduce the {**state["X"], "k": v}
+# spread idiom that silently breaks parallel writes.
+
+# Magic key used by the Replace sentinel. Chosen to be unique enough that
+# accidental collision with a real dict key is implausible. Any dict with
+# this key set to True is treated as a Replace wrapper by the reducers.
+_REPLACE_MAGIC = "__muphrid_replace__"
+
+
+def Replace(value):  # noqa: N802 — function-style API, mirrors a constructor
+    """
+    Sentinel telling Replace-aware reducers to fully replace the field
+    with the wrapped value rather than merging.
+
+    Usage:
+        return Command(update={"metrics": Replace(restored_metrics)})
+        return Command(update={"presented_for_review": Replace([])})
+
+    Implementation note: Replace is a plain dict (`{"__muphrid_replace__":
+    True, "value": value}`), not a custom class. This matters because
+    LangGraph's checkpointer serializes intermediate writes via ormsgpack
+    BEFORE the reducer collapses them — a custom class would raise
+    `Type is not msgpack serializable`. A dict packs natively. The
+    reducers below recognize the magic key and unwrap.
+    """
+    return {_REPLACE_MAGIC: True, "value": value}
+
+
+def _is_replace(x) -> bool:
+    """True iff x is a Replace-wrapped value."""
+    return isinstance(x, dict) and x.get(_REPLACE_MAGIC) is True
+
+
+def _replace_unwrap(x):
+    """If x is a Replace wrapper, return its inner value; else return x."""
+    if _is_replace(x):
+        return x.get("value")
+    return x
+
+
+def _dict_merge_or_replace(old, new):
+    """
+    Reducer for dict-valued fields that need parallel-safe composition AND
+    explicit replacement.
+
+      * Replace(v)            → v (full replacement)
+      * dict + dict           → deep merge (additive)
+      * non-dict new          → return new (replace, matches default semantics)
+
+    Used by the `metrics` field so multiple tools can each add their own
+    keys in a single parallel super-step without stomping each other, while
+    rewind_phase can still clear and restore via Replace(snapshot).
+
+    Defensive on `old`: in normal LangGraph flow, the canonical channel
+    value is always already a real dict (with the Replace wrapper unwrapped
+    by the prior reducer pass). The unwrap here is for robustness — if a
+    sequence of updates ever produces an unexpected shape, we treat a
+    Replace-wrapped old as its inner value rather than silently dropping it.
+    """
+    old = _replace_unwrap(old)
+    if _is_replace(new):
+        return new.get("value")
+    if isinstance(new, dict) and isinstance(old, dict):
+        return _merge_dicts(old, new)
+    return new
+
+
+def _list_extend_or_replace(old, new):
+    """
+    Reducer for list-valued fields where parallel writers should accumulate
+    AND clearers (rewind_phase, advance_phase, commit_variant) need a way
+    to fully reset.
+
+      * Replace(v)            → v (full replacement)
+      * list + list           → old + new (extend, append-style)
+      * non-list new          → return new (matches default replace semantics)
+
+    Use Replace([]) to clear, Replace(snapshot) to restore.
+
+    Currently only `presented_for_review` uses this reducer. Other list
+    fields (variant_pool, visual_context, regression_warnings) have a
+    single writer per super-step that recomputes the full new list from
+    scratch — additive composition would be incorrect there. If you ever
+    add a second additive writer to one of those, switch its reducer to
+    this one.
+    """
+    old = _replace_unwrap(old)
+    if _is_replace(new):
+        return new.get("value")
+    if isinstance(new, list) and isinstance(old, list):
+        return old + new
+    return new
 
 
 # ── Processing phases ──────────────────────────────────────────────────────────
@@ -292,14 +411,15 @@ class PhaseSnapshot(TypedDict):
       captured_at        — ISO 8601 timestamp
       captured_from_phase — the phase that just ended, for diagnostics
     """
-    paths:                dict
-    metrics:              dict
-    metadata:             dict
-    regression_warnings:  list
-    variant_pool:         list
-    visual_context:       list
-    captured_at:          str
-    captured_from_phase:  str
+    paths:                  dict
+    metrics:                dict
+    metadata:               dict
+    regression_warnings:    list
+    variant_pool:           list
+    visual_context:         list
+    presented_for_review:   list  # the agent's HITL-gate curation set
+    captured_at:            str
+    captured_from_phase:    str
 
 
 class RegressionWarning(TypedDict):
@@ -394,6 +514,25 @@ class Variant(TypedDict):
     rationale:    str | None    # populated only after this variant is committed
 
 
+class PresentedVariant(TypedDict):
+    """
+    One entry in `state.presented_for_review` — a pool variant the agent
+    has explicitly surfaced for human approval at the current HITL gate.
+
+    Per-variant attribution: each call to `present_for_review` may add one
+    or more variants, each carrying the rationale the agent supplied with
+    that call. When the agent later adds more variants in a follow-up
+    call, those new entries carry their own (possibly different) rationale.
+    The UI renders each variant alongside its specific rationale so the
+    agent's evolving reasoning is visible.
+
+    Lifecycle: cleared on phase advance, variant commit, and rewind.
+    """
+    variant_id:    str           # references Variant.id in state.variant_pool
+    rationale:     str           # agent's commentary at the moment this entry was added
+    presented_at:  str           # ISO 8601
+
+
 # ── Session context (human-provided at startup) ────────────────────────────────
 
 class SessionContext(TypedDict):
@@ -460,6 +599,15 @@ class HITLPayload(TypedDict):
 
     hitl_check calls interrupt(HITLPayload) and never does I/O.
     The caller reads this payload and handles all presentation.
+
+    Two variant lists, two distinct UI surfaces:
+      * variant_pool — every variant produced this segment. Read-only
+        history; presenters render it as a "what the agent has tried"
+        panel without Approve buttons.
+      * proposal — the agent's curated subset (from
+        state.presented_for_review). Each entry pairs a Variant with the
+        rationale the agent supplied when surfacing it. Approve buttons
+        render here.
     """
     type:           str             # "data_review", "image_review", or "agent_chat"
     title:          str             # human-readable title (from hitl_config.toml)
@@ -467,7 +615,8 @@ class HITLPayload(TypedDict):
     images:         list[str]       # image paths produced by the tool (for image_review)
     context:        list            # recent messages for continuity (last N)
     agent_text:     str             # agent's response text (for multi-turn HITL display)
-    variant_pool:   list[Variant]   # variants captured during this HITL gate (for variant panel UI)
+    variant_pool:   list[Variant]   # passive history — every variant produced this segment
+    proposal:       list[dict]      # agent's curation: each item = {variant, rationale, presented_at}
 
 
 # ── Top-level graph state ──────────────────────────────────────────────────────
@@ -481,7 +630,10 @@ class AstroState(TypedDict):
     phase:      ProcessingPhase
     paths:      Annotated[PathState, _merge_dicts]
     metadata:   Annotated[Metadata, _merge_dicts]
-    metrics:    Metrics
+    # metrics uses Replace-aware deep-merge: tools emit per-call deltas
+    # and parallel writers compose without clobbering siblings;
+    # rewind_phase wraps in Replace() to fully reset on backtrack.
+    metrics:    Annotated[Metrics, _dict_merge_or_replace]
 
     # Append-only logs — use operator.add reducer so updates accumulate
     history:            Annotated[list[str],         operator.add]
@@ -499,11 +651,29 @@ class AstroState(TypedDict):
     # human can chat freely before approving or requesting revision.
     active_hitl: bool
 
-    # Variant pool — concrete results produced for the current HITL gate.
-    # Built passively as a side effect of HITL-mapped tool execution in the
-    # action node. Cleared on phase advance and on variant commit. Default
-    # LangGraph "replace" semantics: nodes return the full new list.
+    # Variant pool — passive history of every variant produced this segment.
+    # Built automatically by variant_snapshot from HITL-mapped tool execution.
+    # The UI shows this as a read-only "what has the agent tried" panel — it
+    # is NOT the approve set. Cleared on phase advance and variant commit.
+    # Default LangGraph "replace" semantics: nodes return the full new list.
     variant_pool: list[Variant]
+
+    # Presented-for-review set — the agent's explicit curation of pool
+    # entries it wants the human to weigh in on at the current HITL gate.
+    # Populated by the `present_for_review` tool (the curation gesture);
+    # NOT auto-populated. Approve buttons in the UI render from this list,
+    # not from variant_pool. Empty until the agent explicitly picks. Each
+    # entry pairs a variant_id from the pool with the rationale the agent
+    # gave when adding it (per-call attribution — multiple add-mode calls
+    # accumulate separate rationales). Cleared at the same lifecycle points
+    # as variant_pool: phase advance, variant commit, rewind.
+    #
+    # Reducer is _list_extend_or_replace so mode='add' calls compose
+    # cleanly under parallel execution, while clearer/restorer code paths
+    # use Replace([]) / Replace(snapshot) to fully reset.
+    presented_for_review: Annotated[
+        list["PresentedVariant"], _list_extend_or_replace
+    ]
 
     # Visual context — non-variant working set of images for the VLM
     # (present_images calls, phase-carry anchors). Active HITL gate variants
@@ -614,6 +784,7 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
         user_feedback={},
         active_hitl=False,
         variant_pool=[],
+        presented_for_review=[],
         visual_context=[],
         regression_warnings=[],
     )

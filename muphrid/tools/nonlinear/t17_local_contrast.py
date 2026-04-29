@@ -295,6 +295,6 @@ def local_contrast_enhance(
         }
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(output_path)},
+        "paths": {"current_image": str(output_path)},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

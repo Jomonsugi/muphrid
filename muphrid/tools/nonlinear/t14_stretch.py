@@ -98,6 +98,58 @@ class GHSOptions(BaseModel):
             "'globalrescale': rescale uniformly across all channels."
         ),
     )
+    per_channel: list["GHSChannelOverride"] | None = Field(
+        default=None,
+        description=(
+            "Per-channel parameter overrides. Must be a list of exactly 3 "
+            "entries in [R, G, B] order. When provided, the stretch runs "
+            "three sequential `ght <channel>` commands inside a single "
+            "Siril script — each channel uses its merged parameters "
+            "(channel override fields override the corresponding base "
+            "GHSOptions fields; None entries inherit). The base `channels` "
+            "field is ignored when per_channel is set. None (default) "
+            "applies a single linked stretch using the base parameters."
+        ),
+    )
+
+
+class GHSChannelOverride(BaseModel):
+    """
+    Per-channel parameter overrides for GHS. Any field left None inherits
+    from the base GHSOptions. Used as one entry in
+    GHSOptions.per_channel = [override_R, override_G, override_B].
+    """
+    stretch_amount: float | None = Field(
+        default=None,
+        description="Override D for this channel. None = inherit from base.",
+    )
+    local_intensity: float | None = Field(
+        default=None,
+        description="Override B for this channel. None = inherit from base.",
+    )
+    symmetry_point: float | None = Field(
+        default=None,
+        description="Override SP for this channel. None = inherit from base.",
+    )
+    shadow_protection: float | None = Field(
+        default=None,
+        description="Override LP for this channel. None = inherit from base.",
+    )
+    highlight_protection: float | None = Field(
+        default=None,
+        description="Override HP for this channel. None = inherit from base.",
+    )
+    color_model: str | None = Field(
+        default=None,
+        description=(
+            "Override color_model for this channel. None = inherit from base. "
+            "Rarely useful per-channel — included for completeness."
+        ),
+    )
+    clip_mode: str | None = Field(
+        default=None,
+        description="Override clip_mode for this channel. None = inherit from base.",
+    )
 
 
 class AsinhOptions(BaseModel):
@@ -185,6 +237,34 @@ class StretchImageInput(BaseModel):
 
 
 # ── Command builders ───────────────────────────────────────────────────────────
+
+def _merge_ghs_with_override(
+    base: "GHSOptions",
+    override: "GHSChannelOverride",
+    channel: str,
+) -> "GHSOptions":
+    """
+    Build a single-channel-scoped GHSOptions by merging a per-channel
+    override onto the base options. Override fields that are None inherit
+    from the base. The `channels` field is forced to the given letter
+    ('R' / 'G' / 'B') and `per_channel` is cleared on the returned copy
+    so downstream command building treats it as a normal single-channel
+    invocation.
+    """
+    def _pick(o, b):
+        return o if o is not None else b
+    return GHSOptions(
+        stretch_amount=_pick(override.stretch_amount, base.stretch_amount),
+        local_intensity=_pick(override.local_intensity, base.local_intensity),
+        symmetry_point=_pick(override.symmetry_point, base.symmetry_point),
+        shadow_protection=_pick(override.shadow_protection, base.shadow_protection),
+        highlight_protection=_pick(override.highlight_protection, base.highlight_protection),
+        color_model=_pick(override.color_model, base.color_model),
+        channels=channel,
+        clip_mode=_pick(override.clip_mode, base.clip_mode),
+        per_channel=None,
+    )
+
 
 def _build_ghs_cmd(opts: GHSOptions) -> str:
     # Siril constraint: LP must be <= SP. Clamp if the agent violated this.
@@ -340,10 +420,22 @@ def stretch_image(
     # Auto-generate suffix from parameters if not provided
     if not output_suffix or output_suffix == "stretch":
         if method == "ghs" and ghs_options is not None:
-            d = int(ghs_options.stretch_amount * 10) if ghs_options.stretch_amount else 0
-            b = int(ghs_options.local_intensity) if ghs_options.local_intensity else 0
-            sp = int(ghs_options.symmetry_point * 1000) if ghs_options.symmetry_point else 0
-            output_suffix = f"ghs_d{d}_b{b}_sp{sp:03d}"
+            if ghs_options.per_channel is not None:
+                # Per-channel suffix encodes the three D values
+                ds: list[str] = []
+                for ov in ghs_options.per_channel:
+                    d_val = (
+                        ov.stretch_amount
+                        if ov.stretch_amount is not None
+                        else ghs_options.stretch_amount
+                    )
+                    ds.append(str(int((d_val or 0) * 10)))
+                output_suffix = f"ghs_pc_d{'_'.join(ds)}"
+            else:
+                d = int(ghs_options.stretch_amount * 10) if ghs_options.stretch_amount else 0
+                b = int(ghs_options.local_intensity) if ghs_options.local_intensity else 0
+                sp = int(ghs_options.symmetry_point * 1000) if ghs_options.symmetry_point else 0
+                output_suffix = f"ghs_d{d}_b{b}_sp{sp:03d}"
         elif method == "asinh":
             sf = int(asinh_options.stretch_factor * 10) if asinh_options.stretch_factor else 0
             output_suffix = f"asinh_sf{sf}"
@@ -353,18 +445,56 @@ def stretch_image(
 
     output_stem = f"{stem}_{output_suffix}"
 
-    if method == "ghs":
-        stretch_cmd = _build_ghs_cmd(ghs_options)  # type: ignore[arg-type]
-    elif method == "asinh":
-        stretch_cmd = _build_asinh_cmd(asinh_options)
+    # Per-channel GHS path: validate the override list, then build a
+    # single Siril script that runs three sequential `ght <channel>`
+    # commands inside one load/save pair so the per-channel stretches
+    # compose in memory without intermediate disk round-trips.
+    if (
+        method == "ghs"
+        and ghs_options is not None
+        and ghs_options.per_channel is not None
+    ):
+        if len(ghs_options.per_channel) != 3:
+            raise ValueError(
+                f"ghs_options.per_channel must have exactly 3 entries "
+                f"[R, G, B]; got {len(ghs_options.per_channel)}."
+            )
+        channel_letters = ("R", "G", "B")
+        per_channel_cmds: list[str] = []
+        merged_per_channel: list[dict] = []
+        for letter, override in zip(channel_letters, ghs_options.per_channel):
+            merged = _merge_ghs_with_override(ghs_options, override, letter)
+            per_channel_cmds.append(_build_ghs_cmd(merged))
+            merged_per_channel.append({
+                "channel": letter,
+                "stretch_amount": merged.stretch_amount,
+                "local_intensity": merged.local_intensity,
+                "symmetry_point": merged.symmetry_point,
+                "shadow_protection": merged.shadow_protection,
+                "highlight_protection": merged.highlight_protection,
+                "color_model": merged.color_model,
+                "clip_mode": merged.clip_mode,
+            })
+        # Single-line summary for diagnostics; the full per-channel cmd
+        # list goes into the JSON summary below.
+        stretch_cmd = " ; ".join(per_channel_cmds)
+        commands = [f"load {stem}", *per_channel_cmds, f"save {output_stem}"]
     else:
-        stretch_cmd = _build_autostretch_cmd(autostretch_options)
+        if method == "ghs":
+            stretch_cmd = _build_ghs_cmd(ghs_options)  # type: ignore[arg-type]
+            merged_per_channel = []
+        elif method == "asinh":
+            stretch_cmd = _build_asinh_cmd(asinh_options)
+            merged_per_channel = []
+        else:
+            stretch_cmd = _build_autostretch_cmd(autostretch_options)
+            merged_per_channel = []
+        commands = [
+            f"load {stem}",
+            stretch_cmd,
+            f"save {output_stem}",
+        ]
 
-    commands = [
-        f"load {stem}",
-        stretch_cmd,
-        f"save {output_stem}",
-    ]
     result = run_siril_script(commands, working_dir=working_dir, timeout=120)
 
     output_path = Path(working_dir) / f"{output_stem}.fit"
@@ -389,9 +519,14 @@ def stretch_image(
             "shadow_protection": ghs_options.shadow_protection,
             "highlight_protection": ghs_options.highlight_protection,
             "color_model": ghs_options.color_model,
-            "channels": ghs_options.channels,
+            "channels": (
+                "per_channel" if ghs_options.per_channel is not None
+                else ghs_options.channels
+            ),
             "clip_mode": ghs_options.clip_mode,
         }
+        if ghs_options.per_channel is not None and merged_per_channel:
+            summary["ghs_per_channel_merged"] = merged_per_channel
     elif method == "asinh":
         summary["asinh_parameters"] = {
             "stretch_factor": asinh_options.stretch_factor,
@@ -407,7 +542,7 @@ def stretch_image(
         summary["stretch_stats"] = stretch_stats
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(output_path)},
+        "paths": {"current_image": str(output_path)},
         "metadata": {
             **state["metadata"],
             "pre_stretch_image": metadata.get("pre_stretch_image", state["paths"]["current_image"]),
@@ -415,22 +550,27 @@ def stretch_image(
         },
         # Stretch output is always non-linear — mark it so downstream
         # consumers (e.g. export_final) use the correct ICC source profile.
-        "metrics": {**state.get("metrics", {}), "is_linear_estimate": False},
+        # Delta-only emit; metrics has a Replace-aware merge reducer.
+        "metrics": {"is_linear_estimate": False},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })
 
 
 # ── Select variant tool ──────────────────────────────────────────────────────
 
-@tool
-def select_stretch_variant(
-    variant: Annotated[str, Field(
+class SelectStretchVariantInput(BaseModel):
+    variant: str = Field(
         description=(
             "The output_suffix of the variant to select (e.g. 'aggressive', "
             "'moderate', 'gentle'). Must match a suffix used in a previous "
             "stretch_image call."
         ),
-    )],
+    )
+
+
+@tool(args_schema=SelectStretchVariantInput)
+def select_stretch_variant(
+    variant: str,
     tool_call_id: Annotated[str, InjectedToolCallId] = None,
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
@@ -500,7 +640,7 @@ def select_stretch_variant(
         params = {}
 
     return Command(update={
-        "paths": {**state["paths"], "current_image": str(variant_path)},
+        "paths": {"current_image": str(variant_path)},
         "messages": [ToolMessage(
             content=json.dumps({
                 "selected_variant": variant,
