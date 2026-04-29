@@ -244,12 +244,30 @@ def pixel_math(
         "expression": expression,
         "auto_broadcast": auto_broadcast,
     }
+    # Pixel math is fundamentally space-agnostic — it operates on whatever
+    # value space the input images are in and produces output in the same
+    # space. The agent might use it to blend two linear masters, or to
+    # apply a mask to a stretched (display) image. Pass through the
+    # current image_space; refuse on missing state. State is the
+    # authoritative contract — see Metadata.image_space.
+    incoming_image_space = state["metadata"].get("image_space")
+    if incoming_image_space not in ("linear", "display"):
+        raise RuntimeError(
+            "pixel_math: state.metadata.image_space is missing or invalid "
+            f"(got {incoming_image_space!r}). Every writer of paths.current_image "
+            "must also write metadata.image_space; this looks like a legacy "
+            "checkpoint or a writer that skipped its bookkeeping. Refusing to "
+            "guess — restart from a fresh checkpoint."
+        )
+
+    # Delta-only paths emit; the spread used here previously was the
+    # parallel-update anti-pattern (CLAUDE.md).
     return Command(update={
         "paths": {
-            **state["paths"],
             "current_image": str(output_path),
             "previous_image": prev_current,
         },
+        "metadata": {"image_space": incoming_image_space},
         "messages": [ToolMessage(
             content=json.dumps(summary, indent=2, default=str),
             tool_call_id=tool_call_id,

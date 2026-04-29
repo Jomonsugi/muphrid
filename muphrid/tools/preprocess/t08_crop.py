@@ -221,5 +221,9 @@ def auto_crop(
 
     return Command(update={
         "paths": {"current_image": str(cropped_path)},
+        # auto_crop runs immediately after stacking — the input is linear
+        # by construction and cropping is a pixel-area operation that does
+        # not change the value space. See Metadata.image_space.
+        "metadata": {"image_space": "linear"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

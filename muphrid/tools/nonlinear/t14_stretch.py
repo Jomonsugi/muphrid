@@ -541,16 +541,38 @@ def stretch_image(
     if stretch_stats:
         summary["stretch_stats"] = stretch_stats
 
+    # `pre_stretch_image` is a one-shot capture: only set on the first
+    # stretch call, stable thereafter. We compute it here (None or path)
+    # and inline it in the dict literal below — keeping the metadata emit
+    # inspectable by the registry's structural drift check, which only
+    # walks dict literals (no name references).
+    new_pre_stretch = (
+        state["paths"]["current_image"]
+        if metadata.get("pre_stretch_image") is None
+        else metadata.get("pre_stretch_image")
+    )
+
+    # Delta-only metadata emit, ALL keys inline so the structural drift
+    # check (registry._assert_image_space_writers) can verify the
+    # image_space contract statically. The deep-merge reducer composes
+    # this with siblings; `stretch_variants` is itself a dict that the
+    # reducer merges into the existing variants map without losing prior
+    # entries. `image_space` is THE transition: stretch is the one tool
+    # that turns linear sensor-space data into display-space.
     return Command(update={
         "paths": {"current_image": str(output_path)},
         "metadata": {
-            **state["metadata"],
-            "pre_stretch_image": metadata.get("pre_stretch_image", state["paths"]["current_image"]),
-            "stretch_variants": {**_stretch_variants, output_suffix: _args_fingerprint},
+            # Stretch is THE transition: linear → display. After this
+            # point, downstream tools (export, preview generation) MUST
+            # use the display-space source profile / no-autostretch
+            # path. See Metadata.image_space — state is the
+            # authoritative contract.
+            "image_space": "display",
+            "stretch_variants": {output_suffix: _args_fingerprint},
+            "pre_stretch_image": new_pre_stretch,
         },
-        # Stretch output is always non-linear — mark it so downstream
-        # consumers (e.g. export_final) use the correct ICC source profile.
-        # Delta-only emit; metrics has a Replace-aware merge reducer.
+        # Heuristic snapshot stays diagnostic; image_space (above) is the
+        # authoritative render contract. See CLAUDE.md.
         "metrics": {"is_linear_estimate": False},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })
@@ -641,6 +663,11 @@ def select_stretch_variant(
 
     return Command(update={
         "paths": {"current_image": str(variant_path)},
+        # Selecting a stretch variant promotes a display-space artifact;
+        # the variant was produced by a previous stretch_image call which
+        # has already crossed the linear → display transition. State must
+        # reflect this so preview/export render decisions are correct.
+        "metadata": {"image_space": "display"},
         "messages": [ToolMessage(
             content=json.dumps({
                 "selected_variant": variant,

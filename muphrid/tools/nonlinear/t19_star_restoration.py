@@ -193,5 +193,9 @@ def star_restoration(
 
     return Command(update={
         "paths": {"current_image": str(output_path)},
+        # Star restoration runs in the post-stretch stage (starless +
+        # mask were both produced from a stretched image). Output is
+        # display-space. See Metadata.image_space.
+        "metadata": {"image_space": "display"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

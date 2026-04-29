@@ -1,91 +1,57 @@
-# ✨ Muphrid
+# Muphrid
 
-🔭 LLM-powered autonomous astrophotography post-processing. Point it at a dataset of
-raw frames, tell it the target and sky conditions, and it handles calibration,
-stacking, stretching, and enhancement — pausing at key decision points (stretch,
-curves, star restoration) for your review.
+*An agentic astrophotography post-processing pipeline that uses open-source image-processing tools, quantitative image analysis, and human-in-the-loop review to turn raw frames into a finished image.*
 
-## Quick Start
+![Muphrid Gradio UI — agent chat, preview, and activity log during nonlinear processing](docs/muphrid_screenshot.png)
+
+Muphrid is an experiment in giving an LLM agent the same kind of working environment a human astrophotographer uses: calibrated tools, measurements, visual inspection, checkpoints, rollback, and collaboration at subjective decision points. It orchestrates Siril, GraXpert, StarNet2, Astropy, Photutils, and scikit-image through a LangGraph agent that can calibrate, register, stack, stretch, analyze, iterate, and ask for review.
+
+The goal is not a one-click filter. The goal is a data-driven processing assistant that can try variants, compare outcomes, explain tradeoffs, and either continue autonomously or pause for human approval when taste matters.
+
+## Quickstart
+
+Prerequisites:
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- [Siril](https://siril.org) 1.4+
+- [GraXpert](https://www.graxpert.com) 3.0+
+- [StarNet2](https://www.starnetastro.com/download/)
+- ExifTool
+- An LLM API key, usually `TOGETHER_API_KEY`
 
 ```bash
-# 1. Clone and install
 git clone https://github.com/Jomonsugi/muphrid.git
 cd muphrid
-curl -LsSf https://astral.sh/uv/install.sh | sh   # if you don't have uv
 uv sync
-
-# 2. Configure
-cp .env.example .env    # then edit — see "Setup" below
-
-# 3. Launch
+cp .env.example .env
+# edit .env with binary paths and API keys
 uv run python -m muphrid
 ```
 
-Enter your dataset path and target name in the UI, click **Start Processing**.
+In the Gradio UI:
 
-## Setup
+1. Enter a dataset folder.
+2. Enter the target name, for example `M42 Orion Nebula`.
+3. Add optional context like Bortle scale, SQM reading, filter, seeing, or acquisition notes.
+4. Click **Start Processing**.
 
-### Python
+The app writes all outputs to `runs/<session-id>/`. Raw input files are never modified.
 
-Requires **Python 3.12+** and [uv](https://docs.astral.sh/uv/) for dependency management.
+## What It Does
 
-### System binaries
+- **Preprocesses raw astrophotography datasets.** Ingests RAW/FITS files, builds master calibration frames, calibrates lights, registers frames, selects frames, stacks, and auto-crops.
+- **Runs a full post-processing pipeline.** Gradient removal, color calibration, green-noise removal, denoise, deconvolution, stretch, star removal/restoration, curves, contrast, saturation, masks, star reduction, and export.
+- **Analyzes every important image state.** Uses Astropy, Photutils, wavelets, histograms, clipping metrics, background flatness, star statistics, and SNR estimates to guide decisions.
+- **Keeps a variant workbench.** At reviewable steps, the agent can create multiple variants, compare them, and deliberately present candidates for approval.
+- **Supports human-in-the-loop review.** The Gradio UI separates the passive workbench from the actionable proposal. You can ask questions, request more iteration, or approve a presented candidate.
+- **Can run fully autonomously.** Toggle autonomous mode to skip review gates and let the agent commit variants itself.
+- **Persists state.** LangGraph checkpoints allow resume, inspection, and development-time cloning of runs.
 
-Install these before running. Muphrid checks for them at startup and will
-tell you exactly what's missing and how to fix it.
+## Dataset Layout
 
-| Tool | Install | Notes |
-|------|---------|-------|
-| [Siril](https://siril.org) >= 1.4 | `brew install --cask siril` | Image processing engine |
-| [GraXpert](https://www.graxpert.com) >= 3.0 | Download from [releases](https://github.com/Steffenhir/GraXpert/releases) | AI gradient extraction and denoising |
-| [StarNet2](https://www.starnetastro.com/download/) | See setup below | Neural network star removal |
-| ExifTool >= 12 | `brew install exiftool` | EXIF metadata reader |
+Use a folder with calibration subdirectories:
 
-#### StarNet2 setup (macOS)
-
-StarNet2 is a standalone binary that needs code-signing on macOS:
-
-```bash
-# Download the MPS-accelerated build from https://www.starnetastro.com/download/
-chmod +x /path/to/starnet2
-xattr -d com.apple.quarantine /path/to/starnet2
-codesign --force --sign - /path/to/starnet2
-# If blocked: System Settings > Privacy & Security > Allow
-```
-
-### .env
-
-Copy `.env.example` to `.env` and fill in binary paths:
-
-```bash
-SIRIL_BIN=/Applications/Siril.app/Contents/MacOS/siril-cli
-GRAXPERT_BIN=/Applications/GraXpert.app/Contents/MacOS/GraXpert
-STARNET_BIN=/path/to/starnet2
-STARNET_WEIGHTS=/path/to/StarNet2_weights.pt
-```
-
-### API key
-
-The default model is **Kimi K2.5** via Together AI. Set the key in your shell
-profile or `.env`:
-
-```bash
-export TOGETHER_API_KEY=your-key-here
-```
-
-To use a different model, change `[model] default` in `processing.toml` and set
-the corresponding key:
-
-| Model | Provider | Key |
-|-------|----------|-----|
-| moonshotai/Kimi-K2.5 (default) | Together AI | `TOGETHER_API_KEY` |
-| deepseek-ai/DeepSeek-V3 | Together AI | `TOGETHER_API_KEY` |
-| claude-sonnet-4-20250514 | Anthropic | `ANTHROPIC_API_KEY` |
-| gpt-4o | OpenAI | `OPENAI_API_KEY` |
-
-## Dataset layout
-
-```
+```text
 my-dataset/
   lights/    # or light/
   darks/     # or dark/
@@ -93,89 +59,96 @@ my-dataset/
   bias/      # or biases/, bias_frames/
 ```
 
-Camera RAW (`.RAF`, `.CR2`, `.ARW`, etc.) or FITS files. Original files are never
-modified — all outputs go to a `runs/<session-id>/` folder.
+Camera RAW files (`.RAF`, `.CR2`, `.ARW`, etc.) and FITS files are supported. FITS camera metadata is read from headers when available. DSLR/mirrorless RAW files may need pixel size and sensor type in `equipment.toml`.
+
+## Installing External Tools
+
+Muphrid validates required binaries at startup and reports what is missing.
+
+| Tool | macOS install / setup | Purpose |
+|------|-----------------------|---------|
+| Siril 1.4+ | `brew install --cask siril` | Calibration, registration, stacking, background extraction |
+| GraXpert 3.0+ | Download from [GraXpert releases](https://github.com/Steffenhir/GraXpert/releases) | AI gradient extraction and denoising |
+| StarNet2 | Download from [StarNet](https://www.starnetastro.com/download/) | Star removal and restoration workflows |
+| ExifTool | `brew install exiftool` | RAW metadata extraction |
+
+StarNet2 on macOS usually needs quarantine removal and ad-hoc signing:
+
+```bash
+chmod +x /path/to/starnet2
+xattr -d com.apple.quarantine /path/to/starnet2
+codesign --force --sign - /path/to/starnet2
+```
+
+Then set paths in `.env`:
+
+```bash
+SIRIL_BIN=/Applications/Siril.app/Contents/MacOS/siril-cli
+GRAXPERT_BIN=/Applications/GraXpert.app/Contents/MacOS/GraXpert
+STARNET_BIN=/path/to/starnet2
+STARNET_WEIGHTS=/path/to/StarNet2_weights.pt
+TOGETHER_API_KEY=your-key-here
+```
 
 ## Running
 
-### Gradio (recommended)
+### Gradio UI
 
 ```bash
 uv run python -m muphrid
 ```
 
-The UI has four tabs:
-
-- **Processing** — chat, image gallery, activity log. Enter dataset path and
-  target, click Start Processing. HITL gates pause and show images in the
-  gallery — chat with the agent or click Approve to continue.
-- **Equipment** — override pixel size, sensor type, focal length (see below).
-- **HITL Config** — toggle which tools pause for review, enable autonomous mode.
-- **Model & Limits** — switch models, adjust safety limits.
-
-Resume a previous session by entering the thread ID in the Resume section.
+The UI has tabs for processing, equipment overrides, HITL configuration, and model/limit settings. Review gates pause the graph and render the agent's proposal in the UI. Chat is for questions and feedback; approval is an explicit action on presented candidates.
 
 ### CLI
 
 ```bash
-muphrid process /path/to/dataset --target "M42 Orion Nebula" --bortle 5
+uv run muphrid process /path/to/dataset --target "M42 Orion Nebula" --bortle 5
 ```
+
+Useful flags:
 
 | Flag | Description |
 |------|-------------|
 | `--sqm 20.8` | SQM-L sky quality reading |
-| `--notes "L-eNhance, gain 100"` | Context injected every step |
-| `--resume run-m42-20260311-120000` | Resume from checkpoint |
+| `--notes "L-eNhance, gain 100"` | Context injected into the agent prompt |
+| `--resume run-m42-20260429-120000` | Resume a saved checkpoint thread |
 | `--autonomous` | Skip all HITL gates |
-| `--db checkpoints.db` | Custom checkpoint DB path |
+| `--db checkpoints.db` | Custom checkpoint database |
 
-At a HITL gate, type `a` to approve or type feedback to continue the conversation.
+## Configuration
 
-## Configuration files
+| File | Purpose |
+|------|---------|
+| `.env` | Secrets and machine-specific binary paths |
+| `processing.toml` | Model selection, recursion limits, per-phase tool budgets, tracing |
+| `hitl_config.toml` | Which tools pause for review, autonomous mode defaults, VLM retention |
+| `equipment.toml` | Camera/telescope values not present in metadata |
 
-### processing.toml
+The default model is `moonshotai/Kimi-K2.5` via Together AI. Anthropic and OpenAI integrations are also wired through LangChain; change the model in `processing.toml` or through the Gradio UI and provide the corresponding API key.
 
-Model selection, safety limits, per-phase tool limits, behavior flags, and
-tracing. Good defaults — most users don't need to change anything here
-except possibly the model.
+## Project Status
 
-### equipment.toml
+This is an active research project, not a polished consumer app. The pipeline works end-to-end on development datasets, but astrophotography processing is highly data-dependent. Expect rough edges, especially around model behavior, external tool availability, and subjective aesthetic choices.
 
-Camera and telescope specs that can't be read from file metadata.
+The most mature parts of the system are:
 
-- **FITS cameras** (ZWO, QHY, etc.): pixel size and focal length are in FITS
-  headers. Leave `equipment.toml` commented out — nothing to configure.
-- **DSLR/mirrorless RAW** (`.RAF`, `.CR2`): pixel size is NOT in EXIF. Uncomment
-  and set `[camera] pixel_size_um`. X-Trans sensors also need `sensor_type = "xtrans"`.
+- the LangGraph processing loop and checkpointing model
+- phase-gated tool registry
+- image-analysis metrics
+- variant workbench and explicit HITL Review Mode
+- Gradio session resume/recovery flow
 
-### hitl_config.toml
+## Documentation
 
-Controls which pipeline steps pause for human review. Four gates are enabled
-by default: gradient removal, stretch, curves, and star restoration. You can
-toggle each tool independently or enable autonomous mode to skip all gates.
+- [ARCHITECTURE.md](ARCHITECTURE.md) - how the graph, tools, state, review mode, and processing pipeline fit together.
+- `runs/<session-id>/processing_log.md` - generated audit log for each processing run.
+- `runs/<session-id>/reports/` - generated per-phase audit reports.
 
-## Troubleshooting
+## Built With
 
-Muphrid validates all dependencies at startup. If something is missing,
-the error message tells you exactly what to install and how.
-
-| Error | Fix |
-|-------|-----|
-| siril-cli not found | Install Siril >= 1.4: `brew install --cask siril` |
-| GraXpert binary not found | Download from [GraXpert releases](https://github.com/Steffenhir/GraXpert/releases), set `GRAXPERT_BIN` in `.env` |
-| StarNet binary not found | Download, code-sign (see setup above), set `STARNET_BIN` and `STARNET_WEIGHTS` in `.env` |
-| StarNet not executable | `chmod +x /path/to/starnet2` |
-| ExifTool not found | `brew install exiftool` |
-| TOGETHER_API_KEY not set | `export TOGETHER_API_KEY=...` in your shell profile or `.env` |
-| Pixel size could not be determined | Set `pixel_size_um` in `equipment.toml` (DSLR/mirrorless only) |
-| Embedding model changed | Set `rebuild_embeddings = true` in `processing.toml`, run once, then remove the flag |
-
-### Logs
-
-Each processing run writes a `processing_log.md` to its run folder
-(`runs/<session-id>/processing_log.md`). For deeper debugging, enable
-[LangSmith](https://smith.langchain.com/) tracing in `processing.toml`.
+LangGraph, LangChain, Gradio, Siril, GraXpert, StarNet2, Astropy, Photutils, scikit-image, PyWavelets, Pydantic, Typer, SQLite.
 
 ## License
 
-GNU General Public License v3.0 — see [LICENSE](LICENSE).
+GNU General Public License v3.0. See [LICENSE](LICENSE).

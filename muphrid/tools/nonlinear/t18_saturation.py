@@ -200,5 +200,9 @@ def saturation_adjust(
 
     return Command(update={
         "paths": {"current_image": str(output_path)},
+        # Saturation adjustment is a display-stage colour boost; input is
+        # already display-space (post-stretch) and output stays in display
+        # space. See Metadata.image_space.
+        "metadata": {"image_space": "display"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

@@ -432,5 +432,9 @@ def curves_adjust(
 
     return Command(update={
         "paths": {"current_image": str(output_path)},
+        # Curves (MTF / GHT / arbitrary-points) are non-linear tonal
+        # transforms applied in display space, post-stretch. Output stays
+        # in display space. See Metadata.image_space.
+        "metadata": {"image_space": "display"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

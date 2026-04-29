@@ -57,3 +57,4 @@ checkpoints.db-wal
 *.db-wal
 .claude/
 CLAUDE.md
+BACKLOG.md

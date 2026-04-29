@@ -234,9 +234,18 @@ def _check_checkpoint_db_integrity(db_path: str) -> None:
 def _convert_fits_to_preview(
     image_paths: list[str],
     working_dir: str,
-    is_linear: bool = True,
+    is_linear: bool,
 ) -> list[str]:
-    """Convert FITS paths to displayable JPG previews. Non-FITS pass through."""
+    """
+    Convert FITS paths to displayable JPG previews. Non-FITS pass through.
+
+    `is_linear` MUST be derived from `state.metadata.image_space`, the
+    authoritative render-state contract — NOT from the diagnostic
+    `metrics.is_linear_estimate` heuristic. The caller is responsible
+    for refusing to render when image_space is missing/invalid; this
+    helper takes a strict bool and assumes the caller has resolved it.
+    See state.Metadata.image_space and CLAUDE.md.
+    """
     from muphrid.tools.utility.t22_generate_preview import generate_preview
 
     preview_paths = []
@@ -262,6 +271,28 @@ def _convert_fits_to_preview(
         else:
             preview_paths.append(img)
     return preview_paths
+
+
+def _resolve_image_space(saved_values: dict) -> str:
+    """
+    Read the authoritative image_space from a checkpoint snapshot. Refuses
+    on missing/invalid — every writer of paths.current_image must also
+    write metadata.image_space (enforced by registry._assert_image_space_writers).
+    A snapshot without image_space is a legacy checkpoint and cannot be
+    rendered faithfully. See CLAUDE.md (no-fallbacks-for-authoritative-state).
+    """
+    metadata = saved_values.get("metadata") or {}
+    image_space = metadata.get("image_space")
+    if image_space not in ("linear", "display"):
+        raise RuntimeError(
+            "Cannot resolve image_space from checkpoint snapshot "
+            f"(got {image_space!r}). The render-state contract requires "
+            "metadata.image_space to be 'linear' or 'display' so preview "
+            "generation and export choose the correct autostretch / source "
+            "profile path. This snapshot predates the image_space field — "
+            "restart from a fresh session."
+        )
+    return image_space
 
 
 def _working_dir_from_variants(variants: list[dict], fallback: str = "") -> str:
@@ -797,9 +828,9 @@ async def _stream_graph(
                 f"**{title}** — {len(proposal)} candidate"
                 f"{'s' if len(proposal) != 1 else ''} presented for review.\n\n"
                 f"---\n"
-                f"*Pick a presented candidate to commit and advance, "
-                f"or send feedback to iterate. Use the Proposal panel's "
-                f"approval note if you want to record why you approved it.*"
+                f"*Click a presented candidate image to select it, then approve "
+                f"to commit and advance. The agent's recommendation is advisory; "
+                f"you can approve any presented candidate or send feedback to iterate.*"
             )
         else:
             footer = (
@@ -861,7 +892,15 @@ async def _recover_active_hitl_ui(
         first_path = saved_pool[0].get("file_path") if isinstance(saved_pool[0], dict) else None
         if first_path:
             wd = str(Path(first_path).parent)
-    is_linear = bool((saved_values.get("metrics", {}) or {}).get("is_linear_estimate", True))
+    # State authority: read image_space directly. Refuse if missing/invalid
+    # — preview rendering must agree with the artifact at paths.current_image.
+    try:
+        image_space = _resolve_image_space(saved_values)
+    except RuntimeError as e:
+        logger.warning(f"HITL recovery preview generation skipped: {e}")
+        chat_messages.append({"role": "assistant", "content": message})
+        return True
+    is_linear = (image_space == "linear")
 
     if wd:
         try:
@@ -873,6 +912,7 @@ async def _recover_active_hitl_ui(
             )
             state["working_dir"] = wd
             state["is_linear"] = is_linear
+            state["image_space"] = image_space
         except Exception as e:
             logger.warning(f"HITL recovery preview generation failed: {e}")
 
@@ -1235,6 +1275,70 @@ def _proposal_choice_options(proposal: list[dict]) -> list[tuple[str, str]]:
     return choices
 
 
+def _caption_selects_variant(caption: str, variant_id: str) -> bool:
+    """True when a gallery caption clearly identifies a proposal variant."""
+    caption = (caption or "").strip()
+    if not caption:
+        return False
+    return (
+        caption == variant_id
+        or caption.startswith(f"{variant_id} ")
+        or caption.startswith(f"{variant_id} —")
+        or caption.startswith(f"{variant_id}:")
+    )
+
+
+def _proposal_candidate_from_gallery_selection(
+    proposal: list[dict],
+    gallery_images: list[tuple],
+    evt: gr.SelectData | None,
+) -> str | None:
+    """Map a clicked review-gallery image to an approvable proposal id."""
+    if evt is None:
+        return None
+
+    # Gradio Gallery.select reports a 0-based index for the clicked item.
+    # Be defensive: some components return tuple-ish indices for grid cells.
+    raw_index = getattr(evt, "index", None)
+    if isinstance(raw_index, (tuple, list)) and raw_index:
+        raw_index = raw_index[0]
+    if not isinstance(raw_index, int):
+        return None
+    if raw_index < 0 or raw_index >= len(gallery_images or []):
+        return None
+
+    item = gallery_images[raw_index]
+    if not isinstance(item, (tuple, list)) or len(item) < 2:
+        return None
+    caption = str(item[1] or "")
+
+    for entry in proposal or []:
+        variant = entry.get("variant") if isinstance(entry, dict) else None
+        if not isinstance(variant, dict):
+            continue
+        variant_id = variant.get("id")
+        if variant_id and _caption_selects_variant(caption, str(variant_id)):
+            return str(variant_id)
+    return None
+
+
+def select_candidate_from_gallery(
+    proposal: list[dict],
+    gallery_images: list[tuple],
+    streaming: bool,
+    evt: gr.SelectData,
+):
+    """Select the clicked proposal candidate in the stable approval dropdown."""
+    if streaming:
+        return gr.skip()
+    variant_id = _proposal_candidate_from_gallery_selection(
+        proposal, gallery_images, evt
+    )
+    if variant_id is None:
+        return gr.skip()
+    return gr.update(value=variant_id)
+
+
 def update_approval_controls(proposal: list[dict], streaming: bool):
     """
     Keep approval controls stable outside @gr.render.
@@ -1409,9 +1513,17 @@ async def resume_session(
                     if fp:
                         wd = str(Path(fp).parent)
                 if wd:
-                    is_linear_resumed = bool(
-                        (saved_values.get("metrics", {}) or {}).get("is_linear_estimate", True)
-                    )
+                    # State authority: image_space drives autostretch.
+                    # Refuse on missing/invalid — see Metadata.image_space.
+                    try:
+                        image_space_resumed = _resolve_image_space(saved_values)
+                    except RuntimeError as e:
+                        logger.warning(
+                            f"resume_session: cannot derive image_space, "
+                            f"skipping preview generation: {e}"
+                        )
+                        raise
+                    is_linear_resumed = (image_space_resumed == "linear")
                     pool_gallery_images.clear()
                     pool_gallery_images.extend(
                         _variant_gallery_items(saved_pool, wd, is_linear_resumed)
@@ -1923,8 +2035,8 @@ def build_app() -> gr.Blocks:
                         return
                     gr.Markdown(
                         f"### Proposal ({len(proposal)} for review)\n"
-                        f"*Send questions or revision requests in chat. To "
-                        f"approve, use the stable approval controls below.*"
+                        f"*Click a presented image above to select it, or choose "
+                        f"by id below. Send questions or revision requests in chat.*"
                     )
                     artifact_entry = proposal[0] if proposal else {}
                     proposal_rationale = (
@@ -1936,6 +2048,10 @@ def build_app() -> gr.Blocks:
                     summary_lines = []
                     if recommendation:
                         summary_lines.append(f"**Recommended:** `{recommendation}`")
+                        summary_lines.append(
+                            "*Recommendation is advisory; any presented candidate "
+                            "can be approved.*"
+                        )
                     if proposal_rationale:
                         summary_lines.append(f"> {proposal_rationale}")
                     if tradeoffs:
@@ -1979,7 +2095,7 @@ def build_app() -> gr.Blocks:
             with gr.Group():
                 gr.Markdown("### Approval")
                 approval_candidate = gr.Dropdown(
-                    label="Presented candidate",
+                    label="Selected candidate (click image above or choose by id)",
                     choices=[],
                     value=None,
                     interactive=False,
@@ -2237,6 +2353,11 @@ def build_app() -> gr.Blocks:
             fn=update_approval_controls,
             inputs=[proposal_state, is_streaming_state],
             outputs=[approval_candidate, approval_note, approve_candidate_btn],
+        )
+        gallery.select(
+            fn=select_candidate_from_gallery,
+            inputs=[proposal_state, gallery, is_streaming_state],
+            outputs=[approval_candidate],
         )
 
         # Helpers to flip the streaming flag at the start and end of each

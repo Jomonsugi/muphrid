@@ -675,5 +675,9 @@ def color_calibrate(
 
     return Command(update={
         "paths": {"current_image": str(output_path)},
+        # PCC/SPCC apply per-channel linear scaling (white balance) and
+        # background neutralization. Both operations are linear in pixel
+        # value space and produce linear output. See Metadata.image_space.
+        "metadata": {"image_space": "linear"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

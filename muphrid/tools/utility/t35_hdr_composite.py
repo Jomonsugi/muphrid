@@ -539,15 +539,23 @@ def hdr_composite(
         f"{final_state['paths'].get('current_image')}"
     )
 
+    # hdr_composite is a transition tool: like t14_stretch, the composite
+    # output is always display-space (both inner passes are stretches and
+    # the blend operates on their results). State authority requires we
+    # set this explicitly here — the inner subgraph nodes capture only
+    # paths from the inner Command.updates, so the inner stretch metadata
+    # does NOT propagate. See Metadata.image_space.
+    #
+    # Heuristic shadow stays in metrics (diagnostic) — image_space (above)
+    # is the authoritative render contract.
     update: dict = {
         "paths": final_state["paths"],
+        "metadata": {"image_space": "display"},
+        "metrics": {"is_linear_estimate": False},
         "messages": [ToolMessage(
             content=json.dumps(summary, indent=2, default=str),
             tool_call_id=tool_call_id,
         )],
     }
-    # Stretch passes flip is_linear via metadata. Propagate.
-    if "metadata" in final_state and final_state["metadata"] is not None:
-        update["metadata"] = final_state["metadata"]
 
     return Command(update=update)

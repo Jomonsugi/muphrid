@@ -196,6 +196,12 @@ TOOL_TO_HITL: dict[str, str] = {
     "create_mask":            "T25_mask",
     "reduce_stars":           "T26_reduce_stars",
     "multiscale_process":     "T27_multiscale",
+    # Export — gated as a final review on the actual JPG export artifact
+    # (not on a FITS-derived preview). When the gate is enabled, export_final
+    # produces the export to a tentative subdirectory; the human reviews
+    # the rendered JPG; on approval, commit_export moves the tentative
+    # files into the final output_dir.
+    "export_final":           "T24_export",
 }
 
 

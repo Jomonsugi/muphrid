@@ -189,7 +189,31 @@ class Metadata(TypedDict):
     plate_solve_coords: dict | None  # {"ra": float, "dec": float}
     focal_length_mm:    float | None
     pixel_size_um:      float | None
-    checkpoints:        dict[str, str] | None  # agent-named image state bookmarks
+
+    # Authoritative render state — what space the pipeline has put the
+    # current image into. "linear" before stretch_image runs (stack
+    # output, gradient removal, color calibration, deconvolution all
+    # preserve linear); "display" after stretch_image and through every
+    # nonlinear tool that follows.
+    #
+    # READ SITES (Gradio preview generation, export_final source-profile
+    # selection, future agent prompt) consult ONLY this field. They
+    # never fall back to metrics.is_linear_estimate, never infer from
+    # FITS HISTORY, never default to a "safe" value when missing. A
+    # missing image_space at a read site means the checkpoint predates
+    # this contract — the run refuses with a clear message rather than
+    # silently producing wrong renders.
+    #
+    # WRITERS — every tool whose Command.update writes paths.current_image
+    # MUST also write metadata.image_space. The structural drift check at
+    # registry import time refuses to start the system if any current_image
+    # writer omits it. See `muphrid.graph.registry._assert_image_space_writers`.
+    #
+    # Distinct from `metrics.is_linear_estimate`, which is analyze_image's
+    # diagnostic "what the data looks like." That stays as observation;
+    # image_space is the contract.
+    image_space:        Literal["linear", "display"]
+    checkpoints:        dict[str, dict] | None  # agent-named image state bookmarks; entries are {"path": str, "image_space": Literal["linear","display"]}
 
     # Last variant committed to current_image — set by both HITL promote_variant
     # and the autonomous commit_variant tool. Lets commit_variant detect the
@@ -222,6 +246,20 @@ class Metadata(TypedDict):
     # on its own — the agent is expected to surface that situation rather
     # than loop on rewinds.
     phase_rewind_counts: dict[str, int] | None
+
+    # Export bookkeeping — written by t24_export and t24_commit_export.
+    #   export_done       : True after a successful direct export OR after
+    #                       commit_export promotes a tentative export.
+    #   exported_files    : list of {"path", "format", "icc_profile",
+    #                       "file_size_mb"} for the final-location files.
+    #   tentative_export  : non-None while a HITL-gated tentative export
+    #                       is staged but not yet committed. Carries the
+    #                       staging dir, final dir, file list, and
+    #                       preview_jpg path so commit_export and the
+    #                       gate's preview consumer agree on the artifact.
+    export_done:        bool | None
+    exported_files:     list | None
+    tentative_export:   dict | None
 
 
 class FrameMetrics(TypedDict, total=False):
@@ -742,6 +780,10 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             plate_solve_coords=None,
             focal_length_mm=None,
             pixel_size_um=None,
+            # New runs always start in linear: ingest produces linear data,
+            # the entire preprocess + linear pipeline preserves it, only
+            # stretch_image flips this to "display". See Metadata.image_space.
+            image_space="linear",
             checkpoints=None,
             last_committed_variant=None,
             last_analysis_snapshot=None,

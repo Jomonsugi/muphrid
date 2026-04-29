@@ -51,16 +51,19 @@ from muphrid.tools.nonlinear.t38_hsv_adjust import hsv_adjust
 from muphrid.tools.scikit.t25_create_mask import create_mask
 from muphrid.tools.scikit.t26_reduce_stars import reduce_stars
 from muphrid.tools.scikit.t27_multiscale import multiscale_process
+from muphrid.tools.scikit.t41_selective_star_reblend import selective_star_reblend
+from muphrid.tools.scikit.t42_enhance_star_color import enhance_star_color
 from muphrid.tools.nonlinear.t31_checkpoint import save_checkpoint, restore_checkpoint
 
 # ── Imports: Export ───────────────────────────────────────────────────────────
 
-from muphrid.tools.utility.t24_export import export_final
+from muphrid.tools.utility.t24_export import commit_export, export_final
 
 # ── Imports: Utility (available in every gate) ────────────────────────────────
 
 from muphrid.tools.utility.t20_analyze import analyze_image
 from muphrid.tools.utility.t21_plate_solve import plate_solve
+from muphrid.tools.utility.t40_analyze_star_population import analyze_star_population
 from muphrid.tools.utility.t23_pixel_math import pixel_math
 from muphrid.tools.utility.t28_extract_narrowband import extract_narrowband
 from muphrid.tools.utility.t29_resolve_target import resolve_target
@@ -78,6 +81,7 @@ from muphrid.tools.utility.t39_present_for_review import present_for_review
 
 UTILITY_TOOLS = [
     analyze_image,
+    analyze_star_population,
     plate_solve,
     pixel_math,
     extract_narrowband,
@@ -161,12 +165,15 @@ NONLINEAR_TOOLS = [
     # create_mask moved to UTILITY_TOOLS — see that list for rationale.
     reduce_stars,
     multiscale_process,
+    selective_star_reblend,
+    enhance_star_color,
     save_checkpoint,
     restore_checkpoint,
 ]
 
 EXPORT_TOOLS = [
     export_final,
+    commit_export,
 ]
 
 
@@ -325,6 +332,164 @@ def _assert_no_schema_drift() -> None:
 
 
 _assert_no_schema_drift()
+
+
+def _assert_image_space_writers() -> None:
+    """
+    Hard-fail at module import if any tool that writes paths.current_image
+    fails to also write metadata.image_space in the SAME Command.update.
+
+    metadata.image_space is the authoritative render-state contract — the
+    Gradio preview generator and t24_export both consult it to choose the
+    autostretch / source-profile path. If a tool advances current_image
+    without also advancing image_space, downstream renders bind to a stale
+    value and produce visually different artifacts than what the human
+    approved at the HITL gate. State must always describe the artifact
+    paths.current_image points at; the only way to enforce that across
+    contributors is structural.
+
+    Static scope (deliberate trade-off):
+
+      - The check parses each registered tool's source via `ast` and looks
+        for `Command(update=<dict-literal>)` calls. When the literal's
+        "paths" entry is itself a dict literal containing a "current_image"
+        key, the same Command.update payload MUST also have a "metadata"
+        entry that is a dict literal containing an "image_space" key.
+
+      - Compound tools that emit `final_state["paths"]` (where the value
+        is a name reference, not a dict literal) are NOT caught by this
+        check because they don't carry a literal "current_image" key —
+        but they MUST emit `metadata.image_space` as a delta themselves
+        (see t34_masked_process and t35_hdr_composite for the worked
+        examples). That part is enforced by code review and the doctrine
+        in CLAUDE.md.
+
+      - Restore branches that conditionally write paths in one branch
+        and metadata in another (see t31_checkpoint) are caught only if
+        the branches happen to be in the same Command.update call — they
+        always are by construction in this codebase.
+
+    The check is intentionally over-strict on `paths.current_image`
+    literals: we do not allow the writer to skip the image_space emit
+    even when the value is "obviously" linear or display. State authority
+    is the contract; per-call re-assertion is the implementation.
+    """
+    import ast
+    import textwrap
+
+    drifts: list[str] = []
+    seen: set[str] = set()
+
+    def _has_key(d: ast.Dict, key: str) -> bool:
+        for k in d.keys:
+            if isinstance(k, ast.Constant) and k.value == key:
+                return True
+        return False
+
+    def _get_value(d: ast.Dict, key: str) -> ast.expr | None:
+        for k, v in zip(d.keys, d.values):
+            if isinstance(k, ast.Constant) and k.value == key:
+                return v
+        return None
+
+    for group in [CALIBRATION_TOOLS, REGISTRATION_TOOLS, ANALYSIS_TOOLS,
+                   STACKING_TOOLS, LINEAR_TOOLS, STRETCH_TOOLS,
+                   NONLINEAR_TOOLS, EXPORT_TOOLS, UTILITY_TOOLS]:
+        for t in group:
+            if t.name in seen:
+                continue
+            seen.add(t.name)
+
+            func = getattr(t, "func", None) or getattr(t, "coroutine", None)
+            if func is None:
+                continue
+            try:
+                src = inspect.getsource(func)
+            except (OSError, TypeError):
+                continue
+            try:
+                tree = ast.parse(textwrap.dedent(src))
+            except SyntaxError:
+                continue
+
+            for node in ast.walk(tree):
+                # Looking for Command(update=<dict-literal>) calls.
+                if not isinstance(node, ast.Call):
+                    continue
+                func_node = node.func
+                if not (isinstance(func_node, ast.Name) and func_node.id == "Command"):
+                    continue
+                update_kw = next(
+                    (kw for kw in node.keywords if kw.arg == "update"),
+                    None,
+                )
+                if update_kw is None or not isinstance(update_kw.value, ast.Dict):
+                    continue
+                update_dict: ast.Dict = update_kw.value
+
+                # Does this update have "paths" → dict literal with "current_image"?
+                paths_val = _get_value(update_dict, "paths")
+                if not isinstance(paths_val, ast.Dict):
+                    continue
+                if not _has_key(paths_val, "current_image"):
+                    continue
+
+                # Now require "metadata" → dict literal with "image_space".
+                metadata_val = _get_value(update_dict, "metadata")
+                ok = (
+                    isinstance(metadata_val, ast.Dict)
+                    and _has_key(metadata_val, "image_space")
+                )
+                if not ok:
+                    # Report the metadata value's AST type so we can
+                    # distinguish "no metadata key at all" from "metadata
+                    # is a variable name" (the bug pattern that bit us
+                    # in t14_stretch — `"metadata": metadata_delta`
+                    # rather than an inline dict literal).
+                    if metadata_val is None:
+                        kind = "no 'metadata' key in update payload"
+                    elif isinstance(metadata_val, ast.Name):
+                        kind = (
+                            f"'metadata' value is a name reference "
+                            f"({metadata_val.id!r}), not a dict literal — "
+                            f"the static check can't verify it. Inline "
+                            f"the image_space emit instead of building it "
+                            f"in a variable."
+                        )
+                    elif isinstance(metadata_val, ast.Dict):
+                        kind = (
+                            "'metadata' is a dict literal but missing "
+                            "'image_space' key"
+                        )
+                    else:
+                        kind = (
+                            f"'metadata' value is {type(metadata_val).__name__} "
+                            f"(not a dict literal)"
+                        )
+                    try:
+                        src_file = inspect.getsourcefile(func) or "<unknown>"
+                    except TypeError:
+                        src_file = "<unknown>"
+                    drifts.append(
+                        f"  - {t.name} ({src_file}, near line {node.lineno}): "
+                        f"{kind}"
+                    )
+
+    if drifts:
+        msg = (
+            "image_space writer-drift detected. metadata.image_space is the "
+            "authoritative render-state contract: Gradio preview and "
+            "t24_export both key off it to choose autostretch / ICC source "
+            "profile. Every tool that advances paths.current_image must "
+            "also advance metadata.image_space — either to a literal "
+            "'linear' / 'display', or by reading state.metadata.image_space "
+            "and emitting it back (preserve writers).\n\nViolators:\n"
+            + "\n".join(drifts)
+        )
+        raise ImportError(msg)
+
+
+_assert_image_space_writers()
 
 
 def all_tools() -> list:

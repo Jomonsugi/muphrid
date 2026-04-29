@@ -158,6 +158,15 @@ class ReduceStarsInput(BaseModel):
         default=None,
         description="Output FITS stem. Defaults to '{source_stem}_reduced_stars'.",
     )
+    star_mask_path: str | None = Field(
+        default=None,
+        description=(
+            "Path to a star-mask FITS to use as the star region. "
+            "None (default): tool reads paths.star_mask from state if set; "
+            "otherwise auto-thresholds luminance at detection_threshold. "
+            "An explicit path overrides state and the auto-threshold."
+        ),
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -189,9 +198,31 @@ def _compute_luminance(data: np.ndarray) -> np.ndarray:
 
 
 def _load_mask_channel(mask_path: Path) -> np.ndarray:
-    """Load a single-channel float32 mask FITS, return (H, W) boolean."""
+    """
+    Load a mask FITS as (H, W) boolean.
+
+    StarNet emits color (3, H, W) masks when the input is RGB; mono inputs
+    yield (H, W) or singleton-leading shapes. Collapse multi-channel masks
+    to per-pixel luminance before thresholding so a pixel counts as "star"
+    when any channel carries star contribution.
+    """
     with astropy_fits.open(mask_path) as hdul:
-        mask_data = hdul[0].data.astype(np.float32).squeeze()
+        mask_data = hdul[0].data.astype(np.float32)
+
+    # Strip singleton dims (e.g. (1, H, W) → (H, W)).
+    mask_data = np.squeeze(mask_data)
+
+    if mask_data.ndim == 3:
+        if mask_data.shape[0] == 3:
+            mask_data = _compute_luminance(mask_data)
+        elif mask_data.shape[2] == 3:
+            mask_data = _compute_luminance(np.moveaxis(mask_data, -1, 0))
+        else:
+            raise ValueError(
+                f"Unexpected mask shape {mask_data.shape} at {mask_path}; "
+                "expected (H, W) or (3, H, W) / (H, W, 3)."
+            )
+
     if mask_data.max() > 1.0:
         mask_data = mask_data / mask_data.max()
     return mask_data > 0.5
@@ -242,6 +273,7 @@ def reduce_stars(
     label_connectivity: int = 2,
     feather_px: int = 3,
     output_stem: str | None = None,
+    star_mask_path: str | None = None,
     tool_call_id: Annotated[str, InjectedToolCallId] = None,
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
@@ -361,7 +393,23 @@ def reduce_stars(
         },
     }
 
+    # Erosion is a morphological operation that preserves value space —
+    # output stays in whatever image_space the input was. The intended
+    # use (post-T19, pre-export) is display, but state authority means
+    # we read and pass through. Refuse on missing state. See
+    # Metadata.image_space.
+    incoming_image_space = state["metadata"].get("image_space")
+    if incoming_image_space not in ("linear", "display"):
+        raise RuntimeError(
+            "reduce_stars: state.metadata.image_space is missing or invalid "
+            f"(got {incoming_image_space!r}). Every writer of paths.current_image "
+            "must also write metadata.image_space; this looks like a legacy "
+            "checkpoint or a writer that skipped its bookkeeping. Refusing to "
+            "guess — restart from a fresh checkpoint."
+        )
+
     return Command(update={
         "paths": {"current_image": str(out_path)},
+        "metadata": {"image_space": incoming_image_space},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

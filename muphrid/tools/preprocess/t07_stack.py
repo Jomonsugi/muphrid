@@ -610,5 +610,8 @@ def siril_stack(
 
     return Command(update={
         "paths": {"current_image": str(master_path)},
+        # Stacking integrates linear frames into a linear master. image_space
+        # is the authoritative render-state contract; see Metadata.image_space.
+        "metadata": {"image_space": "linear"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

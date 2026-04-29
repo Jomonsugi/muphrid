@@ -225,13 +225,33 @@ def star_removal(
         ),
     }
 
+    # Star removal preserves image_space: the operation splits an image into
+    # (starless, mask) but each output is in the same value space as the
+    # input. The documented contract is that t15 runs post-stretch, so the
+    # input should be display-space — but state is the authoritative
+    # contract, so pass through whatever the input claims to be. State
+    # missing image_space is a legacy/broken checkpoint; refuse rather
+    # than guess. See Metadata.image_space.
+    incoming_image_space = state["metadata"].get("image_space")
+    if incoming_image_space not in ("linear", "display"):
+        raise RuntimeError(
+            "star_removal: state.metadata.image_space is missing or invalid "
+            f"(got {incoming_image_space!r}). Every writer of paths.current_image "
+            "must also write metadata.image_space; this looks like a legacy "
+            "checkpoint or a writer that skipped its bookkeeping. Refusing to "
+            "guess — restart from a fresh checkpoint."
+        )
+
+    # Delta-only paths emit; the spread used here previously was the
+    # parallel-update anti-pattern (CLAUDE.md). Each key is only named if
+    # this tool changes it.
     return Command(update={
         "paths": {
-            **state["paths"],
             "current_image": str(starless_fits),
             "previous_image": prev_current,
             "starless_image": str(starless_fits),
             "star_mask": mask_fits_path,
         },
+        "metadata": {"image_space": incoming_image_space},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

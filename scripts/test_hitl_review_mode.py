@@ -383,6 +383,22 @@ def test_commit_variant_blocked_by_review_session() -> None:
     check("commit_variant blocked by explicit review_session", "review_session_requires_human_approval" in content)
 
 
+def test_tool_run_budget_helpers() -> None:
+    state = base_state()
+    session = review_ctl.make_review_session(
+        state=state,
+        hitl_key="T14_stretch",
+        tool_name="stretch_image",
+        status="awaiting_agent_response",
+    )
+    first = review_ctl.increment_tool_runs_since_human(session)
+    second = review_ctl.increment_tool_runs_since_human(first)
+    check("tool-run helper increments counter", review_ctl.tool_runs_since_human(second) == 2)
+    check("tool-run limit not reached below cap", not review_ctl.silent_tool_limit_reached(second, 3))
+    check("tool-run limit reached at cap", review_ctl.silent_tool_limit_reached(second, 2))
+    check("disabled tool-run limit never trips", not review_ctl.silent_tool_limit_reached(second, 0))
+
+
 def main() -> int:
     print("HITL Review Mode smoke tests")
     test_typed_events()
@@ -394,6 +410,7 @@ def main() -> int:
     test_visible_answer_required_before_tools()
     test_visible_answer_with_tool_calls_is_allowed()
     test_commit_variant_blocked_by_review_session()
+    test_tool_run_budget_helpers()
     if _failures:
         print(f"\n{len(_failures)} failure(s): {', '.join(_failures)}")
         return 1

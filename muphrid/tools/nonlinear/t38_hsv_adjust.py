@@ -348,6 +348,9 @@ def hsv_adjust(
 
     return Command(update={
         "paths": {"current_image": str(output_path)},
+        # HSV adjust is a perceptual-space colour edit applied post-stretch;
+        # input and output are both display space. See Metadata.image_space.
+        "metadata": {"image_space": "display"},
         "messages": [ToolMessage(
             content=json.dumps(summary, indent=2, default=str),
             tool_call_id=tool_call_id,

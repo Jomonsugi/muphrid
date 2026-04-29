@@ -132,6 +132,31 @@ def close_review_session(
     return updated
 
 
+def tool_runs_since_human(review_session: dict | None) -> int:
+    """Return the explicit HITL tool-run counter for an open review session."""
+    if not isinstance(review_session, dict):
+        return 0
+    return int(review_session.get("tool_runs_since_human", 0) or 0)
+
+
+def increment_tool_runs_since_human(
+    review_session: dict | None,
+    *,
+    status: str = "awaiting_agent_response",
+) -> ReviewSession | None:
+    """Return review_session with its post-human HITL tool-run counter bumped."""
+    return update_review_session(
+        review_session,
+        status=status,
+        tool_runs_since_human=tool_runs_since_human(review_session) + 1,
+    )
+
+
+def silent_tool_limit_reached(review_session: dict | None, limit: int) -> bool:
+    """True when HITL tool runs since human feedback meet the configured cap."""
+    return limit > 0 and tool_runs_since_human(review_session) >= limit
+
+
 def empty_proposal(now: str | None = None) -> ReviewProposal:
     """Empty proposal artifact."""
     return ReviewProposal(

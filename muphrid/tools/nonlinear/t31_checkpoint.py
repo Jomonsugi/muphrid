@@ -92,18 +92,43 @@ def save_checkpoint(
             )],
         })
 
+    # State authority: a checkpoint must record the image_space alongside
+    # the path so restore can fully reconstitute the render contract. If
+    # state's image_space is missing, this is a legacy checkpoint or a
+    # writer that skipped its bookkeeping — refuse rather than silently
+    # snapshot unknown render state. See Metadata.image_space.
+    incoming_image_space = state.get("metadata", {}).get("image_space")
+    if incoming_image_space not in ("linear", "display"):
+        raise RuntimeError(
+            "save_checkpoint: state.metadata.image_space is missing or invalid "
+            f"(got {incoming_image_space!r}). Every writer of paths.current_image "
+            "must also write metadata.image_space; this looks like a legacy "
+            "checkpoint or a writer that skipped its bookkeeping. Refusing to "
+            "guess — restart from a fresh checkpoint."
+        )
+
     existing = state.get("metadata", {}).get("checkpoints") or {}
-    updated = {**existing, name: current_image}
+    # Each entry is {"path": str, "image_space": "linear"|"display"}.
+    # Delta-only emit: the deep-merge reducer composes with siblings.
+    entry = {"path": current_image, "image_space": incoming_image_space}
+    updated = {**existing, name: entry}
 
     summary = {
         "saved": name,
         "image": Path(current_image).name,
+        "image_space": incoming_image_space,
         "overwritten": name in existing,
-        "all_checkpoints": {k: Path(v).name for k, v in updated.items()},
+        "all_checkpoints": {
+            k: {
+                "image": Path(v["path"]).name if isinstance(v, dict) else Path(v).name,
+                "image_space": v["image_space"] if isinstance(v, dict) else "<legacy>",
+            }
+            for k, v in updated.items()
+        },
     }
 
     return Command(update={
-        "metadata": {"checkpoints": updated},
+        "metadata": {"checkpoints": {name: entry}},
         "messages": [ToolMessage(
             content=json.dumps(summary, indent=2),
             tool_call_id=tool_call_id,
@@ -156,7 +181,27 @@ def restore_checkpoint(
             )],
         })
 
-    restore_path = checkpoints[name]
+    # Each checkpoint entry is now {"path": str, "image_space": "linear"|"display"}.
+    # A bare-string entry is a legacy checkpoint (pre-image_space-authority)
+    # — refuse to restore rather than guess the image_space. State is the
+    # authoritative contract; legacy entries cannot satisfy it.
+    entry = checkpoints[name]
+    if not isinstance(entry, dict) or "path" not in entry or "image_space" not in entry:
+        raise RuntimeError(
+            f"restore_checkpoint: checkpoint '{name}' is in legacy format "
+            f"(got {type(entry).__name__}: {entry!r}). The new format records "
+            "{'path': str, 'image_space': 'linear'|'display'} so render-state "
+            "is reconstituted faithfully. This thread predates the change — "
+            "restart from a fresh checkpoint, or re-save the bookmark with "
+            "save_checkpoint."
+        )
+    if entry["image_space"] not in ("linear", "display"):
+        raise RuntimeError(
+            f"restore_checkpoint: checkpoint '{name}' has invalid image_space "
+            f"({entry['image_space']!r}). Expected 'linear' or 'display'."
+        )
+    restore_path = entry["path"]
+    restore_image_space = entry["image_space"]
     if not Path(restore_path).exists():
         return Command(update={
             "messages": [ToolMessage(
@@ -185,9 +230,16 @@ def restore_checkpoint(
     summary = {
         "restored": name,
         "current_image": Path(restore_path).name,
+        "image_space": restore_image_space,
         "previous_image": Path(prev_current).name if prev_current else None,
         "noop": noop,
-        "all_checkpoints": {k: Path(v).name for k, v in checkpoints.items()},
+        "all_checkpoints": {
+            k: {
+                "image": Path(v["path"]).name if isinstance(v, dict) else Path(v).name,
+                "image_space": v["image_space"] if isinstance(v, dict) else "<legacy>",
+            }
+            for k, v in checkpoints.items()
+        },
     }
     if noop:
         summary["note"] = (
@@ -205,15 +257,27 @@ def restore_checkpoint(
     # Clear them so the next analyze_image establishes a fresh baseline
     # against the restored state. The noop case leaves everything as-is
     # (no state actually changed).
+    # Restore writes BOTH the path and the image_space so state stays
+    # internally consistent — render decisions key off image_space and
+    # the previously-active value would lie about the restored artifact.
+    # Even on noop we re-assert image_space so a stale or out-of-band
+    # value cannot persist.
     update: dict = {
         "paths": {"current_image": restore_path},
+        "metadata": {"image_space": restore_image_space},
         "messages": [ToolMessage(
             content=json.dumps(summary, indent=2),
             tool_call_id=tool_call_id,
         )],
     }
     if not noop:
+        # Real restore — clear stale analysis bookkeeping. Merge
+        # last_analysis_snapshot=None into the metadata delta so the
+        # deep-merge reducer carries both updates through.
         update["regression_warnings"] = []
-        update["metadata"] = {"last_analysis_snapshot": None}
+        update["metadata"] = {
+            "image_space": restore_image_space,
+            "last_analysis_snapshot": None,
+        }
 
     return Command(update=update)

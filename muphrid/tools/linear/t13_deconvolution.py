@@ -507,5 +507,10 @@ def deconvolution(
 
     return Command(update={
         "paths": {"current_image": str(output_path), "pre_decon_image": str(original_image_path)},
+        # Richardson-Lucy / Wiener deconvolution is only valid on linear,
+        # photon-count-proportional data (see module docstring CONSTRAINTS).
+        # The operation preserves linearity — it inverts a convolution in the
+        # same value space. See Metadata.image_space.
+        "metadata": {"image_space": "linear"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

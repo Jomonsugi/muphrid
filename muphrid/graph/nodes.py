@@ -2001,29 +2001,13 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
             # review event using explicit review_session state. When the
             # count reaches the limit, ask the agent to curate and explain
             # the current pool before it keeps experimenting.
-            #
-            # EXTRACTION TRIGGER (intentionally inline today; tracked in
-            # CLAUDE.md "Controller modules" doctrine):
-            # If you find yourself writing a `tool_runs_since_human`-shaped
-            # counter or a similar "N events since last human signal"
-            # backstop ANYWHERE ELSE — autonomous-mode budget, a different
-            # gate type, a different policy concern — extract these two
-            # lines into helpers in `graph/review.py` first:
-            #     increment_tool_runs_since_human(session) -> ReviewSession
-            #     silent_tool_limit_reached(session, env_var) -> bool
-            # The pattern (counter + env-driven limit + curation routing
-            # on trip) repeats cleanly. The inline form here is fine for
-            # one writer; a second writer means it's time to extract.
             import os
-            session = state.get("review_session") or {}
-            tool_count = int(session.get("tool_runs_since_human", 0) or 0) + 1
             silent_limit = int(os.environ.get("MAX_SILENT_HITL_TOOLS", "3"))
-            updated_session = review_ctl.update_review_session(
-                session,
-                status="awaiting_agent_response",
-                tool_runs_since_human=tool_count,
+            updated_session = review_ctl.increment_tool_runs_since_human(
+                state.get("review_session"),
             )
-            if silent_limit > 0 and tool_count >= silent_limit:
+            tool_count = review_ctl.tool_runs_since_human(updated_session)
+            if review_ctl.silent_tool_limit_reached(updated_session, silent_limit):
                 logger.warning(
                     f"HITL tool-run backstop tripped: {tool_count} "
                     f"HITL-mapped tools have run since the latest human "

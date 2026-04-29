@@ -296,5 +296,10 @@ def local_contrast_enhance(
 
     return Command(update={
         "paths": {"current_image": str(output_path)},
+        # Local-contrast enhancements (CLAHE, unsharp, wavelet, EPF) live
+        # in the nonlinear/display stage by convention — they sharpen
+        # human-perceptible detail. Output stays in display space.
+        # See Metadata.image_space.
+        "metadata": {"image_space": "display"},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

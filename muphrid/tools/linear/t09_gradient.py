@@ -425,11 +425,17 @@ def remove_gradient(
     }
 
     return Command(update={
+        # Delta-only emit — paths reducer is _merge_dicts, so listing the
+        # two keys we change composes correctly with parallel siblings.
+        # The ` **state["paths"]` spread that used to be here was the
+        # parallel-clobber anti-pattern documented in CLAUDE.md.
         "paths": {
-            **state["paths"],
             "current_image": str(processed_path),
             "pre_gradient_image": str(original_image_path),
         },
+        # Gradient removal subtracts a smooth model from the linear data
+        # and produces linear output. See Metadata.image_space.
+        "metadata": {"image_space": "linear"},
         "messages": [ToolMessage(
             content=json.dumps(summary, indent=2, default=str),
             tool_call_id=tool_call_id,

@@ -453,7 +453,25 @@ def multiscale_process(
         ],
     }
 
+    # Multiscale linear transform is a wavelet-based per-scale decompose +
+    # reconstruct; it preserves the value space of the input. The agent
+    # may invoke it pre- or post-stretch (sharpening on linear deconv'd
+    # data, or detail-shaping on display-space starless). Pass through
+    # the current image_space; refuse on missing state. State is the
+    # authoritative contract — see Metadata.image_space.
+    incoming_image_space = state["metadata"].get("image_space")
+    if incoming_image_space not in ("linear", "display"):
+        raise RuntimeError(
+            "multiscale_process: state.metadata.image_space is missing or "
+            f"invalid (got {incoming_image_space!r}). Every writer of "
+            "paths.current_image must also write metadata.image_space; "
+            "this looks like a legacy checkpoint or a writer that skipped "
+            "its bookkeeping. Refusing to guess — restart from a fresh "
+            "checkpoint."
+        )
+
     return Command(update={
         "paths": {"current_image": str(out_path)},
+        "metadata": {"image_space": incoming_image_space},
         "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
     })

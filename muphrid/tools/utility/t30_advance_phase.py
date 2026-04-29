@@ -712,21 +712,19 @@ def _scan_hitl_conversations(messages: list, phase_start: int) -> list[dict]:
                     "agent_messages_during_gate": [],
                 }
                 conversations.append(current)
-            # Detect approval-sentinel content
-            if content.startswith("__APPROVE_VARIANT__"):
-                payload = content[len("__APPROVE_VARIANT__"):].strip()
-                try:
-                    data = json.loads(payload)
-                    current["approval_kind"] = "variant"
-                    current["variant_id"] = data.get("id")
-                    current["rationale"] = data.get("rationale", "")
-                except Exception:
-                    pass
-            elif content.startswith("__APPROVE__"):
+            # Typed Review Mode approval events are rendered into explicit
+            # model-visible HumanMessages by hitl_check/promote_variant. Read
+            # that narrative for audit reporting; do not support legacy
+            # sentinel-string approval parsing here.
+            if content.startswith("HUMAN APPROVED"):
                 current["approval_kind"] = "bare"
-                note = content[len("__APPROVE__"):].strip()
-                if note:
-                    current["rationale"] = note
+                for line in content.splitlines():
+                    if line.startswith("Approved:"):
+                        current["approval_kind"] = "variant"
+                        approved = line[len("Approved:"):].strip()
+                        current["variant_id"] = approved.split(" ", 1)[0] or None
+                    elif line.startswith("Rationale:"):
+                        current["rationale"] = line[len("Rationale:"):].strip() or None
             else:
                 current["human_messages"].append(content)
             continue

@@ -409,9 +409,27 @@ def masked_process(
             tool_call_id=tool_call_id,
         )],
     }
-    # Propagate any metadata changes the inner tool made (e.g. is_linear
-    # flips after stretch_image runs as the inner tool).
-    if "metadata" in final_state and final_state["metadata"] is not None:
-        update["metadata"] = final_state["metadata"]
+    # Propagate image_space from the inner subgraph: the inner tool wrote
+    # its image_space into the subgraph state, and the blend (pixel_math)
+    # preserved it. State authority demands we re-emit it as a delta on
+    # the outer Command.update — without this, the outer state's
+    # image_space would not reflect what the inner tool produced. Refuse
+    # if the subgraph state's image_space is invalid (legacy/missing
+    # writer). See Metadata.image_space.
+    final_image_space = final_state.get("metadata", {}).get("image_space")
+    if final_image_space not in ("linear", "display"):
+        raise RuntimeError(
+            "masked_process: inner subgraph produced no valid metadata.image_space "
+            f"(got {final_image_space!r}). The inner tool should set image_space "
+            "in its Command.update; this looks like a writer that skipped its "
+            "bookkeeping."
+        )
+    metadata_delta: dict = {"image_space": final_image_space}
+    # If the inner subgraph also flipped diagnostic metrics (e.g. inner
+    # was stretch_image), surface that too so it survives at the parent.
+    inner_metrics = final_state.get("metrics") or {}
+    if "is_linear_estimate" in inner_metrics:
+        update["metrics"] = {"is_linear_estimate": inner_metrics["is_linear_estimate"]}
+    update["metadata"] = metadata_delta
 
     return Command(update=update)
