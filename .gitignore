@@ -50,11 +50,19 @@ test_images/
 manual_pipeline_output/
 
 # Runtime artifacts
+.langgraph_api/
+# LangGraph / SQLite checkpoint DB and sidecars
 checkpoints.db
 checkpoints.db-shm
 checkpoints.db-wal
 *.db-shm
 *.db-wal
+*.db-journal
+checkpoints.db.corrupt-*
+# Session outputs (under dataset dir or repo root)
+runs/
+# Gradio local cache/flag dir
+.gradio/
 .claude/
 CLAUDE.md
 BACKLOG.md
