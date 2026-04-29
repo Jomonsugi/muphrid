@@ -106,6 +106,15 @@ class AnalyzeStarPopulationInput(BaseModel):
             "always reflect the full detected population (post-cap)."
         ),
     )
+    write_sidecar: bool = Field(
+        default=True,
+        description=(
+            "When true, write the full ranked source table to "
+            "working_dir/star_population_<image_stem>.json and include the "
+            "path in the ToolMessage. Keeps chat output small while preserving "
+            "the full catalog for inspection."
+        ),
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -208,6 +217,7 @@ def analyze_star_population(
     chroma_sample_mode: str = "annulus",
     score_mode: str = "brightness_priority",
     return_table_rows: int = 50,
+    write_sidecar: bool = True,
     tool_call_id: Annotated[str, InjectedToolCallId] = None,
     state: Annotated[AstroState, InjectedState] = None,
 ) -> Command:
@@ -309,6 +319,8 @@ def analyze_star_population(
         chroma = np.array(chroma_list, dtype=np.float32)
 
     score = _compose_score(peaks, chroma, score_mode)
+    if score.size and float(score.max()) > 0.0:
+        score = score / (float(score.max()) + 1e-9)
 
     # Cap by score.
     if len(score) > max_sources:
@@ -328,8 +340,7 @@ def analyze_star_population(
             "p90": float(np.percentile(arr, 90)),
         }
 
-    table_n = min(return_table_rows, len(score))
-    table = [
+    full_table = [
         {
             "x": float(xs[order[i]]),
             "y": float(ys[order[i]]),
@@ -339,8 +350,17 @@ def analyze_star_population(
             "chroma": float(chroma[order[i]]),
             "score": float(score[order[i]]),
         }
-        for i in range(table_n)
+        for i in range(len(order))
     ]
+    table_n = min(return_table_rows, len(full_table))
+    table = full_table[:table_n]
+
+    sidecar_path: str | None = None
+    if write_sidecar:
+        working_dir = state["dataset"]["working_dir"]
+        sidecar = Path(working_dir) / f"star_population_{img_path.stem}.json"
+        sidecar.write_text(json.dumps(full_table, indent=2, default=str))
+        sidecar_path = str(sidecar)
 
     payload = {
         "count": int(len(score)),
@@ -360,6 +380,7 @@ def analyze_star_population(
             int(c) for c in np.histogram(score, bins=10, range=(0.0, 1.0))[0]
         ],
         "top_sources_by_score": table,
+        "source_catalog_path": sidecar_path,
     }
 
     return Command(update={

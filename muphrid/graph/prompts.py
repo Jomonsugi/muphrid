@@ -51,6 +51,7 @@ Stretch (linear → nonlinear crossing):
 Nonlinear processing (display space):
   star_removal, curves_adjust, local_contrast_enhance, saturation_adjust,
   star_restoration, create_mask, reduce_stars, multiscale_process,
+  analyze_star_population, selective_star_reblend, enhance_star_color,
   masked_process, hsv_adjust, hdr_composite,
   save_checkpoint, restore_checkpoint
 
@@ -297,6 +298,12 @@ When a global operation would damage part of the frame, use
 masked_process with a create_mask that isolates where the operation
 should apply.
 
+For expert star treatment, use the star tools as a workflow rather than
+a single blunt adjustment: star_removal creates starless + star mask;
+analyze_star_population measures the source population; selective_star_reblend
+can keep only the highest-ranked bright/colorful sources while suppressing
+the rest; enhance_star_color can tune the star contribution's saturation.
+
 Advance when the picture matches what the data can support and the
 user has approved via HITL (when not autonomous). Any outstanding
 regression warnings will be captured into the phase log alongside the
@@ -308,7 +315,10 @@ message if you're deliberately accepting a tradeoff.
 ## Current Phase: Export
 
 Convert the finished image to distribution formats via export_final.
-Advance when the export files exist.
+If final export HITL review is enabled, export_final stages the files
+for approval and the backend commits them after human approval. Do not
+try to promote an exported JPG/TIF/JXL as the working image. Advance
+when export_done is true and the export files exist.
 """.strip(),
 
     ProcessingPhase.REVIEW: """

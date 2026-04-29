@@ -247,7 +247,7 @@ class Metadata(TypedDict):
     # than loop on rewinds.
     phase_rewind_counts: dict[str, int] | None
 
-    # Export bookkeeping — written by t24_export and t24_commit_export.
+    # Export bookkeeping — written by t24_export and backend export approval.
     #   export_done       : True after a successful direct export OR after
     #                       commit_export promotes a tentative export.
     #   exported_files    : list of {"path", "format", "icc_profile",

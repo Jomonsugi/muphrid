@@ -57,7 +57,7 @@ from muphrid.tools.nonlinear.t31_checkpoint import save_checkpoint, restore_chec
 
 # ── Imports: Export ───────────────────────────────────────────────────────────
 
-from muphrid.tools.utility.t24_export import commit_export, export_final
+from muphrid.tools.utility.t24_export import export_final
 
 # ── Imports: Utility (available in every gate) ────────────────────────────────
 
@@ -173,7 +173,6 @@ NONLINEAR_TOOLS = [
 
 EXPORT_TOOLS = [
     export_final,
-    commit_export,
 ]
 
 

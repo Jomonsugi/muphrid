@@ -156,3 +156,20 @@ title   = "T26 Star Reduction"
 enabled = false
 type    = "image_review"
 title   = "T27 Multiscale Sharpening"
+
+[hitl.T41_selective_star_reblend]
+enabled = false
+type    = "image_review"
+title   = "T41 Selective Star Reblend"
+
+[hitl.T42_enhance_star_color]
+enabled = false
+type    = "image_review"
+title   = "T42 Enhance Star Color"
+
+# ── Export ───────────────────────────────────────────────────────────────────
+
+[hitl.T24_export]
+enabled = true
+type    = "image_review"
+title   = "T24 Final Export Review"

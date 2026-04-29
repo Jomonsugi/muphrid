@@ -253,7 +253,8 @@ def _convert_fits_to_preview(
         p = Path(img)
         if p.suffix.lower() in (".fit", ".fits", ".fts"):
             preview_dir = Path(working_dir) / "previews"
-            expected = preview_dir / f"preview_{p.stem}.jpg"
+            render_mode = "linear_autostretch" if is_linear else "display_faithful"
+            expected = preview_dir / f"preview_{p.stem}_{render_mode}.jpg"
             if expected.exists():
                 preview_paths.append(str(expected))
             else:
@@ -572,7 +573,10 @@ def _parse_stream_chunks(
                         result = json.loads(result_text)
                         files = result.get("exported_files", [])
                         if files:
-                            lines = ["**Pipeline complete — output files written:**", ""]
+                            if result.get("tentative"):
+                                lines = ["**Export staged for final review:**", ""]
+                            else:
+                                lines = ["**Pipeline complete — output files written:**", ""]
                             for f in files:
                                 size_mb = f.get("file_size_mb", "?")
                                 fmt = f.get("format", "?")
@@ -2242,6 +2246,10 @@ def build_app() -> gr.Blocks:
             _hitl_cb("T25_mask", "T25 Mask Creation")
             _hitl_cb("T26_reduce_stars", "T26 Star Reduction")
             _hitl_cb("T27_multiscale", "T27 Multiscale Sharpening")
+            _hitl_cb("T41_selective_star_reblend", "T41 Selective Star Reblend")
+            _hitl_cb("T42_enhance_star_color", "T42 Enhance Star Color")
+            gr.Markdown("**Export**")
+            _hitl_cb("T24_export", "T24 Final Export Review", default=True)
 
         # ── Model & Limits tab ───────────────────────────────────────
         with gr.Tab("Model & Limits"):

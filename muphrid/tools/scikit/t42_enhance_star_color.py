@@ -12,14 +12,11 @@ mask is restored.
 
 Backend: pure numpy + Astropy + skimage.color. No Siril.
 
-Note on composition: this tool produces a new current_image directly.
-It does not modify paths.star_mask on disk — a subsequent call to
-selective_star_reblend reads the original mask and re-detects on it,
-independent of any prior color-boost. To get tier-suppressed AND
-color-boosted output, run enhance_star_color first (its output is the
-boosted full-restoration), then run selective_star_reblend (which will
-build its own weight map; its output replaces enhance_star_color's
-current_image).
+Note on composition: this standalone tool produces a full-restoration
+current_image with boosted star color. It does not modify paths.star_mask
+on disk. For a single pass that both suppresses selected star populations
+and preserves/boosts color, use selective_star_reblend with
+star_saturation_multiplier instead.
 """
 
 from __future__ import annotations

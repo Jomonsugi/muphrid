@@ -214,6 +214,83 @@ def test_export_picks_correct_source_profile() -> None:
     )
 
 
+def test_export_review_is_system_owned() -> None:
+    """
+    Final export review must be system-owned: export_final derives tentative
+    staging from T24_export HITL policy, commit_export is not model-bound, and
+    backend commit updates metadata without mutating paths.current_image.
+    """
+    print("\n[4b] export review is system-owned")
+
+    from muphrid.graph.registry import tools_for_phase
+    from muphrid.graph.state import ProcessingPhase
+    from muphrid.tools.utility import t24_export
+
+    src = inspect_source(t24_export.export_final.func)
+    check(
+        "export_final derives tentative from T24_export",
+        'is_enabled("T24_export")' in src and "effective_tentative" in src,
+    )
+
+    export_tool_names = {t.name for t in tools_for_phase(ProcessingPhase.EXPORT)}
+    check(
+        "commit_export not model-bound in export phase",
+        "commit_export" not in export_tool_names,
+        f"tools={sorted(export_tool_names)}",
+    )
+
+    wd = tempfile.mkdtemp(prefix="backend_commit_")
+    final_dir = Path(wd) / "export"
+    staging = final_dir / ".tentative_master"
+    staging.mkdir(parents=True)
+    jpg = staging / "master_web.jpg"
+    jpg.write_bytes(b"jpg")
+    state = {
+        "dataset": {"working_dir": wd},
+        "paths": {"current_image": str(Path(wd) / "working.fit")},
+        "metadata": {
+            "image_space": "display",
+            "tentative_export": {
+                "stem": "master",
+                "write_dir": str(staging),
+                "final_dir": str(final_dir),
+                "exported_files": [
+                    {"path": str(jpg), "format": "jpg",
+                     "icc_profile": "sRGB", "file_size_mb": 0.0},
+                ],
+                "preview_jpg": str(jpg),
+            },
+        },
+    }
+    try:
+        update, _summary = t24_export.commit_export_update(state, note="approved")
+        check("backend export commit does not mutate paths", "paths" not in update)
+        check("backend export commit sets export_done", update["metadata"]["export_done"] is True)
+    except Exception as e:
+        check("backend export commit", False, f"{type(e).__name__}: {e}")
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
+def test_preview_cache_is_render_mode_aware() -> None:
+    """Preview filenames must differ for linear autostretch vs display faithful."""
+    print("\n[4c] preview cache is render-mode aware")
+
+    from muphrid.tools.utility import t22_generate_preview
+    import muphrid.gradio_app as gradio_app
+
+    preview_src = inspect_source(t22_generate_preview.generate_preview)
+    gradio_src = inspect_source(gradio_app._convert_fits_to_preview)
+    check(
+        "generate_preview includes render-mode suffix",
+        "linear_autostretch" in preview_src and "display_faithful" in preview_src,
+    )
+    check(
+        "gradio preview cache includes render-mode suffix",
+        "linear_autostretch" in gradio_src and "display_faithful" in gradio_src,
+    )
+
+
 def inspect_source(func) -> str:
     import inspect as _inspect
     return _inspect.getsource(func)
@@ -449,6 +526,8 @@ def main() -> int:
     test_registry_imports_clean()
     test_export_refuses_missing_image_space()
     test_export_picks_correct_source_profile()
+    test_export_review_is_system_owned()
+    test_preview_cache_is_render_mode_aware()
     test_analyze_image_does_not_clobber_image_space()
     test_checkpoint_save_restore_round_trip()
     test_commit_export_round_trip()

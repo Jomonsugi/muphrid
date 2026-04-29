@@ -121,6 +121,42 @@ def make_two_peak_fixture(workdir: Path) -> dict:
     }
 
 
+def make_clean_star_mask_fixture(workdir: Path) -> dict:
+    """
+    Same two-star geometry as make_two_peak_fixture, but the star mask has an
+    exactly zero background. This models a clean component/mask image rather
+    than real sky luminance, and should exercise t41's mask-native fallback.
+    """
+    h, w = 256, 256
+    sigma = 3.0
+    starless = np.full((3, h, w), 0.02, dtype=np.float32)
+
+    pa_r = _gauss(h, w, 60, 60, sigma, 0.9)
+    pa_g = _gauss(h, w, 60, 60, sigma, 0.05 * 0.9)
+    pa_b = _gauss(h, w, 60, 60, sigma, 0.05 * 0.9)
+    pb_r = _gauss(h, w, 180, 180, sigma, 0.9)
+    pb_g = _gauss(h, w, 180, 180, sigma, 0.9)
+    pb_b = _gauss(h, w, 180, 180, sigma, 0.9)
+
+    mask = np.stack([pa_r + pb_r, pa_g + pb_g, pa_b + pb_b], axis=0).astype(np.float32)
+    original = (starless + mask).astype(np.float32)
+
+    starless_p = workdir / "clean_starless.fits"
+    mask_p = workdir / "clean_starmask.fits"
+    original_p = workdir / "clean_original.fits"
+    astropy_fits.HDUList([astropy_fits.PrimaryHDU(data=starless)]).writeto(starless_p, overwrite=True)
+    astropy_fits.HDUList([astropy_fits.PrimaryHDU(data=mask)]).writeto(mask_p, overwrite=True)
+    astropy_fits.HDUList([astropy_fits.PrimaryHDU(data=original)]).writeto(original_p, overwrite=True)
+    return {
+        "starless": str(starless_p),
+        "star_mask": str(mask_p),
+        "original": str(original_p),
+        "peak_a": (60, 60),
+        "peak_b": (180, 180),
+        "shape": (h, w),
+    }
+
+
 def make_state(workdir: Path, fx: dict, latest_mask: str | None = None) -> dict:
     return {
         "dataset": {"working_dir": str(workdir)},
@@ -210,6 +246,11 @@ def test_analyze_star_population_finds_both_peaks():
         detected >= 2,
         f"detected count={detected}",
     )
+    check(
+        "t40_writes_sidecar_catalog",
+        Path(msg_payload.get("source_catalog_path", "")).exists(),
+        str(msg_payload.get("source_catalog_path")),
+    )
 
     # color_priority should rank peak A (red) above peak B (white) on chroma.
     result_color = analyze_star_population.func(
@@ -236,6 +277,58 @@ def test_analyze_star_population_finds_both_peaks():
         )
     else:
         check("t40_color_priority_ranks_red_first", False, "fewer than 2 sources")
+
+
+def test_selective_reblend_clean_mask_fallback_and_edges():
+    workdir = Path(tempfile.mkdtemp(prefix="t41_clean_"))
+    fx = make_clean_star_mask_fixture(workdir)
+    state = make_state(workdir, fx)
+
+    result_full = selective_star_reblend.func(
+        mode="brightness_priority",
+        keep_fraction=1.0,
+        suppress_strength=0.0,
+        core_radius_factor=1.5,
+        feather_sigma_px=0.0,
+        mask_dilation_px=0,
+        confine_to_region_mask=False,
+        threshold_sigma=5.0,
+        fwhm_guess=3.0,
+        min_separation_fwhm=2.0,
+        max_sources=100,
+        output_stem="t41_clean_full",
+        tool_call_id="t41-clean-full",
+        state=state,
+    )
+    full = _read_fits(result_full.update["paths"]["current_image"])
+    original = _read_fits(fx["original"])
+    check(
+        "t41_clean_mask_keep_all_full_restore",
+        np.allclose(full, np.clip(original, 0.0, 1.0), atol=1e-5),
+    )
+
+    result_none = selective_star_reblend.func(
+        mode="brightness_priority",
+        keep_fraction=0.0,
+        suppress_strength=0.0,
+        core_radius_factor=1.5,
+        feather_sigma_px=0.0,
+        mask_dilation_px=0,
+        confine_to_region_mask=False,
+        threshold_sigma=5.0,
+        fwhm_guess=3.0,
+        min_separation_fwhm=2.0,
+        max_sources=100,
+        output_stem="t41_clean_none",
+        tool_call_id="t41-clean-none",
+        state=state,
+    )
+    none = _read_fits(result_none.update["paths"]["current_image"])
+    starless = _read_fits(fx["starless"])
+    check(
+        "t41_clean_mask_keep_none_suppresses_all",
+        np.allclose(none, starless, atol=1e-5),
+    )
 
 
 def test_selective_reblend_color_priority_keeps_red():
@@ -366,6 +459,38 @@ def test_selective_reblend_confine_to_region():
     )
 
 
+def test_selective_reblend_composes_color_boost():
+    workdir = Path(tempfile.mkdtemp(prefix="t41_color_boost_"))
+    fx = make_two_peak_fixture(workdir)
+    state = make_state(workdir, fx)
+
+    result = selective_star_reblend.func(
+        mode="brightness_priority",
+        keep_fraction=1.0,
+        suppress_strength=0.0,
+        core_radius_factor=2.0,
+        feather_sigma_px=0.0,
+        mask_dilation_px=0,
+        star_saturation_multiplier=2.0,
+        confine_to_region_mask=False,
+        threshold_sigma=3.0,
+        fwhm_guess=3.0,
+        min_separation_fwhm=2.0,
+        max_sources=100,
+        output_stem="t41_color_boost",
+        tool_call_id="t41-color-boost",
+        state=state,
+    )
+    boosted = _read_fits(result.update["paths"]["current_image"])
+    original = _read_fits(fx["original"])
+    o_hsv_at_a = rgb2hsv(np.moveaxis(original[:, 55:65, 55:65], 0, -1))
+    b_hsv_at_a = rgb2hsv(np.moveaxis(boosted[:, 55:65, 55:65], 0, -1))
+    check(
+        "t41_color_boost_composes_with_reblend",
+        float(np.mean(b_hsv_at_a[..., 1])) > float(np.mean(o_hsv_at_a[..., 1])),
+    )
+
+
 def test_enhance_star_color_increases_saturation():
     workdir = Path(tempfile.mkdtemp(prefix="t42_"))
     fx = make_two_peak_fixture(workdir)
@@ -439,6 +564,19 @@ def test_selective_reblend_refuses_missing_starless():
     )
 
 
+def test_star_tools_are_hitl_mapped():
+    from muphrid.graph.hitl import TOOL_TO_HITL
+
+    check(
+        "t41_hitl_mapped",
+        TOOL_TO_HITL.get("selective_star_reblend") == "T41_selective_star_reblend",
+    )
+    check(
+        "t42_hitl_mapped",
+        TOOL_TO_HITL.get("enhance_star_color") == "T42_enhance_star_color",
+    )
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 
@@ -446,11 +584,14 @@ def main() -> int:
     print("== expert star treatment tests ==")
     test_t26_star_mask_path_wired()
     test_analyze_star_population_finds_both_peaks()
+    test_selective_reblend_clean_mask_fallback_and_edges()
     test_selective_reblend_color_priority_keeps_red()
     test_selective_reblend_brightness_priority_keeps_brighter()
     test_selective_reblend_confine_to_region()
+    test_selective_reblend_composes_color_boost()
     test_enhance_star_color_increases_saturation()
     test_selective_reblend_refuses_missing_starless()
+    test_star_tools_are_hitl_mapped()
     print()
     if _failures:
         print(f"FAILED: {len(_failures)}")

@@ -98,7 +98,8 @@ def generate_preview(
     preview_dir.mkdir(exist_ok=True)
 
     stem = img_path.stem
-    preview_stem = f"preview_{stem}"
+    render_mode = "linear_autostretch" if auto_stretch_linear else "display_faithful"
+    preview_stem = f"preview_{stem}_{render_mode}"
 
     commands = [f"load {stem}"]
 

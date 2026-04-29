@@ -29,13 +29,16 @@ from typing import Annotated, Literal
 import numpy as np
 from astropy.io import fits as astropy_fits
 from astropy.stats import mad_std
+from astropy.table import Table
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
+from skimage.color import hsv2rgb, rgb2hsv
 from skimage.filters import gaussian
+from skimage.measure import label, regionprops
 from skimage.morphology import binary_dilation, disk
 
 from muphrid.graph.state import AstroState
@@ -93,6 +96,15 @@ class SelectiveStarReblendInput(BaseModel):
             "blending. >0 grows the support of the star contribution; "
             "useful when StarNet edges leave thin halos in the starless. "
             "0 disables."
+        ),
+    )
+    star_saturation_multiplier: float = Field(
+        default=1.0,
+        description=(
+            "Optional HSV saturation multiplier applied to the star component "
+            "before the selective weight map is blended. 1.0 = neutral; "
+            "1.2-1.5 can preserve colorful stars after suppressing the faint "
+            "population. Requires a color star_mask."
         ),
     )
     confine_to_region_mask: bool = Field(
@@ -212,6 +224,15 @@ def _compose_score(peaks: np.ndarray, chroma: np.ndarray, mode: str) -> np.ndarr
     raise ValueError(f"Unknown mode: {mode}")
 
 
+def _saturate_chw(chw: np.ndarray, multiplier: float) -> np.ndarray:
+    """Multiply HSV saturation by multiplier; input (3,H,W) float in [0,1]."""
+    hwc = np.moveaxis(np.clip(chw, 0.0, 1.0), 0, -1)
+    hsv = rgb2hsv(hwc)
+    hsv[..., 1] = np.clip(hsv[..., 1] * multiplier, 0.0, 1.0)
+    rgb = hsv2rgb(hsv)
+    return np.moveaxis(rgb, -1, 0).astype(np.float32)
+
+
 def _detect_on_mask(
     mask_lum: np.ndarray,
     threshold_sigma: float,
@@ -219,9 +240,9 @@ def _detect_on_mask(
     min_sep: float,
 ):
     bg_noise = float(mad_std(mask_lum))
-    if bg_noise <= 0:
-        return None, 0.0, 0.0
     bg_level = float(np.median(mask_lum))
+    if bg_noise <= 0:
+        return _detect_components_on_mask(mask_lum), bg_noise, bg_level
     threshold = threshold_sigma * bg_noise
     from photutils.detection import IRAFStarFinder
     with warnings.catch_warnings():
@@ -230,7 +251,51 @@ def _detect_on_mask(
             threshold=threshold, fwhm=fwhm_guess, minsep_fwhm=min_sep,
         )
         sources = finder(mask_lum - bg_level)
+    if sources is None or len(sources) == 0:
+        fallback = _detect_components_on_mask(mask_lum)
+        if fallback is not None and len(fallback) > 0:
+            return fallback, bg_noise, bg_level
     return sources, bg_noise, bg_level
+
+
+def _detect_components_on_mask(mask_lum: np.ndarray) -> Table | None:
+    """
+    Mask-native source detection for clean StarNet masks.
+
+    Real image luminance uses MAD-based thresholds. Star masks are different:
+    they are derived component images and can have exactly zero backgrounds.
+    In that case MAD is not a meaningful sky-noise estimate, so threshold
+    relative to the mask's own support and measure connected components.
+    """
+    max_val = float(np.max(mask_lum)) if mask_lum.size else 0.0
+    if max_val <= 0.0:
+        return None
+
+    support = mask_lum > (0.05 * max_val)
+    labeled = label(support, connectivity=2)
+    rows: list[dict] = []
+    for region in regionprops(labeled, intensity_image=mask_lum):
+        if region.area <= 0:
+            continue
+        centroid_weighted = getattr(region, "centroid_weighted", None)
+        if centroid_weighted is not None:
+            y, x = centroid_weighted
+        else:
+            y, x = region.centroid
+        intensity_max = getattr(region, "intensity_max", None)
+        if intensity_max is None:
+            intensity_max = float(np.max(mask_lum[labeled == region.label]))
+        area_radius = float(np.sqrt(region.area / np.pi))
+        rows.append({
+            "xcentroid": float(x),
+            "ycentroid": float(y),
+            "peak": float(intensity_max),
+            "fwhm": max(1.0, area_radius),
+        })
+
+    if not rows:
+        return None
+    return Table(rows=rows)
 
 
 def _build_weight_map(
@@ -274,6 +339,7 @@ def selective_star_reblend(
     core_radius_factor: float = 1.5,
     feather_sigma_px: float = 2.0,
     mask_dilation_px: int = 0,
+    star_saturation_multiplier: float = 1.0,
     confine_to_region_mask: bool = False,
     threshold_sigma: float = 5.0,
     fwhm_guess: float = 3.0,
@@ -293,13 +359,36 @@ def selective_star_reblend(
     blurred by `feather_sigma_px`. Optional `mask_dilation_px` dilates the
     StarNet mask before blending. Optional `confine_to_region_mask` reads
     paths.latest_mask and applies the weight rules only inside it (W=1.0
-    outside, full restoration).
+    outside, full restoration). Optional `star_saturation_multiplier`
+    boosts the star component before the population weight map is applied,
+    allowing color-preserving star reduction in one compositing pass.
 
     Output: starless + dilated_star_mask * W. New FITS path becomes
     paths.current_image; pre-call current_image is preserved at
     paths.previous_image. Reads paths.starless_image and paths.star_mask
     from state — call star_removal first.
     """
+    if not 0.0 <= keep_fraction <= 1.0:
+        raise ValueError("keep_fraction must be in [0, 1].")
+    if not 0.0 <= suppress_strength <= 1.0:
+        raise ValueError("suppress_strength must be in [0, 1].")
+    if core_radius_factor <= 0:
+        raise ValueError("core_radius_factor must be > 0.")
+    if feather_sigma_px < 0:
+        raise ValueError("feather_sigma_px must be >= 0.")
+    if mask_dilation_px < 0:
+        raise ValueError("mask_dilation_px must be >= 0.")
+    if star_saturation_multiplier <= 0:
+        raise ValueError("star_saturation_multiplier must be > 0.")
+    if threshold_sigma <= 0:
+        raise ValueError("threshold_sigma must be > 0.")
+    if fwhm_guess <= 0:
+        raise ValueError("fwhm_guess must be > 0.")
+    if min_separation_fwhm <= 0:
+        raise ValueError("min_separation_fwhm must be > 0.")
+    if max_sources <= 0:
+        raise ValueError("max_sources must be > 0.")
+
     working_dir = state["dataset"]["working_dir"]
     starless_p = state["paths"].get("starless_image")
     mask_p = state["paths"].get("star_mask")
@@ -379,6 +468,13 @@ def selective_star_reblend(
             f"starless ({starless.shape[1:]}) and star_mask "
             f"({mask_chw.shape[1:]}) shapes disagree."
         )
+    if star_saturation_multiplier != 1.0:
+        if mask_chw.shape[0] != 3:
+            raise ValueError(
+                "star_saturation_multiplier requires a color (3-channel) "
+                "star_mask. A mono star component has no chroma to boost."
+            )
+        mask_chw = _saturate_chw(mask_chw, star_saturation_multiplier)
     mask_lum = _luminance(mask_chw)
 
     if region_mask_2d is not None and region_mask_2d.shape != mask_lum.shape:
@@ -418,6 +514,8 @@ def selective_star_reblend(
         chroma = np.zeros_like(peaks)
 
     score = _compose_score(peaks, chroma, mode)
+    if score.size and float(score.max()) > 0.0:
+        score = score / (float(score.max()) + 1e-9)
 
     # Cap by score.
     if len(score) > max_sources:
@@ -425,7 +523,8 @@ def selective_star_reblend(
         xs, ys = xs[keep_idx], ys[keep_idx]
         peaks, fwhms, chroma, score = peaks[keep_idx], fwhms[keep_idx], chroma[keep_idx], score[keep_idx]
 
-    # Pick the keep set.
+    # Pick the keep set. keep_fraction=1.0 means full restoration over the
+    # whole star mask, not just the disks painted around detected centroids.
     n_keep = max(0, int(round(keep_fraction * len(score))))
     keep_threshold_idx = np.argsort(score)[-n_keep:] if n_keep > 0 else np.array([], dtype=int)
     keep_mask = np.zeros(len(score), dtype=bool)
@@ -434,10 +533,13 @@ def selective_star_reblend(
 
     # Build W on the image grid.
     H, W_dim = mask_lum.shape
-    W = _build_weight_map(
-        (H, W_dim), xs, ys, fwhms, keep_mask,
-        suppress_strength, core_radius_factor, feather_sigma_px,
-    )
+    if keep_fraction >= 1.0:
+        W = np.ones((H, W_dim), dtype=np.float32)
+    else:
+        W = _build_weight_map(
+            (H, W_dim), xs, ys, fwhms, keep_mask,
+            suppress_strength, core_radius_factor, feather_sigma_px,
+        )
 
     # Confine W to region (outside region: full restoration).
     if region_mask_2d is not None:
@@ -447,7 +549,10 @@ def selective_star_reblend(
     if mask_dilation_px > 0:
         # Build a binary support, dilate, then re-apply soft mask values
         # only on the dilated support.
-        support = mask_lum > (5.0 * bg_noise + bg_level)
+        if bg_noise > 0:
+            support = mask_lum > (5.0 * bg_noise + bg_level)
+        else:
+            support = mask_lum > (0.05 * float(mask_lum.max()))
         dilated = binary_dilation(support, disk(mask_dilation_px))
         # Spread the soft mask values into newly dilated pixels by nearest
         # value via a lightweight Gaussian blur of the soft mask, then
@@ -486,6 +591,7 @@ def selective_star_reblend(
         "sources_kept": n_kept,
         "sources_suppressed": n_total - n_kept,
         "confine_to_region_mask": confine_to_region_mask,
+        "star_saturation_multiplier": star_saturation_multiplier,
         "score_p10_p50_p90": [
             float(np.percentile(score, 10)),
             float(np.percentile(score, 50)),

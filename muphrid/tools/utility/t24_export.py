@@ -15,15 +15,15 @@ the heuristic stays diagnostic.
 
 Tentative-export pattern (when the T24_export HITL gate is enabled):
 
-  1. export_final runs with `tentative=True` (the agent flips this when
-     the gate is on; otherwise it defaults to False / direct export).
+  1. export_final writes tentatively when the T24_export HITL gate is
+     enabled. This is system-derived, not model-selected.
      Files are written to `<output_dir>/.tentative_<stem>/`.
   2. The tool emits a ReviewSession proposal whose visual_path points
      at the actual rendered JPG export (the artifact the human will
      ultimately see — not a FITS-derived auto-preview).
   3. The HITL gate fires; the human approves the proposal.
-  4. The agent calls commit_export, which moves the tentative files
-     into the canonical export_dir and clears state.metadata.tentative_export.
+  4. The backend approval path moves the tentative files into the
+     canonical export_dir and clears state.metadata.tentative_export.
 
 When the gate is disabled (autonomous), export_final writes directly
 to the export_dir with no tentative staging.
@@ -191,11 +191,11 @@ class ExportFinalInput(BaseModel):
             "When True, write export artifacts to "
             "<output_dir>/.tentative_<stem>/ and record their paths in "
             "state.metadata.tentative_export so the HITL gate can present "
-            "the actual rendered JPG before committing. The agent should "
-            "set this when the T24_export HITL gate is enabled. After "
-            "human approval, call commit_export to move the tentative "
-            "files into output_dir. When False (autonomous), files go "
-            "directly into output_dir."
+            "the actual rendered JPG before committing. This field is kept "
+            "for compatibility, but the effective behavior is system-owned: "
+            "when the T24_export HITL gate is enabled, export_final stages "
+            "tentatively regardless of the model-provided value; autonomous "
+            "mode writes directly into output_dir."
         ),
     )
 
@@ -312,11 +312,11 @@ def export_final(
     disagree with the artifact the human approved. Override `source_profile`
     explicitly only for unusual workflows.
 
-    Tentative mode: when `tentative=True`, files are written to
-    <output_dir>/.tentative_<stem>/ and recorded in
-    state.metadata.tentative_export. Use with the T24_export HITL gate so
-    the human reviews the rendered JPG, then call commit_export to move
-    the tentative files into output_dir.
+    Tentative mode: when the T24_export HITL gate is enabled, files are
+    written to <output_dir>/.tentative_<stem>/ and recorded in
+    state.metadata.tentative_export. The human reviews the rendered JPG,
+    and the backend approval path moves files into output_dir. The model
+    does not decide whether final export review is tentative.
     """
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"]["current_image"]
@@ -361,10 +361,15 @@ def export_final(
     stem = img_path.stem
 
     # Tentative writes land in a per-stem staging dir under export_dir.
-    # commit_export moves them into export_dir on approval. Disambiguating
-    # by stem keeps two parallel review cycles from clobbering each other
-    # (rare, but possible when the agent re-exports after revision).
-    if tentative:
+    # Approval moves them into export_dir. Disambiguating by stem keeps two
+    # parallel review cycles from clobbering each other (rare, but possible
+    # when the agent re-exports after revision). The effective tentative
+    # flag is HITL policy, not an LLM-controlled escape hatch.
+    from muphrid.graph.hitl import is_enabled
+
+    effective_tentative = bool(is_enabled("T24_export"))
+
+    if effective_tentative:
         write_dir = export_dir / f".tentative_{stem}"
         write_dir.mkdir(parents=True, exist_ok=True)
     else:
@@ -404,7 +409,8 @@ def export_final(
         "exported_files": exported_files,
         "image_space": incoming_image_space,
         "source_profile": source_profile,
-        "tentative": tentative,
+        "tentative": effective_tentative,
+        "requested_tentative": tentative,
         "preview_jpg": jpg_preview_path,
     }
     # Surface the JPG (when present) as both output_path and preview_path
@@ -418,9 +424,9 @@ def export_final(
 
     metadata_delta: dict = {
         "image_space": incoming_image_space,
-        "export_done": not tentative,
+        "export_done": not effective_tentative,
     }
-    if tentative:
+    if effective_tentative:
         metadata_delta["tentative_export"] = {
             "stem": stem,
             "write_dir": str(write_dir),
@@ -456,36 +462,13 @@ class CommitExportInput(BaseModel):
     )
 
 
-@tool(args_schema=CommitExportInput)
-def commit_export(
-    note: str | None = None,
-    tool_call_id: Annotated[str, InjectedToolCallId] = None,
-    state: Annotated[AstroState, InjectedState] = None,
-) -> Command:
+def _commit_tentative_export(tentative: dict) -> tuple[list[dict], str]:
     """
-    Promote a tentative export to its final destination.
+    Move tentative export files into their final directory.
 
-    Reads `state.metadata.tentative_export` (set by `export_final(tentative=True)`),
-    moves each tentative file from the staging directory into the canonical
-    export_dir, removes the empty staging directory, and clears the
-    tentative_export marker. Sets `metadata.export_done=True` and
-    `metadata.exported_files` to the final paths.
-
-    Refuses if no tentative_export is present — the caller must run
-    export_final(tentative=True) first. Refuses if any tentative file is
-    missing on disk (would-be silent data loss otherwise). Idempotent
-    against partial moves: if a tentative file's destination already
-    exists with the same content, the move is treated as already-complete.
+    Shared by the commit_export tool and the backend HITL approval path.
+    Does not mutate LangGraph state directly.
     """
-    metadata = state.get("metadata", {}) or {}
-    tentative = metadata.get("tentative_export")
-    if not isinstance(tentative, dict):
-        raise RuntimeError(
-            "commit_export: state.metadata.tentative_export is not set. "
-            "Run export_final(tentative=True) first to produce a staged "
-            "export, then call commit_export after the human approves."
-        )
-
     write_dir = Path(tentative["write_dir"])
     final_dir = Path(tentative["final_dir"])
     final_dir.mkdir(parents=True, exist_ok=True)
@@ -501,12 +484,10 @@ def commit_export(
             )
         dst = final_dir / src.name
         if dst.exists() and dst.resolve() == src.resolve():
-            # Already in place (e.g. write_dir == final_dir for some reason).
             moved_entry = dict(entry)
             moved.append(moved_entry)
             continue
         if dst.exists():
-            # Conservative: don't clobber an unrelated final-dir file.
             raise FileExistsError(
                 f"commit_export: destination already exists and is not the "
                 f"tentative source: {dst}. Resolve manually before retrying."
@@ -516,26 +497,74 @@ def commit_export(
         moved_entry["path"] = str(dst)
         moved.append(moved_entry)
 
-    # Best-effort cleanup of the empty staging directory.
     try:
         if write_dir.exists() and not any(write_dir.iterdir()):
             write_dir.rmdir()
     except OSError:
-        # Non-fatal: leftover staging dir is mildly untidy, not a data risk.
         pass
 
+    return moved, str(final_dir)
+
+
+def commit_export_update(
+    state: AstroState,
+    *,
+    note: str | None = None,
+) -> tuple[dict, dict]:
+    """
+    Return (state_update, summary) for committing a tentative export.
+
+    This is the backend path used after structured HITL approval. It commits
+    export files without promoting the reviewed JPG/TIF into paths.current_image.
+    """
+    metadata = state.get("metadata", {}) or {}
+    tentative = metadata.get("tentative_export")
+    if not isinstance(tentative, dict):
+        raise RuntimeError(
+            "commit_export: state.metadata.tentative_export is not set. "
+            "Run export_final with the T24_export HITL gate enabled to produce "
+            "a staged export, then approve it."
+        )
+
+    moved, final_dir = _commit_tentative_export(tentative)
     summary = {
         "committed_files": moved,
-        "final_dir": str(final_dir),
+        "final_dir": final_dir,
         "note": note,
     }
-
-    return Command(update={
+    update = {
         "metadata": {
             "export_done": True,
             "exported_files": moved,
             "tentative_export": None,
         },
+    }
+    return update, summary
+
+
+@tool(args_schema=CommitExportInput)
+def commit_export(
+    note: str | None = None,
+    tool_call_id: Annotated[str, InjectedToolCallId] = None,
+    state: Annotated[AstroState, InjectedState] = None,
+) -> Command:
+    """
+    Promote a tentative export to its final destination.
+
+    Reads `state.metadata.tentative_export`, moves each tentative file from
+    the staging directory into the canonical export_dir, removes the empty
+    staging directory, and clears the tentative_export marker. Sets
+    `metadata.export_done=True` and `metadata.exported_files` to the final paths.
+
+    Refuses if no tentative_export is present — the caller must run
+    export_final(tentative=True) first. Refuses if any tentative file is
+    missing on disk (would-be silent data loss otherwise). Idempotent
+    against partial moves: if a tentative file's destination already
+    exists with the same content, the move is treated as already-complete.
+    """
+    update, summary = commit_export_update(state, note=note)
+    return Command(update={
+        **update,
         "messages": [ToolMessage(
             content=json.dumps(summary, indent=2),
             tool_call_id=tool_call_id,

@@ -69,7 +69,8 @@ def _to_preview_path(path: str, working_dir: str, is_linear: bool) -> str | None
         if not working_dir:
             return None
         from muphrid.tools.utility.t22_generate_preview import generate_preview
-        expected = Path(working_dir) / "previews" / f"preview_{p.stem}.jpg"
+        render_mode = "linear_autostretch" if is_linear else "display_faithful"
+        expected = Path(working_dir) / "previews" / f"preview_{p.stem}_{render_mode}.jpg"
         if expected.exists():
             return str(expected)
         try:

@@ -243,8 +243,18 @@ def _current_image_ref(state: AstroState) -> VisualRef | None:
 
     chosen: Path | None = None
     if preview_dir is not None:
-        vlm_preview = preview_dir / f"preview_{stem}_vlm.jpg"
-        human_preview = preview_dir / f"preview_{stem}.jpg"
+        image_space = (state.get("metadata") or {}).get("image_space")
+        render_mode = (
+            "linear_autostretch"
+            if image_space == "linear"
+            else "display_faithful"
+            if image_space == "display"
+            else None
+        )
+        if render_mode is None:
+            return None
+        vlm_preview = preview_dir / f"preview_{stem}_{render_mode}_vlm.jpg"
+        human_preview = preview_dir / f"preview_{stem}_{render_mode}.jpg"
         if vlm_preview.exists():
             chosen = vlm_preview
         elif human_preview.exists():
@@ -1664,7 +1674,8 @@ def _resolve_variant_preview(
         return None
     from muphrid.tools.utility.t22_generate_preview import generate_preview
     p = Path(fits_path)
-    expected = Path(working_dir) / "previews" / f"preview_{p.stem}.jpg"
+    render_mode = "linear_autostretch" if is_linear else "display_faithful"
+    expected = Path(working_dir) / "previews" / f"preview_{p.stem}_{render_mode}.jpg"
     if expected.exists():
         return str(expected)
     try:
@@ -2144,6 +2155,76 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                     visible_response_required=True,
                 ),
             }
+
+        _active_hitl_key, active_tool_name = review_ctl.active_review_tool(state)
+        if active_tool_name == "export_final":
+            try:
+                from muphrid.tools.utility.t24_export import commit_export_update
+
+                commit_update, commit_summary = commit_export_update(
+                    state,
+                    note=rationale or None,
+                )
+            except Exception as e:
+                logger.exception("Export approval failed during tentative commit")
+                return {
+                    "messages": vlm_messages + [HumanMessage(
+                        content=(
+                            "[System] Export approval could not be committed: "
+                            f"{type(e).__name__}: {e}. The export review gate "
+                            "remains open so the agent can inspect and recover."
+                        )
+                    )],
+                    "active_hitl": True,
+                    "review_session": review_ctl.update_review_session(
+                        state.get("review_session"),
+                        status="awaiting_agent_response",
+                        last_human_event=human_event,
+                        tool_runs_since_human=0,
+                        visible_response_required=True,
+                    ),
+                }
+
+            existing_visual = list(state.get("visual_context", []) or [])
+            non_hitl = [
+                r for r in existing_visual
+                if r.get("source") not in ("hitl_variant", "phase_carry")
+            ]
+            committed = commit_summary.get("committed_files", [])
+            committed_lines = [
+                f"- {entry.get('path')}"
+                for entry in committed
+                if isinstance(entry, dict) and entry.get("path")
+            ]
+            approval_lines = [
+                "HUMAN APPROVED EXPORT",
+                f"Approved export candidate: {variant_id}.",
+                "The tentative export has been committed to the final export directory.",
+                "paths.current_image is unchanged; the reviewed artifact was an export product, not a working FITS.",
+            ]
+            if committed_lines:
+                approval_lines.append("Committed files:")
+                approval_lines.extend(committed_lines)
+            if rationale:
+                approval_lines.append(f"Rationale: {rationale}")
+            approval_lines.append("Continue to completion.")
+
+            export_update = {
+                **commit_update,
+                "active_hitl": False,
+                "review_session": review_ctl.close_review_session(
+                    state.get("review_session"),
+                    reason="export_approved",
+                ),
+                "variant_pool": [],
+                "visual_context": non_hitl,
+                "messages": vlm_messages + [HumanMessage(content="\n".join(approval_lines))],
+            }
+            logger.info(
+                f"Export approval committed for {variant_id} "
+                f"({len(committed)} file(s)); current_image left unchanged"
+            )
+            return export_update
 
         update = promote_variant(state, variant_id, rationale=rationale or None)
         if update is None:

@@ -607,13 +607,14 @@ cmd = commit_variant.invoke({
 })
 preview_dir = Path(paths[0]).parent / "previews"
 preview_dir.mkdir(exist_ok=True)
-(preview_dir / f"preview_{Path(paths[0]).stem}.jpg").write_bytes(_FAKE_JPG_BYTES)
+(preview_dir / f"preview_{Path(paths[0]).stem}_linear_autostretch.jpg").write_bytes(_FAKE_JPG_BYTES)
 # Apply the Command's update onto state (simulate LangGraph's reducer)
 post_state = make_state(
     variant_pool=cmd.update["variant_pool"],
     visual_context=cmd.update["visual_context"],
     paths=cmd.update["paths"],
     dataset={"working_dir": str(Path(paths[0]).parent)},
+    metadata={"image_space": "linear"},
 )
 messages = [SystemMessage(content="sys"), HumanMessage(content="continuing")]
 out = _build_vlm_view(post_state, messages)
