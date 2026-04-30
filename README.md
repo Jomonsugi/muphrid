@@ -1,6 +1,9 @@
 # Muphrid
 
-*An agentic astrophotography post-processing pipeline that uses open-source image-processing tools, quantitative image analysis, and human-in-the-loop review to turn raw frames into a finished image.*
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.html)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+
+*An agentic astrophotography post-processing system that uses open-source image-processing tools, quantitative image analysis, and human-in-the-loop review to turn raw frames into a finished image.*
 
 ![Muphrid Gradio UI — agent chat, preview, and activity log during nonlinear processing](docs/muphrid_screenshot.png)
 
