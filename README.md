@@ -9,7 +9,7 @@
 
 Muphrid is an experiment in giving an LLM agent the same kind of working environment a human astrophotographer uses: calibrated tools, measurements, visual inspection, checkpoints, rollback, and collaboration at subjective decision points. It orchestrates Siril, GraXpert, StarNet2, Astropy, Photutils, and scikit-image through a LangGraph agent that can calibrate, register, stack, stretch, analyze, iterate, and ask for review.
 
-The goal is not a one-click filter. The goal is a data-driven processing assistant that can try variants, compare outcomes, explain tradeoffs, and either continue autonomously or pause for human approval when taste matters.
+The goal is not a one-click filter. It is a data-driven processing agent that can try variants, compare outcomes, explain tradeoffs, and either work autonomously or pause for human collaboration and approval when taste matters.
 
 ## Quickstart
 
