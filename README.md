@@ -20,7 +20,7 @@ Prerequisites:
 - [GraXpert](https://www.graxpert.com) 3.0+
 - [StarNet2](https://www.starnetastro.com/download/)
 - ExifTool
-- An LLM API key, usually `TOGETHER_API_KEY`
+- An LLM API key
 
 ```bash
 git clone https://github.com/Jomonsugi/muphrid.git
