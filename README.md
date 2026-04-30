@@ -152,6 +152,22 @@ The most mature parts of the system are:
 
 LangGraph, LangChain, Gradio, Siril, GraXpert, StarNet2, Astropy, Photutils, scikit-image, PyWavelets, Pydantic, Typer, SQLite.
 
+## Citations
+
+Muphrid relies on the following scientific tools whose authors request citation:
+
+- **Siril** — Richard, C., Hourdin, V., Melis, C., & Knagg-Baugh, A. (2024). *Siril: An Advanced Tool for Astronomical Image Processing.* Journal of Open Source Software, 9(102), 7242. <https://doi.org/10.21105/joss.07242>
+- **Astropy** — Astropy Collaboration et al., [Paper I (2013)](https://doi.org/10.1051/0004-6361/201322068), [Paper II (2018)](https://arxiv.org/abs/1801.02634), and [Paper III (2022)](https://arxiv.org/abs/2206.14220). See <https://www.astropy.org/acknowledging.html>.
+- **Photutils** — Bradley et al. (2025). *Photutils: an Astropy package for detection and photometry of astronomical sources.* Zenodo: <https://doi.org/10.5281/zenodo.596036>
+- **scikit-image** — van der Walt, S., Schönberger, J. L., Nunez-Iglesias, J., Boulogne, F., Warner, J. D., Yager, N., Gouillart, E., Yu, T., & the scikit-image contributors (2014). *scikit-image: Image processing in Python.* PeerJ, 2, e453. <https://doi.org/10.7717/peerj.453>
+- **PyWavelets** — Lee, G. R., Gommers, R., Wasilewski, F., Wohlfahrt, K., & O'Leary, A. (2019). *PyWavelets: A Python package for wavelet analysis.* Journal of Open Source Software, 4(36), 1237. <https://doi.org/10.21105/joss.01237>
+
+Muphrid also uses [GraXpert](https://www.graxpert.com) and [StarNet2](https://www.starnetastro.com).
+
+If Muphrid was useful in your work, please cite it as:
+
+> Shanks, M. (2026). *Muphrid: An agentic astrophotography post-processing system.* GitHub. <https://github.com/Jomonsugi/muphrid>
+
 ## License
 
 GNU General Public License v3.0. See [LICENSE](LICENSE).
