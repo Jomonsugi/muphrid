@@ -1177,6 +1177,7 @@ def make_agent_node(model_factory):
         messages = _strip_empty_ai_messages(messages)
 
         response = model.invoke(messages)
+        logger.info("agent_node usage_metadata=%s", getattr(response, "usage_metadata", None))
         response = _rescue_raw_tool_calls(response)
         response = _normalize_empty_response(response)
 
