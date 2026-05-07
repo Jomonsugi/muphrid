@@ -104,7 +104,7 @@ def _load_processing_defaults() -> dict:
     from muphrid.config import _pcfg
     per_phase = _pcfg("limits", "per_phase") or {}
     return {
-        "llm_model": os.environ.get("LLM_MODEL", "") or _pcfg("model", "default", "moonshotai/Kimi-K2.5"),
+        "llm_model": os.environ.get("LLM_MODEL", "") or _pcfg("model", "default", "moonshotai/Kimi-K2.6"),
         "recursion_limit": int(os.environ.get("RECURSION_LIMIT", "") or _pcfg("limits", "recursion_limit", 200)),
         "max_tools_per_phase": int(os.environ.get("MAX_TOOLS_PER_PHASE", "") or _pcfg("limits", "max_tools_per_phase", 30)),
         "max_consecutive_same_tool": int(os.environ.get("MAX_CONSECUTIVE_SAME_TOOL", "") or _pcfg("limits", "max_consecutive_same_tool", 3)),
@@ -2256,7 +2256,7 @@ def build_app() -> gr.Blocks:
             gr.Markdown("### Model")
             llm_model = gr.Dropdown(
                 label="LLM Model",
-                choices=["moonshotai/Kimi-K2.5", "deepseek-ai/DeepSeek-V3.1", "claude-sonnet-4-6"],
+                choices=["moonshotai/Kimi-K2.6", "deepseek-ai/DeepSeek-V3.1", "claude-sonnet-4-6"],
                 value=env_defaults["llm_model"],
                 allow_custom_value=True,
             )

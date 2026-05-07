@@ -128,7 +128,7 @@ Useful flags:
 | `hitl_config.toml` | Which tools pause for review, autonomous mode defaults, VLM retention |
 | `equipment.toml` | Camera/telescope values not present in metadata |
 
-The default model is `moonshotai/Kimi-K2.5` via Together AI. Anthropic and OpenAI integrations are also wired through LangChain; change the model in `processing.toml` or through the Gradio UI and provide the corresponding API key.
+The default model is `moonshotai/Kimi-K2.6` via Together AI. Anthropic and OpenAI integrations are also wired through LangChain; change the model in `processing.toml` or through the Gradio UI and provide the corresponding API key.
 
 ## Project Status
 

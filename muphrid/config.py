@@ -117,7 +117,7 @@ class Settings:
 _MODEL_DEFAULTS: dict[str, dict] = {
     # Kimi K2.5: thinking mode enabled by default, fixed temp 1.0
     # Instant mode: temp 0.6. Any other temp value errors.
-    "moonshotai/Kimi-K2.5": {
+    "moonshotai/Kimi-K2.6": {
         "provider": "together",
         "temperature": None,        # don't send — model uses fixed 1.0 (thinking) or 0.6 (instant)
         "thinking": True,
@@ -163,7 +163,7 @@ def load_settings() -> Settings:
     # This lets env vars override TOML for backwards compat and CI/testing.
 
     # Model: env var overrides processing.toml
-    model = _optional("LLM_MODEL", "") or _pcfg("model", "default", "moonshotai/Kimi-K2.5")
+    model = _optional("LLM_MODEL", "") or _pcfg("model", "default", "moonshotai/Kimi-K2.6")
 
     # Provider derived from model config
     model_defaults = _get_model_defaults(model)
