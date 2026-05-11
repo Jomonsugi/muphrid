@@ -15,7 +15,7 @@
 # _MODEL_DEFAULTS in config.py. This just selects which model to use.
 
 [model]
-default = "moonshotai/Kimi-K2.5"
+default = "moonshotai/Kimi-K2.6"
 
 # ── Safety limits ─────────────────────────────────────────────────────────────
 # These prevent runaway tool loops and excessive resource usage.

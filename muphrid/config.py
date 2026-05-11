@@ -115,7 +115,7 @@ class Settings:
 # Users can override via .env but these are the researched defaults.
 
 _MODEL_DEFAULTS: dict[str, dict] = {
-    # Kimi K2.5: thinking mode enabled by default, fixed temp 1.0
+    # Kimi K2.6: thinking mode enabled by default, fixed temp 1.0
     # Instant mode: temp 0.6. Any other temp value errors.
     "moonshotai/Kimi-K2.6": {
         "provider": "together",
@@ -471,10 +471,10 @@ def make_llm(settings: Settings | None = None):
             "base_url": "https://api.together.xyz/v1/",
             "timeout": 120,
         }
-        # Only send temperature if not None (Kimi K2.5 uses fixed values)
+        # Only send temperature if not None (Kimi K2.6 uses fixed values)
         if settings.llm_temperature is not None:
             kwargs["temperature"] = settings.llm_temperature
-        # Kimi K2.5 thinking mode control
+        # Kimi K2.6 thinking mode control
         if not settings.llm_thinking and "Kimi" in settings.llm_model:
             kwargs["model_kwargs"] = {
                 "extra_body": {"chat_template_kwargs": {"thinking": False}},
