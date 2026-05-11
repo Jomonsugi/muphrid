@@ -101,9 +101,6 @@ class Settings:
     starnet_bin: str # absolute path to the starnet2 executable
     starnet_weights: str # absolute path to StarNet2_weights.pt
 
-    # Camera sensor
-    pixel_size_um: float | None # optional override; None → use camera lookup table
-
     # LangSmith (optional tracing)
     langchain_tracing: bool
     langchain_api_key: str
@@ -219,7 +216,6 @@ def load_settings() -> Settings:
         graxpert_bin=_optional("GRAXPERT_BIN", "graxpert"),
         starnet_bin=_require("STARNET_BIN"),
         starnet_weights=_require("STARNET_WEIGHTS"),
-        pixel_size_um=float(v) if (v := _optional("PIXEL_SIZE_UM")) else None,
         langchain_tracing=tracing,
         langchain_api_key=_optional("LANGCHAIN_API_KEY"),
         langchain_project=_optional("LANGCHAIN_PROJECT", "") or _pcfg("tracing", "project", "muphrid"),
@@ -253,7 +249,7 @@ def _check_siril(siril_bin: str) -> None:
         )
 
 
-def configure_siril_for_equipment() -> str:
+def configure_siril_for_equipment(sensor_type_override: str | None = None) -> str:
     """
     Write Siril demosaic preferences derived from equipment.toml.
 
@@ -264,6 +260,9 @@ def configure_siril_for_equipment() -> str:
       xtrans → xtrans_passes=3 (Markesteijn 3-pass, best quality)
       bayer → xtrans_passes=1 (Markesteijn not used for Bayer; reset to default)
       mono → xtrans_passes=1 (no CFA demosaic needed)
+
+    `sensor_type_override` lets the Gradio app force a sensor type at boot
+    time (the user's UI selection); when None, equipment.toml is canonical.
 
     Returns the sensor_type string for logging.
     Raises ConfigError if equipment.toml is missing or sensor_type is unrecognised.
@@ -283,8 +282,7 @@ def configure_siril_for_equipment() -> str:
     with open(equipment_path, "rb") as f:
         equipment = tomllib.load(f)
 
-    # UI override takes priority over equipment.toml
-    sensor_type = os.environ.get("SENSOR_TYPE_OVERRIDE", "").lower()
+    sensor_type = (sensor_type_override or "").lower()
     if not sensor_type:
         sensor_type = equipment.get("camera", {}).get("sensor_type", "").lower()
     # sensor_type may be empty when equipment.toml is minimal (e.g. ZWO FITS

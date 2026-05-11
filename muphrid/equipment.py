@@ -1,21 +1,25 @@
 """
 Equipment configuration loader.
 
-Reads equipment.toml from the project root and provides equipment data to
-any tool that needs it. These values are hints — if the data provides a
-more accurate value (FITS headers, plate solve), the data wins.
+equipment.toml is the durable config file. It seeds state.acquisition_meta
+at ingest_dataset time. After ingest, state is canonical — downstream tools
+read state, not this module.
 
-Resolution order for pixel_size_um:
-  1. Explicit argument passed to the tool (e.g. from FITS headers)
-  2. PIXEL_SIZE_UM environment variable (from Gradio UI override)
-  3. equipment.toml [camera] pixel_size_um
-  → Hard fail if none provides a value
+Two resolution layers, kept apart:
 
-Resolution order for focal_length_mm:
-  1. Explicit argument passed to the tool (e.g. from plate solve)
-  2. FOCAL_LENGTH_MM environment variable (from Gradio UI override)
-  3. equipment.toml [optics] focal_length_mm
-  → Returns None if unavailable (hard fail at point of use)
+  At ingest time (called only by ingest_dataset):
+    `resolve_focal_length_for_ingest()` / `resolve_pixel_size_for_ingest()`
+    return the equipment.toml value (or None / ValueError). Ingest combines
+    them with explicit override kwargs and FITS/EXIF header values.
+
+  At downstream tool runtime:
+    `equipment_from_state(state, require=(…,))` reads
+    state.dataset.acquisition_meta and refuses cleanly when required fields
+    are null, naming the state path the caller should resolve.
+
+The env-var hop (FOCAL_LENGTH_MM / PIXEL_SIZE_UM / SENSOR_TYPE_OVERRIDE)
+that the Gradio app used to write is gone. Gradio now passes override
+kwargs to ingest_dataset directly; state is the contract from there.
 """
 
 from __future__ import annotations
@@ -73,60 +77,61 @@ def get_location() -> dict[str, Any]:
     return load_equipment().get("location", {})
 
 
-def resolve_pixel_size(explicit_value: float | None = None) -> float:
+def resolve_pixel_size() -> float | None:
     """
-    Resolve pixel size in microns.
-      1. Explicit value (from tool argument / FITS headers — data wins)
-      2. PIXEL_SIZE_UM env var (from Gradio UI)
-      3. equipment.toml [camera] pixel_size_um
-    Raises ValueError if none can provide a value.
+    Read pixel size in microns from equipment.toml. Returns None if unset.
+    Called only by ingest_dataset as one tier of its EXIF/FITS/toml chain.
+    Downstream tools should read state.dataset.acquisition_meta.pixel_size_um.
     """
-    if explicit_value is not None and explicit_value > 0:
-        return explicit_value
-
-    env_val = os.environ.get("PIXEL_SIZE_UM", "").strip()
-    if env_val:
-        try:
-            return float(env_val)
-        except ValueError:
-            pass
-
     camera = get_camera()
     config_val = camera.get("pixel_size_um")
     if config_val is not None and config_val > 0:
         return float(config_val)
-
-    raise ValueError(
-        "Pixel size could not be determined from file metadata and was not "
-        "provided. Please set it in the Equipment tab (Gradio) or in "
-        "equipment.toml [camera] pixel_size_um."
-    )
+    return None
 
 
-def resolve_focal_length(explicit_value: float | None = None) -> float | None:
+def resolve_focal_length() -> float | None:
     """
-    Resolve focal length in mm.
-      1. Explicit value (from tool argument / plate solve — data wins)
-      2. FOCAL_LENGTH_MM env var (from Gradio UI)
-      3. equipment.toml [optics] focal_length_mm
-    Returns None if unavailable (hard fail at point of use in tools).
+    Read focal length in mm from equipment.toml. Returns None if unset.
+    Called only by ingest_dataset as one tier of its EXIF/FITS/toml chain.
+    Downstream tools should read state.dataset.acquisition_meta.focal_length_mm.
     """
-    if explicit_value is not None and explicit_value > 0:
-        return explicit_value
-
-    env_val = os.environ.get("FOCAL_LENGTH_MM", "").strip()
-    if env_val:
-        try:
-            return float(env_val)
-        except ValueError:
-            pass
-
     optics = get_optics()
     config_val = optics.get("focal_length_mm")
     if config_val is not None and config_val > 0:
         return float(config_val)
-
     return None
+
+
+def equipment_from_state(
+    state: dict,
+    *,
+    require: tuple[str, ...] = (),
+) -> dict:
+    """
+    Downstream-tool resolver: return state.dataset.acquisition_meta.
+
+    `state` is the canonical source after ingest_dataset. Tools that need
+    hardware facts call this and never re-resolve from equipment.toml or
+    env vars; that's the ingest layer's job exactly once per run.
+
+    If any name in `require` is null/missing, raise ValueError naming the
+    state path so the agent (or user) knows where to set the value.
+
+    Returns the acquisition_meta dict (empty dict when none is set).
+    """
+    meta = ((state or {}).get("dataset") or {}).get("acquisition_meta") or {}
+    missing = [name for name in require if not meta.get(name)]
+    if missing:
+        joined = ", ".join(f"acquisition_meta.{n}" for n in missing)
+        raise ValueError(
+            f"Required equipment state is null: {joined}. "
+            f"Set the value in equipment.toml (for CLI/autonomous runs) or "
+            f"the Gradio Equipment tab (for UI runs) and re-ingest the dataset. "
+            f"State is the contract — re-running this tool without populated "
+            f"state will keep failing."
+        )
+    return meta
 
 
 def resolve_target_coords(target_name: str) -> dict[str, float] | None:

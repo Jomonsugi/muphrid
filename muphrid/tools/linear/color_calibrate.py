@@ -3,26 +3,23 @@ color_calibrate
 
 Correct white balance by matching star colors to photometric catalogs.
 Siril's PCC/SPCC always include background neutralization as part of the
-operation — it cannot be disabled. Use PCC for general OSC/DSLR images,
-SPCC for more accurate calibration when sensor/filter spectral data is available.
+operation — it cannot be disabled.
 
-This tool requires a plate-solved image. Plate solving is attempted internally
-if WCS is not already present in the FITS header.
+Plate solving is attempted internally if WCS is not already present in the
+FITS header. The tool reads imaging focal length, pixel size, and target
+coordinates from state.dataset.acquisition_meta. equipment.toml seeds those
+fields at ingest_dataset time (CLI) or the Gradio Equipment tab passes
+overrides at ingest time (UI). Mid-run hardware editing is not supported.
 
-Pixel size is resolved in this order:
-  1. pixel_size_um argument (explicit override)
-  2. PIXEL_SIZE_UM environment variable
-  3. Built-in camera model lookup table (keyed on AcquisitionMeta.camera_model)
-  4. Fail with a clear error message — plate solving cannot proceed without it
-
-Siril commands (verified against Siril 1.4 CLI docs):
-    platesolve — see plate_solve for full options
-    pcc [-limitmag=[+-]] [-catalog=] [-bgtol=lower,upper]
-    spcc [-limitmag=[+-]]
-         [ { -monosensor= [-rfilter=] [-gfilter=] [-bfilter=]
-           | -oscsensor= [-oscfilter=] [-osclpf=] } ]
-         [-whiteref=] [-narrowband [-rwl=] [-gwl=] [-bwl=] [-rbw=] [-gbw=] [-bbw=]]
-         [-bgtol=lower,upper] [-atmos [-obsheight=] { [-pressure=] | [-slp=] }]
+State contract:
+  Required (refused when null):
+    acquisition_meta.focal_length_mm — set by ingest from equipment.toml /
+      FITS-EXIF; refined by plate_solve when it runs first.
+    acquisition_meta.pixel_size_um  — set by ingest from equipment.toml /
+      FITS-EXIF.
+  Optional:
+    acquisition_meta.target_coords  — set by resolve_target. Used as a
+      position hint for blind plate solving when present.
 """
 
 from __future__ import annotations
@@ -38,27 +35,9 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from muphrid.equipment import resolve_focal_length as _resolve_fl
-from muphrid.equipment import resolve_pixel_size as _resolve_px
-from muphrid.equipment import resolve_target_coords as _resolve_target
+from muphrid.equipment import equipment_from_state
 from muphrid.graph.state import AstroState
 from muphrid.tools._siril import SirilError, SirilResult, run_siril_script
-
-
-def resolve_pixel_size(
-    pixel_size_um_arg: float | None,
-    camera_model: str | None = None,
-) -> float:
-    """
-    Resolve pixel size in microns. Priority:
-      1. Explicit argument
-      2. equipment.toml [camera] pixel_size_um
-      3. PIXEL_SIZE_UM env var
-
-    camera_model is accepted for backward compatibility but is no longer
-    used for lookup. Maintain pixel_size_um in equipment.toml instead.
-    """
-    return _resolve_px(pixel_size_um_arg)
 
 
 # ── Pydantic input schemas ────────────────────────────────────────────────────
@@ -114,43 +93,27 @@ class SpccAtmosphericOptions(BaseModel):
 
 
 class SpccOptions(BaseModel):
-    """Configuration for Spectrophotometric Color Calibration (SPCC)."""
+    """Configuration for Spectrophotometric Color Calibration (SPCC).
+
+    OSC-only. Mono camera support is on the backlog (see BACKLOG.md
+    item 12); the SPCC database entries for mono sensors and per-channel
+    filters are not currently wired through state and equipment.toml.
+    """
     # OSC mode
     osc_sensor_name: str | None = Field(
         default=None,
         description=(
-            "OSC sensor/camera name as in Siril's SPCC database (-oscsensor=). "
+            "OSC sensor/camera name as in Siril's SPCC database. "
             "Use spcc_list oscsensor to see available names."
         ),
     )
     osc_filter_name: str | None = Field(
         default=None,
-        description="OSC filter name as in Siril's SPCC database (-oscfilter=).",
+        description="OSC filter name as in Siril's SPCC database.",
     )
     osc_lpf: str | None = Field(
         default=None,
-        description="OSC light pollution filter name (-osclpf=).",
-    )
-
-    # Mono mode
-    mono_sensor_name: str | None = Field(
-        default=None,
-        description=(
-            "Mono sensor name as listed in Siril's SPCC database. "
-            "Set when imaging with a mono camera + separate RGB filters."
-        ),
-    )
-    r_filter: str | None = Field(
-        default=None,
-        description="Red channel filter name for mono mode.",
-    )
-    g_filter: str | None = Field(
-        default=None,
-        description="Green channel filter name for mono mode.",
-    )
-    b_filter: str | None = Field(
-        default=None,
-        description="Blue channel filter name for mono mode.",
+        description="OSC light pollution filter name.",
     )
 
     white_reference: str | None = Field(
@@ -243,39 +206,6 @@ class ColorCalibrateInput(BaseModel):
             "Reliable for all OSC/DSLR images. "
             "'spcc': Spectrophotometric Color Calibration — more accurate, "
             "models the sensor's spectral response. Configure via spcc_options."
-        ),
-    )
-    focal_length_mm: float = Field(
-        default=0.0,
-        description=(
-            "Imaging focal length in mm. If 0 or omitted, resolved from "
-            "equipment.toml [optics] focal_length_mm."
-        ),
-    )
-    pixel_size_um: float | None = Field(
-        default=None,
-        description=(
-            "Pixel size in microns. If null, resolved from PIXEL_SIZE_UM env var "
-            "or camera model lookup table."
-        ),
-    )
-    camera_model: str | None = Field(
-        default=None,
-        description="Camera model string for pixel size lookup when pixel_size_um is null.",
-    )
-    target_name: str | None = Field(
-        default=None,
-        description=(
-            "Astronomical target name resolved via SIMBAD to RA/DEC (e.g. 'M42'). "
-            "Used as plate solve position hint when target_coords is not provided. "
-            "Prefer calling resolve_target first and passing target_coords explicitly."
-        ),
-    )
-    target_coords: dict | None = Field(
-        default=None,
-        description=(
-            "Explicit hint coordinates for plate solving: {'ra': float, 'dec': float} "
-            "in decimal degrees. Takes precedence over target_name."
         ),
     )
     catalog: str = Field(
@@ -372,16 +302,8 @@ def _build_spcc_cmd(
 ) -> str:
     cmd = "spcc"
 
-    # Mono vs OSC sensor/filter configuration
-    if opts.mono_sensor_name:
-        cmd += f' "-monosensor={opts.mono_sensor_name}"'
-        if opts.r_filter:
-            cmd += f' "-rfilter={opts.r_filter}"'
-        if opts.g_filter:
-            cmd += f' "-gfilter={opts.g_filter}"'
-        if opts.b_filter:
-            cmd += f' "-bfilter={opts.b_filter}"'
-    elif opts.osc_sensor_name:
+    # OSC sensor/filter configuration. Mono is on the backlog (item 12).
+    if opts.osc_sensor_name:
         cmd += f' "-oscsensor={opts.osc_sensor_name}"'
         if opts.osc_filter_name:
             cmd += f' "-oscfilter={opts.osc_filter_name}"'
@@ -529,11 +451,6 @@ def _read_wcs_from_fits(fits_path: Path, pixel_size_um: float | None = None) -> 
 @tool(args_schema=ColorCalibrateInput)
 def color_calibrate(
     method: str = "pcc",
-    focal_length_mm: float = 0.0,
-    pixel_size_um: float | None = None,
-    camera_model: str | None = None,
-    target_name: str | None = None,
-    target_coords: dict | None = None,
     catalog: str = "gaia",
     limitmag: str | None = None,
     bgtol_lower: float | None = None,
@@ -548,18 +465,19 @@ def color_calibrate(
     Performs background neutralization and photometric or spectrophotometric
     color calibration.
 
-    Requires a plate-solved image. Plate solving is attempted internally if
-    WCS is not already present in the FITS header. Requires focal_length_mm
-    and pixel_size_um (resolved from equipment.toml or environment if not
-    explicitly provided).
+    Plate solving is attempted internally when WCS is not already present in
+    the FITS header. Imaging focal length, pixel size, and (optional) target
+    coordinates are read from state.dataset.acquisition_meta — they are
+    populated by ingest_dataset and (for focal length) potentially refined
+    by an earlier plate_solve call.
 
     Method guidance:
       pcc — reliable for all OSC/DSLR images, uses Gaia catalog by default.
-      spcc — more accurate, models sensor spectral response.
+      spcc — more accurate, models sensor spectral response. OSC only;
+        mono support is on the backlog.
 
     SPCC modes (configured via spcc_options):
       OSC broadband: set osc_sensor_name, optionally osc_filter_name + osc_lpf.
-      Mono broadband: set mono_sensor_name + r_filter / g_filter / b_filter.
       Narrowband: set narrowband with wavelengths/bandwidths per channel.
       Atmospheric: set atmospheric for extinction correction at low elevations.
       White ref: set white_reference to target a specific reference spectrum.
@@ -568,9 +486,11 @@ def color_calibrate(
       downscale, sip_order, search_radius, catalog, limitmag, no_crop,
       local astrometry.net with blind_pos / blind_res.
 
-    Raises RuntimeError if pixel size cannot be resolved or plate solving fails.
-    On plate solve failure, retry with adjusted platesolve_options (lower sigma,
-    relax=True, explicit target_coords) or correct pixel_size_um / focal_length_mm.
+    Raises ValueError when required state is null
+    (acquisition_meta.focal_length_mm or acquisition_meta.pixel_size_um).
+    Raises RuntimeError when plate solving fails on the input image; retry
+    with adjusted platesolve_options (lower sigma, relax=True) or first
+    call resolve_target so acquisition_meta.target_coords carries a hint.
     """
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"]["current_image"]
@@ -584,27 +504,14 @@ def color_calibrate(
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    try:
-        px_size = resolve_pixel_size(pixel_size_um, camera_model)
-    except ValueError as e:
-        raise RuntimeError(
-            f"Cannot color calibrate: pixel size unknown. {e}\n"
-            "Please set pixel size in the Equipment tab or in equipment.toml [camera] pixel_size_um."
-        ) from e
-
-    # Resolve focal length: explicit arg → env var (UI) → equipment.toml → None
-    resolved_fl = _resolve_fl(focal_length_mm if focal_length_mm and focal_length_mm > 0 else None)
-    if resolved_fl is None:
-        raise RuntimeError(
-            "Cannot color calibrate: focal length unknown. Plate solving requires "
-            "an approximate focal length to constrain the search.\n"
-            "Please set focal length in the Equipment tab or in equipment.toml [optics] focal_length_mm."
-        )
-
-    # Resolve position hint: explicit coords > target_name SIMBAD lookup
-    resolved_coords = target_coords
-    if resolved_coords is None and target_name:
-        resolved_coords = _resolve_target(target_name)
+    # State-canonical equipment reads. equipment_from_state refuses cleanly
+    # with a state-naming message when required fields are null.
+    acq = equipment_from_state(
+        state, require=("focal_length_mm", "pixel_size_um"),
+    )
+    resolved_fl = float(acq["focal_length_mm"])
+    px_size = float(acq["pixel_size_um"])
+    resolved_coords = acq.get("target_coords")
 
     stem = img_path.stem
     output_stem = f"{stem}_cc"
@@ -633,8 +540,11 @@ def color_calibrate(
                 f"platesolve_cmd={platesolve_cmd!r}\n"
                 f"stdout={exc.result.stdout[-600:]!r}\n"
                 f"stderr={exc.result.stderr[-400:]!r}\n"
-                "Retry with adjusted platesolve_options (lower sigma, relax=True), "
-                "explicit target_coords, or corrected pixel_size_um / focal_length_mm."
+                "Retry with adjusted platesolve_options (lower sigma, relax=True). "
+                "If acquisition_meta.target_coords is null, call resolve_target "
+                "to populate a position hint, or correct "
+                "acquisition_meta.pixel_size_um / acquisition_meta.focal_length_mm "
+                "in equipment.toml."
             ) from exc
         raise
 

@@ -687,7 +687,14 @@ class AstroState(TypedDict):
     session: SessionContext
 
     # Core
-    dataset:    Dataset
+    # `dataset` uses deep-merge so multiple post-ingest writers (resolve_target
+    # writes acquisition_meta.target_coords; plate_solve writes
+    # acquisition_meta.focal_length_mm) can each emit delta-only updates and
+    # compose parallel-safely. Tools must emit nested deltas
+    # ({"acquisition_meta": {"target_coords": ...}}), never spread the existing
+    # dataset/acquisition_meta dict — that pattern silently clobbers siblings
+    # under parallel execution. See CLAUDE.md §Reducer Discipline.
+    dataset:    Annotated[Dataset, _merge_dicts]
     phase:      ProcessingPhase
     paths:      Annotated[PathState, _merge_dicts]
     metadata:   Annotated[Metadata, _merge_dicts]

@@ -974,18 +974,25 @@ async def start_session(
     yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
 
     try:
-        # Apply equipment overrides from UI to os.environ
-        if pixel_size and pixel_size > 0:
-            os.environ["PIXEL_SIZE_UM"] = str(pixel_size)
+        # Equipment values from the UI are passed through to ingest_dataset
+        # as override kwargs. ingest writes them straight into
+        # state.dataset.acquisition_meta — state is the canonical contract
+        # downstream tools read; no env-var side channel.
+        #
+        # Siril's per-app config (Markesteijn pass count for X-Trans
+        # demosaic) is set once at app boot via configure_siril_for_equipment
+        # — pass the same sensor_type when the user changes it via the UI.
         if sensor_type:
-            os.environ["SENSOR_TYPE_OVERRIDE"] = sensor_type
-        if focal_length and focal_length > 0:
-            os.environ["FOCAL_LENGTH_MM"] = str(focal_length)
+            from muphrid.config import configure_siril_for_equipment
+            configure_siril_for_equipment(sensor_type_override=sensor_type)
 
         # Ingest dataset
         ingest_result = ingest_dataset.invoke({
             "root_directory": dataset_path,
             "thread_id": thread_id,
+            "override_focal_length_mm": float(focal_length) if focal_length and focal_length > 0 else None,
+            "override_pixel_size_um": float(pixel_size) if pixel_size and pixel_size > 0 else None,
+            "override_sensor_type": sensor_type or None,
         })
 
         # Build session context

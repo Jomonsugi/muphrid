@@ -28,7 +28,7 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from muphrid.equipment import resolve_pixel_size, resolve_target_coords
+from muphrid.equipment import equipment_from_state
 from muphrid.graph.state import AstroState
 from muphrid.tools._siril import SirilError, run_siril_script, siril_script_path
 from muphrid.tools.linear.color_calibrate import _read_wcs_from_fits
@@ -37,37 +37,6 @@ from muphrid.tools.linear.color_calibrate import _read_wcs_from_fits
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class PlateSolveInput(BaseModel):
-    target_name: str | None = Field(
-        default=None,
-        description=(
-            "Astronomical target name resolved via SIMBAD to RA/DEC (e.g. 'M42'). "
-            "Used as position hint when approximate_coords is not provided. "
-            "Prefer calling resolve_target first and passing approximate_coords explicitly."
-        ),
-    )
-    approximate_coords: dict | None = Field(
-        default=None,
-        description=(
-            "Hint coordinates for the image center: {'ra': float, 'dec': float} "
-            "in decimal degrees (J2000). Significantly improves success rate and "
-            "speed. Takes precedence over target_name."
-        ),
-    )
-    focal_length_mm: float | None = Field(
-        default=None,
-        description="Imaging focal length in mm. Overrides image/settings values.",
-    )
-    pixel_size_um: float | None = Field(
-        default=None,
-        description=(
-            "Pixel size in microns. If null, resolved from PIXEL_SIZE_UM env var "
-            "or camera model lookup table."
-        ),
-    )
-    camera_model: str | None = Field(
-        default=None,
-        description="Camera model string for pixel size lookup when pixel_size_um is null.",
-    )
     force_resolve: bool = Field(
         default=False,
         description="Force a new solve even if WCS already present in the FITS header.",
@@ -250,11 +219,6 @@ def _parse_rotation(stdout: str) -> float | None:
 
 @tool(args_schema=PlateSolveInput)
 def plate_solve(
-    target_name: str | None = None,
-    approximate_coords: dict | None = None,
-    focal_length_mm: float | None = None,
-    pixel_size_um: float | None = None,
-    camera_model: str | None = None,
     force_resolve: bool = False,
     no_flip: bool = False,
     downscale: bool = False,
@@ -275,18 +239,32 @@ def plate_solve(
     Astrometric plate solving — determines celestial coordinates and pixel
     scale (arcsec/pixel) of the image.
 
-    Returned measured_focal_length_mm is derived from the measured plate scale and
-    the known pixel size (focal_mm = pixel_um × 206.265 / plate_scale_arcsec). This
-    is more accurate than the manufacturer's nominal focal length.
+    State contract:
+      Required (refused when null):
+        acquisition_meta.focal_length_mm — needed to constrain the search.
+        acquisition_meta.pixel_size_um   — needed to translate plate scale
+          to focal length and to convert star sizes to angular size.
+      Optional:
+        acquisition_meta.target_coords   — used as a position hint that
+          greatly speeds and stabilizes the solve. Call resolve_target first
+          if null.
+
+    On success, plate_solve writes the measured focal length back to
+    acquisition_meta.focal_length_mm (single field — plate-solve wins over
+    equipment.toml). The ToolMessage announces the mutation so the agent's
+    reasoning stays current.
 
     Troubleshooting failed solves:
-      - Provide approximate_coords (even rough RA/DEC helps enormously)
-      - Verify focal_length_mm and pixel_size_um (wrong scale = #1 failure cause)
-      - Try downscale=True for large images (> 6000px)
-      - Try a different catalog (gaia, nomad, tycho2)
-      - Increase limitmag ('+2' or '+3') for sparse fields
-      - Try use_local_astrometry_net=True with blind_pos/blind_res for unknown fields
-      - Set search_radius to widen the cone search
+      - First ensure acquisition_meta.target_coords is populated (run
+        resolve_target). A rough RA/DEC hint helps enormously.
+      - Try downscale=True for large images (> 6000px).
+      - Try a different catalog (gaia, nomad, tycho2).
+      - Increase limitmag ('+2' or '+3') for sparse fields.
+      - Try use_local_astrometry_net=True with blind_pos/blind_res for
+        unknown fields.
+      - Set search_radius to widen the cone search.
+      - Verify acquisition_meta.pixel_size_um and acquisition_meta.focal_length_mm
+        (wrong scale = #1 failure cause). Correct in equipment.toml.
     """
     working_dir = state["dataset"]["working_dir"]
     image_path = state["paths"]["current_image"]
@@ -295,28 +273,13 @@ def plate_solve(
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    resolved_px_um: float | None = None
-    try:
-        resolved_px_um = resolve_pixel_size(pixel_size_um)
-    except ValueError:
-        pass
-
-    # Resolve focal length: explicit arg → env var (UI) → equipment.toml
-    if not focal_length_mm or focal_length_mm <= 0:
-        from muphrid.equipment import resolve_focal_length
-        focal_length_mm = resolve_focal_length()
-        if focal_length_mm is None:
-            raise RuntimeError(
-                "Cannot plate solve: focal length unknown. An approximate focal "
-                "length is needed to constrain the plate solve search.\n"
-                "Please set focal length in the Equipment tab or in "
-                "equipment.toml [optics] focal_length_mm."
-            )
-
-    # Resolve position hint: explicit coords > target_name SIMBAD lookup
-    resolved_coords = approximate_coords
-    if resolved_coords is None and target_name:
-        resolved_coords = resolve_target_coords(target_name)
+    # State-canonical equipment reads. Refuses cleanly when null.
+    acq = equipment_from_state(
+        state, require=("focal_length_mm", "pixel_size_um"),
+    )
+    focal_length_mm = float(acq["focal_length_mm"])
+    resolved_px_um = float(acq["pixel_size_um"])
+    resolved_coords = acq.get("target_coords")
 
     # Rewrite save_disto to a whitespace-free reference before building the
     # command. Siril's tokenizer splits on whitespace and would truncate
@@ -425,22 +388,38 @@ def plate_solve(
             "wcs_source": wcs_info.get("wcs_source"),
         }
 
-        # Discrepancy reporting: inform if measured value differs from user input
-        if measured_fl and focal_length_mm and abs(measured_fl - focal_length_mm) > 1.0:
-            summary["focal_length_note"] = (
-                f"Plate-solve measured {measured_fl:.1f}mm, which differs from the "
-                f"provided {focal_length_mm:.1f}mm. The measured value is more accurate. "
-                f"Consider updating the Equipment tab for future runs."
-            )
+        # Authoritative state mutation: plate solution is the most accurate
+        # focal length measurement we have. Write it back to acquisition_meta
+        # so subsequent scale-sensitive tools read the corrected value.
+        # Single field — plate-solve wins; equipment.toml is just the
+        # starting config the user typed.
+        dataset_delta: dict = {}
+        if measured_fl and measured_fl > 0:
+            dataset_delta["acquisition_meta"] = {"focal_length_mm": float(measured_fl)}
+            if focal_length_mm and abs(measured_fl - focal_length_mm) > 1.0:
+                summary["state_update"] = (
+                    f"Updated acquisition_meta.focal_length_mm: "
+                    f"{focal_length_mm:.1f} → {measured_fl:.1f} "
+                    f"(measured from plate solution; subsequent scale-sensitive "
+                    f"tools will use {measured_fl:.1f})."
+                )
+            else:
+                summary["state_update"] = (
+                    f"Wrote acquisition_meta.focal_length_mm = {measured_fl:.1f} "
+                    f"(measured from plate solution)."
+                )
 
-        return Command(update={
+        update: dict = {
             # Delta-only emit so parallel-update composition works.
             "metadata": {
                 "plate_solve_coords": coords,
                 "pixel_scale": pixel_scale,
             },
             "messages": [ToolMessage(content=json.dumps(summary, indent=2, default=str), tool_call_id=tool_call_id)],
-        })
+        }
+        if dataset_delta:
+            update["dataset"] = dataset_delta
+        return Command(update=update)
 
     except SirilError as exc:
         stdout_lower = exc.result.stdout.lower() + exc.result.stderr.lower()

@@ -81,7 +81,6 @@ def resolve_target(
     session_name = state["session"]["target_name"]
     query = target_name or session_name
     coords, resolved_via = _try_resolve(query)
-    acq = state["dataset"].get("acquisition_meta") or {}
     if coords is None:
         failure_summary = {
             "status": "failed",
@@ -92,11 +91,10 @@ def resolve_target(
                 "('Orion Nebula'). Avoid combined strings like 'M42 Orion Nebula'."
             ),
         }
+        # Delta-only emit. dataset has a deep-merge reducer; nested deltas
+        # compose parallel-safely with other writers of acquisition_meta.
         return Command(update={
-            "dataset": {
-                **state["dataset"],
-                "acquisition_meta": {**acq, "target_coords": None},
-            },
+            "dataset": {"acquisition_meta": {"target_coords": None}},
             "messages": [ToolMessage(content=json.dumps(failure_summary, indent=2, default=str), tool_call_id=tool_call_id)],
         })
 
@@ -109,9 +107,7 @@ def resolve_target(
     }
     return Command(update={
         "dataset": {
-            **state["dataset"],
             "acquisition_meta": {
-                **acq,
                 "target_coords": {"ra": coords["ra"], "dec": coords["dec"]},
             },
         },

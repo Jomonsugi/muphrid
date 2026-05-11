@@ -86,8 +86,32 @@ class IngestDatasetInput(BaseModel):
     override_target_name: str | None = Field(
         default=None,
         description=(
-            "Override the target/object name. Use when the object cannot be "
+            "Override the target/object name. Set when the object cannot be "
             "determined from EXIF/headers or the filename."
+        ),
+    )
+    override_focal_length_mm: float | None = Field(
+        default=None,
+        description=(
+            "Override the imaging focal length in mm. Wins over FITS/EXIF "
+            "headers and equipment.toml. Set by the Gradio Equipment tab; "
+            "leave null in CLI/autonomous runs (equipment.toml is the config)."
+        ),
+    )
+    override_pixel_size_um: float | None = Field(
+        default=None,
+        description=(
+            "Override the sensor pixel size in microns. Wins over FITS/EXIF "
+            "headers and equipment.toml. Set by the Gradio Equipment tab; "
+            "leave null in CLI/autonomous runs."
+        ),
+    )
+    override_sensor_type: str | None = Field(
+        default=None,
+        description=(
+            "Override sensor mosaic type: 'bayer' or 'xtrans'. Wins over "
+            "EXIF detection. Set by the Gradio Equipment tab; leave null in "
+            "CLI/autonomous runs."
         ),
     )
     thread_id: str | None = Field(
@@ -162,13 +186,29 @@ def _sample_frame(file_path: Path) -> _FrameSample | None:
 def _extract_raw_meta(
     light_files: list[Path],
     override_target_name: str | None,
+    override_focal_length_mm: float | None = None,
+    override_pixel_size_um: float | None = None,
+    override_sensor_type: str | None = None,
 ) -> AcquisitionMeta:
     """
     Sample the first light frame for EXIF + sensor metadata using ExifTool.
     Returns a fully typed AcquisitionMeta with sensor characterization fields.
+
+    Override priority (highest wins) for each hardware fact:
+        explicit override kwarg (Gradio Equipment tab)
+        → FITS/EXIF header value
+        → equipment.toml resolver (resolve_focal_length, resolve_pixel_size)
+        → null
     """
     if not light_files:
-        return _empty_meta("raw", override_target_name)
+        meta = _empty_meta("raw", override_target_name)
+        if override_focal_length_mm and override_focal_length_mm > 0:
+            meta["focal_length_mm"] = float(override_focal_length_mm)
+        if override_pixel_size_um and override_pixel_size_um > 0:
+            meta["pixel_size_um"] = float(override_pixel_size_um)
+        if override_sensor_type:
+            meta["sensor_type"] = override_sensor_type
+        return meta
 
     try:
         with exiftool.ExifToolHelper() as et:
@@ -199,24 +239,39 @@ def _extract_raw_meta(
 
     sensor = sensor_info_from_tags(tags)
 
-    # Pixel size: equipment.toml first, then FITS header
+    # Pixel size resolution: override → FITS/EXIF header → equipment.toml → null
     px_um: float | None = None
-    try:
-        px_um = resolve_pixel_size()
-    except ValueError:
-        pass
-    if px_um is None:
+    if override_pixel_size_um and override_pixel_size_um > 0:
+        px_um = float(override_pixel_size_um)
+    else:
         raw_px = _first(tags, _PIXEL_SIZE_KEYS)
         if raw_px is not None:
             try:
                 px_um = float(raw_px)
             except (ValueError, TypeError):
                 pass
+        if px_um is None:
+            try:
+                px_um = resolve_pixel_size()
+            except ValueError:
+                pass
+
+    # Focal length resolution: override → FITS/EXIF header → equipment.toml → null
+    fl_mm: float | None = None
+    if override_focal_length_mm and override_focal_length_mm > 0:
+        fl_mm = float(override_focal_length_mm)
+    elif focal:
+        fl_mm = float(focal)
+    else:
+        fl_mm = resolve_focal_length()
+
+    # Sensor type: override wins over EXIF detection
+    sensor_type = override_sensor_type or sensor.sensor_type
 
     return AcquisitionMeta(
         target_name=override_target_name,
         target_coords=None, # populated later by resolve_target
-        focal_length_mm=resolve_focal_length() or (float(focal) if focal else None),
+        focal_length_mm=fl_mm,
         pixel_size_um=px_um,
         exposure_time_s=exposure,
         iso=iso,
@@ -231,7 +286,7 @@ def _extract_raw_meta(
         white_level=sensor.white_level,
         bit_depth=sensor.bit_depth,
         raw_exposure_bias=sensor.raw_exposure_bias,
-        sensor_type=sensor.sensor_type,
+        sensor_type=sensor_type,
     )
 
 
@@ -389,6 +444,9 @@ def _ingest_raw(
     file_pattern: str | None,
     override_target_name: str | None,
     thread_id: str | None = None,
+    override_focal_length_mm: float | None = None,
+    override_pixel_size_um: float | None = None,
+    override_sensor_type: str | None = None,
 ) -> tuple[Dataset, list[str], dict]:
     target_name = override_target_name or root.name
     warnings: list[str] = []
@@ -446,7 +504,13 @@ def _ingest_raw(
         )
 
     light_paths = [Path(p) for p in buckets["lights"]]
-    meta = _extract_raw_meta(light_paths, target_name)
+    meta = _extract_raw_meta(
+        light_paths,
+        target_name,
+        override_focal_length_mm=override_focal_length_mm,
+        override_pixel_size_um=override_pixel_size_um,
+        override_sensor_type=override_sensor_type,
+    )
 
     if meta.get("iso") is None and meta.get("exposure_time_s") is None:
         warnings.append(
@@ -556,6 +620,9 @@ def _ingest_fits(
     file_pattern: str | None,
     override_target_name: str | None,
     thread_id: str | None = None,
+    override_focal_length_mm: float | None = None,
+    override_pixel_size_um: float | None = None,
+    override_sensor_type: str | None = None,
 ) -> tuple[Dataset, list[str], dict]:
     """
     Ingest FITS files from a dedicated astronomy camera (ZWO, QHY, etc.).
@@ -635,7 +702,13 @@ def _ingest_fits(
     # Extract metadata using the same function as RAW
     # (key tuples now include FITS fallbacks)
     light_paths = [Path(p) for p in buckets["lights"]]
-    meta = _extract_raw_meta(light_paths, target_name)
+    meta = _extract_raw_meta(
+        light_paths,
+        target_name,
+        override_focal_length_mm=override_focal_length_mm,
+        override_pixel_size_um=override_pixel_size_um,
+        override_sensor_type=override_sensor_type,
+    )
 
     calib_warnings = _cross_validate_calibration(meta, buckets)
     warnings.extend(calib_warnings)
@@ -702,6 +775,9 @@ def ingest_dataset(
     root_directory: str,
     file_pattern: str | None = None,
     override_target_name: str | None = None,
+    override_focal_length_mm: float | None = None,
+    override_pixel_size_um: float | None = None,
+    override_sensor_type: str | None = None,
     thread_id: str | None = None,
 ) -> dict:
     """
@@ -729,10 +805,16 @@ def ingest_dataset(
     if fmt == "raw":
         dataset, warnings, summary = _ingest_raw(
             root, file_pattern, override_target_name, thread_id=thread_id,
+            override_focal_length_mm=override_focal_length_mm,
+            override_pixel_size_um=override_pixel_size_um,
+            override_sensor_type=override_sensor_type,
         )
     else:
         dataset, warnings, summary = _ingest_fits(
             root, file_pattern, override_target_name, thread_id=thread_id,
+            override_focal_length_mm=override_focal_length_mm,
+            override_pixel_size_um=override_pixel_size_um,
+            override_sensor_type=override_sensor_type,
         )
 
     return {
