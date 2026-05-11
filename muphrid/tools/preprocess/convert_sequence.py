@@ -28,6 +28,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
+from muphrid.tools._disk import require_free_space
 from muphrid.tools._siril import run_siril_script
 
 
@@ -63,6 +64,20 @@ def _convert_to_sequence(
 
     if not input_files:
         raise ValueError("input_files is empty — nothing to convert.")
+
+    # Disk-space precondition. convert produces a FITSEQ on the order of
+    # the input bytes plus a tempdir copy of the inputs. Estimate
+    # generously (2x input size) so we account for both the tmp copy and
+    # the FITSEQ output, then a debayer multiplier when requested.
+    total_input_bytes = sum(
+        Path(f).stat().st_size for f in input_files if Path(f).exists()
+    )
+    multiplier = 6 if debayer else 2  # 2x input + (3x if debayered)
+    require_free_space(
+        working_dir,
+        bytes_needed=total_input_bytes * multiplier,
+        what=f"FITSEQ {sequence_name}.fit ({len(input_files)} frames)",
+    )
 
     with tempfile.TemporaryDirectory(dir=wdir, prefix=f"{sequence_name}_raw_") as tmpdir:
         tmp = Path(tmpdir)

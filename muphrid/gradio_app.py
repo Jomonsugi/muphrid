@@ -818,7 +818,15 @@ async def _stream_graph(
                 _proposal_rationale_summary(proposal),
             )
 
-        if review_state == "needs_curation":
+        if interrupt_payload.get("type") == "disk_full":
+            footer = (
+                f"**{title}** — system halted.\n\n"
+                f"---\n"
+                f"*Free disk on this volume and send any message to resume. "
+                f"The disk check re-runs on resume; if space is still "
+                f"short, the run halts again with an updated tally.*"
+            )
+        elif review_state == "needs_curation":
             footer = (
                 f"**{title}** — agent needs to select candidates.\n\n"
                 f"---\n"

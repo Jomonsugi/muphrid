@@ -48,6 +48,7 @@ from muphrid.tools._sensor import (
     flat_siril_norm_thresholds,
     read_frame_exif,
 )
+from muphrid.tools._disk import require_free_space
 from muphrid.tools._siril import SirilError, run_siril_script, siril_script_path
 from muphrid.tools.preprocess.convert_sequence import _convert_to_sequence
 
@@ -462,6 +463,18 @@ def build_masters(
     # clean name in working_dir and returns the basename.
     stack_seq = seq_name
     if ft == "flat" and master_bias_path:
+        # Disk check before bias-subtraction writes pp_<seq>.fit. Output
+        # size is comparable to the input FITSEQ (no debayer).
+        flat_seq_fit = wdir / f"{seq_name}.fit"
+        if not flat_seq_fit.exists():
+            flat_seq_fit = wdir / f"{seq_name}.fits"
+        if flat_seq_fit.exists():
+            require_free_space(
+                str(wdir),
+                bytes_needed=flat_seq_fit.stat().st_size,
+                what=f"bias-calibrated flat FITSEQ pp_{seq_name}.fit",
+            )
+
         bias_ref = siril_script_path(master_bias_path, wdir)
         run_siril_script(
             [f"calibrate {seq_name} -bias={bias_ref} -fitseq"],

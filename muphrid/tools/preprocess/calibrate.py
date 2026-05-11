@@ -59,6 +59,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
+from muphrid.tools._disk import require_free_space
 from muphrid.tools._siril import run_siril_script, siril_script_path
 
 
@@ -303,6 +304,24 @@ def calibrate(
         parts.append("-opt")
 
     calibrate_cmd = " ".join(parts)
+
+    # Disk-space precondition. calibrate reads the CFA FITSEQ and writes
+    # a calibrated FITSEQ (pp_<seq>.fit). When debayer=True the output
+    # is 3-channel float so the working file roughly triples in size;
+    # otherwise it stays comparable. Refuse upfront with a typed
+    # disk_full interrupt rather than letting Siril fail mid-write with
+    # an opaque CFITSIO error.
+    input_fit = Path(working_dir) / f"{lights_sequence}.fit"
+    if not input_fit.exists():
+        input_fit = Path(working_dir) / f"{lights_sequence}.fits"
+    if input_fit.exists():
+        multiplier = 3 if debayer else 1
+        require_free_space(
+            working_dir,
+            bytes_needed=input_fit.stat().st_size * multiplier,
+            what=f"calibrated FITSEQ pp_{lights_sequence}.fit",
+        )
+
     result = run_siril_script([calibrate_cmd], working_dir=working_dir, timeout=600)
 
     # Stdout parse stays as a supplementary diagnostic — NOT the source of

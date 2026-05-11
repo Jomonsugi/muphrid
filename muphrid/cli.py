@@ -453,6 +453,59 @@ def _run_graph(
 
         interrupt_type = interrupt_payload.get("type", "unknown")
 
+        if interrupt_type == "disk_full":
+            # System-detected precondition refusal. Only the operator can
+            # free disk — the agent has no recourse. Same mode-aware CLI
+            # shape as flag_dataset_issue: autonomous exits cleanly so an
+            # unattended user returns to a clear signal; attended prompts
+            # so the user can fix and resume in-place.
+            what = interrupt_payload.get("what", "(unknown output)")
+            wdir = interrupt_payload.get("working_dir", "?")
+            needed = interrupt_payload.get("needed_bytes", 0)
+            free = interrupt_payload.get("free_bytes", 0)
+            short = interrupt_payload.get("shortfall_bytes", 0)
+
+            def _h(b: int) -> str:
+                v = float(b)
+                for u in ("B", "KiB", "MiB", "GiB", "TiB"):
+                    if v < 1024:
+                        return f"{v:.1f} {u}"
+                    v /= 1024
+                return f"{v:.1f} PiB"
+
+            typer.echo(f"\n{'=' * 60}")
+            typer.echo("INSUFFICIENT DISK SPACE — pipeline halted")
+            typer.echo(f"{'=' * 60}")
+            typer.echo(f"\nTool was about to write: {what}")
+            typer.echo(f"Working dir:             {wdir}")
+            typer.echo(f"Needed:                  {_h(needed)}")
+            typer.echo(f"Free:                    {_h(free)}")
+            typer.echo(f"Short by:                {_h(short)}")
+            typer.echo(
+                "\nFree disk on this volume (delete old runs/ subdirs, "
+                "move files off the drive, etc.) and resume."
+            )
+            typer.echo(f"\n{'=' * 60}")
+
+            if autonomous:
+                thread_id = config.get("configurable", {}).get("thread_id", "?")
+                typer.echo(
+                    f"\n[autonomous] Halting on disk shortfall. "
+                    f"Thread '{thread_id}' is preserved on disk. "
+                    f"Free space and re-run with --resume {thread_id} to continue."
+                )
+                raise typer.Exit(code=2)
+
+            # Attended CLI: prompt and resume. The disk check re-runs on
+            # resume; if still insufficient, the interrupt fires again.
+            typer.prompt(
+                "Press ENTER once disk has been freed (anything to resume)",
+                default="",
+                show_default=False,
+            )
+            stream_input = Command(resume="resume")
+            continue
+
         if interrupt_type == "flag_dataset_issue":
             # Agent-initiated escape hatch. Fires regardless of autonomous
             # mode — this is the documented exception. CLI behavior is

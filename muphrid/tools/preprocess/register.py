@@ -47,6 +47,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from muphrid.graph.state import AstroState
+from muphrid.tools._disk import require_free_space
 from muphrid.tools._siril import run_siril_script, siril_script_path
 
 
@@ -619,6 +620,25 @@ def siril_register(
             apply_parts.extend(_build_filter_flags(parsed_filters))
 
         commands.append(" ".join(apply_parts))
+
+    # ── Disk-space precondition ───────────────────────────────────────────
+    # siril_register reads the calibrated FITSEQ and writes a registered
+    # FITSEQ of comparable size. On a 609-frame debayered sequence that
+    # can easily be 180+ GB. If the working volume can't hold it, Siril
+    # writes a partial file, hits a CFITSIO error mid-stream, and aborts
+    # with a misleading "Extension doesn't start with SIMPLE/XTENSION"
+    # message. Refuse upfront with a typed disk_full interrupt so the
+    # human can free space and resume cleanly.
+    input_fit = Path(working_dir) / f"{calibrated_sequence}.fit"
+    if not input_fit.exists():
+        input_fit = Path(working_dir) / f"{calibrated_sequence}.fits"
+    if input_fit.exists():
+        out_name = f"{prefix or 'r_'}{calibrated_sequence}.fit"
+        require_free_space(
+            working_dir,
+            bytes_needed=input_fit.stat().st_size,
+            what=f"registered FITSEQ {out_name}",
+        )
 
     # ── Execute ───────────────────────────────────────────────────────────
     result = run_siril_script(commands, working_dir=working_dir, timeout=900)
