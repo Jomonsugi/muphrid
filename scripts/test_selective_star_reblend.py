@@ -30,12 +30,6 @@ import numpy as np
 from astropy.io import fits as astropy_fits
 from skimage.color import rgb2hsv
 
-# Import the graph package first to trigger full registry init in the
-# correct order — the tool modules below all import from muphrid.graph.state,
-# which transitively loads registry, which imports the tool modules. Direct
-# tool imports without this priming hit a circular ImportError.
-import muphrid.graph  # noqa: F401
-
 from muphrid.tools.utility.t40_analyze_star_population import (
     analyze_star_population,
 )

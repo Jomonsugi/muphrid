@@ -29,6 +29,7 @@ Target states (per frame):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -245,13 +246,58 @@ def _run_bias_test(working_dir: Path, bias_files: list[Path]) -> list[BiasEval]:
 
 # ── Folder aggregate (T02) ─────────────────────────────────────────────────────
 
+def _stack_params(n: int) -> tuple[str, str]:
+    """Pick stack_method/rejection_method by frame count (matches T02 docstrings)."""
+    if n < 15:
+        return "mean", "winsorized"
+    if n <= 50:
+        return "mean", "sigma"
+    return "mean", "linear"
+
+
+def _synthetic_state(
+    working_dir: Path,
+    files_kind: str,  # "biases" or "flats"
+    files: list[Path],
+    master_bias_path: str | None = None,
+) -> dict:
+    """Minimal AstroState-shaped dict for direct `build_masters.func(...)` calls.
+
+    CLAUDE.md §Synthetic State Exception: invoking a tool's `.func` with a
+    constructed state dict is the documented pattern for scripts/tests.
+    """
+    inventory = {"lights": [], "darks": [], "flats": [], "biases": []}
+    inventory[files_kind] = [str(p.resolve()) for p in files]
+    return {
+        "dataset": {
+            "working_dir": str(working_dir),
+            "files": inventory,
+        },
+        "paths": {"masters": {"bias": master_bias_path} if master_bias_path else {}},
+    }
+
+
+def _invoke_build_masters(
+    state: dict,
+    file_type: str,
+    stack_method: str,
+    rejection_method: str,
+) -> dict:
+    """Call build_masters.func with synthetic state; return parsed JSON result."""
+    cmd = build_masters.func(
+        file_type=file_type,
+        stack_method=stack_method,
+        rejection_method=rejection_method,
+        tool_call_id="diagnostic",
+        state=state,
+    )
+    return json.loads(cmd.update["messages"][0].content)
+
+
 def _run_t02_bias(working_dir: Path, bias_files: list[Path]) -> tuple[str, float | None]:
-    result = build_masters.invoke({
-        "working_dir": str(working_dir),
-        "file_type": "bias",
-        "input_files": [str(p.resolve()) for p in bias_files],
-    })
-    return result["master_path"], result["diagnostics"]["quality_flags"].get("median")
+    state = _synthetic_state(working_dir, "biases", bias_files)
+    result = _invoke_build_masters(state, "bias", "median", "none")
+    return result["master_path"], result["quality_flags"].get("median")
 
 
 def _run_t02_folder_flat(
@@ -261,15 +307,11 @@ def _run_t02_folder_flat(
     label: str,
 ) -> FlatEval:
     """Run T02 on a group of flats. Reports Siril-normalized median + sensor thresholds."""
+    stack_method, rejection_method = _stack_params(len(flat_files))
     try:
-        result = build_masters.invoke({
-            "working_dir": str(working_dir),
-            "file_type": "flat",
-            "input_files": [str(p.resolve()) for p in flat_files],
-            "master_bias_path": master_bias_path,
-        })
-        diag = result["diagnostics"]
-        qf = diag["quality_flags"]
+        state = _synthetic_state(working_dir, "flats", flat_files, master_bias_path)
+        result = _invoke_build_masters(state, "flat", stack_method, rejection_method)
+        qf = result["quality_flags"]
         siril_norm = qf.get("flat_median_normalized")
         norm_min = qf.get("flat_norm_threshold_min")
         norm_max = qf.get("flat_norm_threshold_max")
@@ -285,7 +327,7 @@ def _run_t02_folder_flat(
             siril_norm_median=float(siril_norm) if siril_norm is not None else None,
             siril_norm_min=float(norm_min) if norm_min is not None else None,
             siril_norm_max=float(norm_max) if norm_max is not None else None,
-            warnings=list(diag["warnings"]),
+            warnings=list(result.get("warnings", [])),
         )
     except Exception as e:
         return FlatEval(
@@ -381,10 +423,12 @@ def main() -> int:
           f"UNDER=<{TARGET_FILL_MIN*100:.0f}%  OVER=>{TARGET_FILL_MAX*100:.0f}%  "
           f"SATURATED=clipped")
 
-    # Build master bias (needed for folder aggregate check)
-    bias_master_dir = wd / "bias_master"
-    bias_master_dir.mkdir(parents=True, exist_ok=True)
-    master_bias_path, _ = _run_t02_bias(bias_master_dir, biases)
+    # Build master bias only when the folder-aggregate path will consume it.
+    master_bias_path: str | None = None
+    if not args.skip_folder and len(flats) > 1:
+        bias_master_dir = wd / "bias_master"
+        bias_master_dir.mkdir(parents=True, exist_ok=True)
+        master_bias_path, _ = _run_t02_bias(bias_master_dir, biases)
 
     # ── Individual flat checks ─────────────────────────────────────────────────
     if not args.skip_individual:
