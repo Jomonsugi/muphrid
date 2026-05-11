@@ -19,19 +19,19 @@ target, sky quality, equipment notes
 LangGraph processing graph
     |
     +--> phase_router
-    |        selects phase-specific tool set
+    | selects phase-specific tool set
     |
     +--> agent
-    |        LLM with current phase tools bound
+    | LLM with current phase tools bound
     |
     +--> auto_checkpoint
-    |        bookmarks image before mutating tools
+    | bookmarks image before mutating tools
     |
     +--> action
-    |        executes tool calls
+    | executes tool calls
     |
     +--> variant_snapshot
-    |        captures reviewable image variants
+    | captures reviewable image variants
     |
     +--> hitl_check
              opens or resumes human review gates
@@ -140,11 +140,11 @@ Tool implementations live under `muphrid/tools/`.
 
 ```text
 tools/
-  preprocess/   calibration, registration, stacking
-  linear/       linear-stage image processing
-  nonlinear/    stretch-adjacent and nonlinear image processing
-  scikit/       local Python/scikit-image processing tools
-  utility/      analysis, export, checkpoints, review, masks, previews
+  preprocess/ calibration, registration, stacking
+  linear/ linear-stage image processing
+  nonlinear/ stretch-adjacent and nonlinear image processing
+  scikit/ local Python/scikit-image processing tools
+  utility/ analysis, export, checkpoints, review, masks, previews
 ```
 
 Each tool is a LangChain tool with a Pydantic `args_schema`. The registry checks for schema/function drift at startup so a tool cannot silently expose parameters the function does not accept.

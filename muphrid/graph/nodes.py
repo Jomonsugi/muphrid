@@ -3,7 +3,7 @@ Graph nodes — phase_router, agent, action, hitl_check, phase_advance.
 
 See graph_design.md for the architecture:
 
-    phase_router → agent → action → hitl_check → agent  (ReAct loop)
+    phase_router → agent → action → hitl_check → agent (ReAct loop)
                      │
                      └── (no tool_calls) → phase_advance → phase_router
 """
@@ -93,11 +93,11 @@ def route_after_phase_router(state: AstroState) -> str:
 # Messages stay text-only — they are the audit trail, not the visual context.
 #
 # Writers to visual_context:
-#   - variant_snapshot   → mirrors variant_pool (source="hitl_variant")
-#   - promote_variant    → drops hitl_variant entries, keeps approved as
-#                          source="phase_carry"
-#   - present_images     → replaces source="present_images" entries
-#   - advance_phase      → clears the list
+# - variant_snapshot → mirrors variant_pool (source="hitl_variant")
+# - promote_variant → drops hitl_variant entries, keeps approved as
+# source="phase_carry"
+# - present_images → replaces source="present_images" entries
+# - advance_phase → clears the list
 #
 # The helpers in this section never mutate state; they read it and return
 # a new message list to pass to the model.
@@ -216,7 +216,7 @@ def _current_image_ref(state: AstroState) -> VisualRef | None:
       - state.paths.current_image must be set; the derived agent-VLM preview
         (smaller sibling under <working_dir>/previews/) must exist on disk.
       - We prefer the agent-sized VLM preview (`preview_<stem>_vlm.jpg`) when
-        present — produced at ~1024px / q=85 by t22_generate_preview alongside
+        present — produced at ~1024px / q=85 by generate_preview alongside
         the human-facing 1920px preview. If only the human preview exists, we
         fall back to it rather than skipping (correctness over cost).
 
@@ -276,10 +276,10 @@ def _select_visible_refs(state: AstroState) -> list[VisualRef]:
     """
     Pick the images the agent should see right now. Four sources:
 
-      - state.variant_pool   → projected to VisualRefs (active decision space
+      - state.variant_pool → projected to VisualRefs (active decision space
                                 during a HITL gate or sandwich-iteration in
                                 autonomous mode). Source label "hitl_variant".
-      - current_image        → auto-projected anchor produced by
+      - current_image → auto-projected anchor produced by
                                 _current_image_ref(state) when vlm_phase_eligible.
                                 Source label "current_image".
       - state.visual_context → present_images and phase_carry entries the
@@ -384,7 +384,7 @@ def _format_variant_pool_for_prompt(variant_pool: list[Variant]) -> str:
                 metric_strs.append(f"{key}={val:.3f}")
             else:
                 metric_strs.append(f"{key}={val}")
-        suffix = f"  ({', '.join(metric_strs)})" if metric_strs else ""
+        suffix = f" ({', '.join(metric_strs)})" if metric_strs else ""
         lines.append(f"- **{vid}** — {label}{suffix}")
     return "\n".join(lines)
 
@@ -548,9 +548,9 @@ def _check_text_loop(messages: list) -> None:
         return
 
     # Walk the tail backward. Count text-only AIMessages until we hit:
-    #   - A HumanMessage (conversation interleave — resets the run)
-    #   - An AIMessage with tool_calls (agent did something — resets)
-    #   - A ToolMessage (tool ran — resets)
+    # - A HumanMessage (conversation interleave — resets the run)
+    # - An AIMessage with tool_calls (agent did something — resets)
+    # - A ToolMessage (tool ran — resets)
     run_texts: list[str] = []
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
@@ -574,7 +574,7 @@ def _check_text_loop(messages: list) -> None:
         f"detector doesn't catch — the agent is talking to itself "
         f"instead of advancing the work. Most recent response "
         f"(first 200 chars):\n"
-        f"  {run_texts[0][:200]!r}\n"
+        f" {run_texts[0][:200]!r}\n"
         f"To override, set MAX_CONSECUTIVE_TEXT_ONLY=0 in .env. "
         f"To raise the trigger threshold, set MAX_CONSECUTIVE_TEXT_ONLY=N."
     )
@@ -606,7 +606,7 @@ def _check_phase_tool_limit(messages: list, phase) -> None:
     tool_call_count = 0
     for msg in reversed(messages):
         if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "advance_phase":
-            break  # reached the start of this phase
+            break # reached the start of this phase
         if isinstance(msg, AIMessage) and msg.tool_calls:
             tool_call_count += len(msg.tool_calls)
 
@@ -624,20 +624,20 @@ def _check_phase_tool_limit(messages: list, phase) -> None:
 # Markers that identify a ToolMessage as a failure. Successful tools return
 # JSON (dict/list) in their content; failing tools yield free-form error text
 # from _format_tool_error or raw exception strings. We check:
-#   1. content is a dict/list with "error" or "success": false
-#   2. OR content is a string that matches any known failure prefix
+# 1. content is a dict/list with "error" or "success": false
+# 2. OR content is a string that matches any known failure prefix
 # Substring matching is sufficient because _format_tool_error standardizes
 # on these prefixes and SirilError messages contain "siril-cli exited".
 _TOOL_ERROR_MARKERS: tuple[str, ...] = (
-    "Tool '",                 # "Tool 'X' failed ..." from _format_tool_error
-    "Error:",                 # generic error prefix
-    "Error in line ",         # Siril script error
-    "siril-cli exited",       # SirilError
+    "Tool '", # "Tool 'X' failed ..." from _format_tool_error
+    "Error:", # generic error prefix
+    "Error in line ", # Siril script error
+    "siril-cli exited", # SirilError
     "Traceback (most recent", # unraised exceptions leaking through
-    "validation error",       # pydantic validation
-    "FileNotFoundError",      # raised from tool bodies
-    "RuntimeError",           # raised from tool bodies
-    "ValueError",             # raised from tool bodies
+    "validation error", # pydantic validation
+    "FileNotFoundError", # raised from tool bodies
+    "RuntimeError", # raised from tool bodies
+    "ValueError", # raised from tool bodies
     "with an internal error", # _format_tool_error fallback
 )
 
@@ -785,7 +785,7 @@ def _check_stuck_loop(messages: list) -> None:
             # advance_phase marks the start of a new phase = clean slate
             if getattr(msg, "name", None) == "advance_phase":
                 break
-            continue  # other tool results don't affect the count
+            continue # other tool results don't affect the count
         if isinstance(msg, HumanMessage):
             # Human intervention resets — re-application after feedback is OK
             break
@@ -875,7 +875,7 @@ def _check_stuck_loop(messages: list) -> None:
 # DeepSeek-V3 (via Together AI) occasionally degenerates and emits its internal
 # tool-call delimiters as plain text instead of populating the tool_calls field:
 #
-#   <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_name<｜tool▁sep｜>{...}<｜tool▁call▁end｜>
+# <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_name<｜tool▁sep｜>{...}<｜tool▁call▁end｜>
 #
 # When this happens, route_after_agent sees no tool_calls and routes to
 # agent_chat, which nudges the model — making the loop worse (growing indent).
@@ -1472,7 +1472,7 @@ _VARIANT_METRIC_KEYS = (
 
 def _phase_short_code(hitl_key: str | None) -> str:
     """
-    Extract the 'T09'-style prefix from a hitl_key like 'T09_gradient'.
+    Extract the 'remove_gradient'-style prefix from a hitl_key like 'T09_gradient'.
     Falls back to 'TXX' if the key doesn't follow the convention.
     """
     if not hitl_key:
@@ -1608,7 +1608,7 @@ def _make_variant(
 
     params = _extract_variant_params(tool_msg, ai_msg)
 
-    # Generate stable id: T09_v1, T09_v2, ...  (counts existing entries with
+    # Generate stable id: T09_v1, T09_v2, ... (counts existing entries with
     # the same prefix; pool is per-gate so this stays small)
     same_phase = [v for v in pool if v.get("id", "").startswith(f"{short}_v")]
     n = len(same_phase) + 1
@@ -1673,7 +1673,7 @@ def _resolve_variant_preview(
         return None
     if not working_dir:
         return None
-    from muphrid.tools.utility.t22_generate_preview import generate_preview
+    from muphrid.tools.utility.generate_preview import generate_preview
     p = Path(fits_path)
     render_mode = "linear_autostretch" if is_linear else "display_faithful"
     expected = Path(working_dir) / "previews" / f"preview_{p.stem}_{render_mode}.jpg"
@@ -1723,7 +1723,7 @@ def variant_snapshot(state: AstroState) -> dict[str, Any]:
             trailing.append(msg)
         else:
             break
-    trailing.reverse()  # restore chronological order
+    trailing.reverse() # restore chronological order
 
     if not trailing:
         return {}
@@ -1801,7 +1801,7 @@ def build_variant_promotion_update(
       - paths.current_image := variant.file_path
       - variant_pool := []
       - visual_context := <existing> + phase_carry entry for the approved variant
-      - metadata.last_committed_variant := {id, file_path}  (race-fix signal:
+      - metadata.last_committed_variant := {id, file_path} (race-fix signal:
         lets commit_variant detect "already promoted via HITL" when the pool
         has been cleared and return idempotent success instead of an error)
 
@@ -1955,7 +1955,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     # ── No HITL tool found in recent messages ────────────────────────
     if hitl_key is None:
         if not review_open:
-            return {}  # no HITL mapping, no active conversation — pass through
+            return {} # no HITL mapping, no active conversation — pass through
 
         # Active review: agent called a non-HITL tool (analyze_image, present_images)
         # Let it pass through so the agent sees the result.
@@ -2160,7 +2160,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         _active_hitl_key, active_tool_name = review_ctl.active_review_tool(state)
         if active_tool_name == "export_final":
             try:
-                from muphrid.tools.utility.t24_export import commit_export_update
+                from muphrid.tools.utility.export import commit_export_update
 
                 commit_update, commit_summary = commit_export_update(
                     state,
@@ -2368,9 +2368,9 @@ def agent_chat(state: AstroState) -> dict[str, Any]:
                 or msg.additional_kwargs.get("is_hitl_turn_policy")
             )
         ):
-            continue  # skip our own nudge injections
+            continue # skip our own nudge injections
         else:
-            break  # tool results, HITL feedback, etc. reset the counter
+            break # tool results, HITL feedback, etc. reset the counter
 
     if consecutive_text_only >= max_nudges:
         raise NudgeLimitError(

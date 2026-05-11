@@ -127,7 +127,7 @@ def _recover_via_python(src: Path, dst: Path) -> tuple[bool, str]:
             try:
                 dst_cur.execute(s)
             except sqlite3.OperationalError as e:
-                print(f"  warning: could not recreate table from `{s[:80]}...`: {e}")
+                print(f" warning: could not recreate table from `{s[:80]}...`: {e}")
         dst_conn.commit()
 
         total_recovered = 0
@@ -156,9 +156,9 @@ def _recover_via_python(src: Path, dst: Path) -> tuple[bool, str]:
                 dst_conn.commit()
                 total_recovered += n_recovered
                 total_failed += n_failed
-                print(f"  {tbl}: recovered {n_recovered}, lost {n_failed}")
+                print(f" {tbl}: recovered {n_recovered}, lost {n_failed}")
             except sqlite3.DatabaseError as e:
-                print(f"  {tbl}: could not recover — {e}")
+                print(f" {tbl}: could not recover — {e}")
 
         src_conn.close()
         dst_conn.close()
@@ -170,19 +170,19 @@ def _recover_via_python(src: Path, dst: Path) -> tuple[bool, str]:
 def recover(db_path: Path) -> int:
     """Returns shell-style exit code: 0 on success, 1 on hard failure."""
     if not db_path.exists():
-        print(f"  [no file] {db_path}")
+        print(f" [no file] {db_path}")
         return 0
 
     print(f"Checking {db_path} ({db_path.stat().st_size:,} bytes)...")
     ok, issues = _integrity_check(db_path)
     if ok:
-        print(f"  integrity_check: ok — nothing to recover")
+        print(f" integrity_check: ok — nothing to recover")
         return 0
-    print(f"  integrity_check: {len(issues)} issue(s)")
+    print(f" integrity_check: {len(issues)} issue(s)")
     for issue in issues[:5]:
-        print(f"    - {issue[:160]}")
+        print(f" - {issue[:160]}")
     if len(issues) > 5:
-        print(f"    - ... ({len(issues) - 5} more)")
+        print(f" - ... ({len(issues) - 5} more)")
     print()
 
     candidate = db_path.with_suffix(db_path.suffix + ".recovered")
@@ -193,17 +193,17 @@ def recover(db_path: Path) -> int:
     if sqlite3_bin:
         print(f"Recovering via sqlite3 CLI ({sqlite3_bin})...")
         ok, msg = _recover_via_cli(db_path, candidate, sqlite3_bin)
-        print(f"  {msg}")
+        print(f" {msg}")
         if not ok:
-            print(f"  CLI recovery failed; falling back to Python row-walk.")
+            print(f" CLI recovery failed; falling back to Python row-walk.")
             if candidate.exists():
                 candidate.unlink()
             ok, msg = _recover_via_python(db_path, candidate)
-            print(f"  {msg}")
+            print(f" {msg}")
     else:
         print("Recovering via Python row-walk (sqlite3 CLI not on PATH)...")
         ok, msg = _recover_via_python(db_path, candidate)
-        print(f"  {msg}")
+        print(f" {msg}")
 
     if not ok or not candidate.exists():
         print("\nRecovery FAILED. Original file is untouched.")
@@ -213,21 +213,21 @@ def recover(db_path: Path) -> int:
     if not rec_ok:
         print(f"\nrecovered DB integrity: {len(rec_issues)} issue(s) remain")
         for issue in rec_issues[:5]:
-            print(f"  - {issue[:160]}")
+            print(f" - {issue[:160]}")
         print(
             "\nRefusing to promote a damaged recovered file. The original is "
             "untouched. Inspect manually, or fall back to a good backup."
         )
         return 1
-    print(f"\n  recovered DB integrity: ok")
+    print(f"\n recovered DB integrity: ok")
 
     quarantine = db_path.with_name(
         f"{db_path.name}.corrupt-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
     )
     shutil.move(str(db_path), str(quarantine))
-    print(f"  quarantined corrupt file: {db_path} -> {quarantine}")
+    print(f" quarantined corrupt file: {db_path} -> {quarantine}")
     shutil.move(str(candidate), str(db_path))
-    print(f"  promoted recovered DB:    {candidate} -> {db_path}")
+    print(f" promoted recovered DB: {candidate} -> {db_path}")
 
     # Report what we got
     conn = sqlite3.connect(str(db_path))
@@ -240,7 +240,7 @@ def recover(db_path: Path) -> int:
         conn.close()
     print(f"\nRecovered {len(per_thread)} thread(s), {sum(c for _, c in per_thread)} checkpoint(s), {n_writes} write(s):")
     for tid, cnt in per_thread:
-        print(f"  {tid}: {cnt}")
+        print(f" {tid}: {cnt}")
     return 0
 
 

@@ -164,20 +164,20 @@ class MasterPaths(TypedDict):
 class PathState(TypedDict):
     current_image:      str | None   # FITS path of the working image — always current
     latest_preview:     str | None   # JPG path of the most recent preview — HITL only
-    starless_image:     str | None   # set after star_removal (T15)
-    star_mask:          str | None   # set after star_removal (T15)
+    starless_image:     str | None   # set after star_removal
+    star_mask:          str | None   # set after star_removal
     masters:            MasterPaths
-    pre_gradient_image: str | None   # snapshot before T09 — HITL before/after comparison
-    pre_decon_image:    str | None   # snapshot before T13 — HITL before/after comparison
+    pre_gradient_image: str | None   # snapshot before remove_gradient — HITL before/after comparison
+    pre_decon_image:    str | None   # snapshot before deconvolution — HITL before/after comparison
 
     # Preprocessing sequence chain — each tool writes its output name here
     # so the next tool can read it via InjectedState without the LLM tracking paths.
-    lights_sequence:      str | None        # sequence name after T02b → read by T03
-    calibrated_sequence:  str | None        # sequence name after T03  → read by T04, T05
-    registered_sequence:  str | None        # sequence name after T04  → read by T07
-    selected_frames:      list[str] | None  # accepted frame keys after T06 → read by T07
+    lights_sequence:      str | None        # sequence name after convert_sequence → read by calibrate
+    calibrated_sequence:  str | None        # sequence name after calibrate  → read by siril_register, analyze_frames
+    registered_sequence:  str | None        # sequence name after siril_register  → read by siril_stack
+    selected_frames:      list[str] | None  # accepted frame keys after select_frames → read by siril_stack
 
-    # Latest mask FITS path — written by T25, optionally read by T27
+    # Latest mask FITS path — written by create_mask, optionally read by multiscale_process
     latest_mask:          str | None
 
 
@@ -247,7 +247,7 @@ class Metadata(TypedDict):
     # than loop on rewinds.
     phase_rewind_counts: dict[str, int] | None
 
-    # Export bookkeeping — written by t24_export and backend export approval.
+    # Export bookkeeping — written by export and backend export approval.
     #   export_done       : True after a successful direct export OR after
     #                       commit_export promotes a tentative export.
     #   exported_files    : list of {"path", "format", "icc_profile",
@@ -277,9 +277,9 @@ class FrameMetrics(TypedDict, total=False):
 
 class Metrics(TypedDict):
     frame_stats:         dict[str, FrameMetrics]  # keyed by filename
-    frame_summary:       dict | None              # summary stats from T05 (median_fwhm, etc.)
+    frame_summary:       dict | None              # summary stats from analyze_frames (median_fwhm, etc.)
 
-    # Core image quality (from T20 analyze_image)
+    # Core image quality (from analyze_image)
     current_fwhm:        float | None
     current_background:  float | None
     current_noise:       float | None
@@ -287,7 +287,7 @@ class Metrics(TypedDict):
     snr_estimate:        float | None
     dynamic_range_db:    float | None
 
-    # Per-channel statistics (from T20 channels)
+    # Per-channel statistics (from analyze_image channels)
     channel_stats:       dict | None              # per-channel mean/median/std
 
     # Background characterization
@@ -299,7 +299,7 @@ class Metrics(TypedDict):
     green_excess:        float | None
     channel_imbalance:   float | None             # max - min channel mean
 
-    # Color saturation (HSV-based, drives T18)
+    # Color saturation (HSV-based, drives saturation_adjust)
     mean_saturation:     float | None
     median_saturation:   float | None
 
@@ -315,7 +315,7 @@ class Metrics(TypedDict):
     clipped_shadows_pct:    float | None
     clipped_highlights_pct: float | None
 
-    # Star metrics (from T20 photutils)
+    # Star metrics (from analyze_image photutils)
     star_count:          int | None
     fwhm_std:            float | None             # PSF uniformity indicator
     median_star_peak_ratio: float | None          # star dominance indicator
@@ -323,7 +323,7 @@ class Metrics(TypedDict):
     # Contrast (p95 - p5 luminance range)
     contrast_ratio:      float | None
 
-    # Structured additions from analyze_image. See T20 docstring for the
+    # Structured additions from analyze_image. See analyze_image docstring for the
     # full definition of each. All optional so legacy callers keep working.
     pixel_coverage:        dict | None            # total / n_valid / valid_pct / etc.
     clipping_per_channel:  dict | None            # per-channel clip staircase at chosen thresholds
@@ -339,7 +339,7 @@ class Metrics(TypedDict):
 
 class AcquisitionMeta(TypedDict):
     target_name:      str | None
-    target_coords:    dict | None   # {"ra": float, "dec": float} J2000, from T29 resolve_target
+    target_coords:    dict | None   # {"ra": float, "dec": float} J2000, from resolve_target
     focal_length_mm:  float | None
     pixel_size_um:    float | None
     exposure_time_s:  float | None   # per-frame exposure in seconds
@@ -349,14 +349,14 @@ class AcquisitionMeta(TypedDict):
     bortle:           int | None
     camera_model:     str | None
     telescope:        str | None
-    input_format:     str | None     # "fits" | "raw" — set by T01, read by T03
+    input_format:     str | None     # "fits" | "raw" — set by ingest_dataset, read by calibrate
 
-    # Sensor characterization — populated by T01, used by T02 for sensor-relative thresholds
+    # Sensor characterization — populated by ingest_dataset, used by build_masters for sensor-relative thresholds
     black_level:       int | None    # pedestal ADU (e.g. 1022 for Fuji X-T30 II)
     white_level:       int | None    # sensor full-well ADU (e.g. 16383 for 14-bit)
     bit_depth:         int | None    # raw bit depth: 12, 14, or 16
     raw_exposure_bias: float | None  # stops (Fuji RAF:RawExposureBias; None for non-Fuji)
-    sensor_type:       str | None    # "bayer" | "xtrans" — affects T03 debayer kernel
+    sensor_type:       str | None    # "bayer" | "xtrans" — affects calibrate debayer kernel
 
 
 class FileInventory(TypedDict):
@@ -630,8 +630,8 @@ class SessionContext(TypedDict):
                       alone is sufficient.
 
       remove_stars  — User intent for star processing:
-                       True  → run star_removal (T15) + star_restoration (T19)
-                       False → skip T15/T19 entirely
+                       True  → run star_removal + star_restoration
+                       False → skip star_removal/star_restoration entirely
                        None  → ask via HITL when the agent reaches that decision point
                       Default None — the agent uses HITL to ask a simple yes/no.
 
@@ -746,7 +746,7 @@ class AstroState(TypedDict):
 def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
     """
     Build a minimal valid AstroState for a new dataset.
-    Called by make_initial_state() in cli.py after T01 ingest_dataset runs.
+    Called by make_initial_state() in cli.py after ingest_dataset runs.
 
     session is the human-provided startup context: target_name (required),
     bortle (optional), remove_stars intent (optional), and free-text notes.
@@ -817,7 +817,7 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             fwhm_std=None,
             median_star_peak_ratio=None,
             contrast_ratio=None,
-            # Structured additions — see T20 docstring.
+            # Structured additions — see analyze_image docstring.
             pixel_coverage=None,
             clipping_per_channel=None,
             mode_estimate=None,
@@ -931,7 +931,7 @@ def build_initial_message(dataset: Dataset, session: SessionContext, ingest_summ
         if equip_optics.get("focal_length_mm"):
             lines.append(f"- Focal length: {equip_optics['focal_length_mm']} mm (plate-solve-measured)")
 
-    # Ingest sensor summary (from T01's EXIF analysis)
+    # Ingest sensor summary (from ingest_dataset's EXIF analysis)
     sensor_summary = ingest_summary.get("sensor")
     if sensor_summary and isinstance(sensor_summary, dict):
         # Only show if it adds info beyond what's already displayed

@@ -74,7 +74,7 @@ def siril_script_path(path: Path | str, working_dir: Path | str) -> str:
         if not re.search(r"\s", rel_str):
             return rel_str
     except ValueError:
-        pass  # path lives outside working_dir — fall through to symlink
+        pass # path lives outside working_dir — fall through to symlink
 
     # Case 2: symlink into working_dir under a whitespace-free basename.
     clean_name = re.sub(r"\s+", "_", src.name) or "file"
@@ -129,9 +129,9 @@ class SirilResult:
     stdout: str
     stderr: str
     exit_code: int
-    script: str                         # the .ssf content that was executed
+    script: str # the .ssf content that was executed
     working_dir: str
-    parsed: dict = field(default_factory=dict)  # structured values extracted from stdout
+    parsed: dict = field(default_factory=dict) # structured values extracted from stdout
 
 
 class SirilError(RuntimeError):
@@ -149,31 +149,31 @@ class SirilError(RuntimeError):
 # Each entry: (key, compiled_pattern, group_index_or_name)
 
 _STDOUT_PATTERNS: list[tuple[str, re.Pattern, str | int]] = [
-    ("background_noise",  re.compile(r"Background noise level:\s*([\d.e+-]+)"), 1),
-    ("background_mean",   re.compile(r"Background mean:\s*([\d.e+-]+)"),        1),
-    ("fwhm",              re.compile(r"FWHM:\s*([\d.]+)"),                      1),
-    ("star_count",        re.compile(r"(\d+)\s+stars?\s+detected",
-                                     re.IGNORECASE),                            1),
-    ("snr",               re.compile(r"SNR[:\s]+([\d.]+)"),                     1),
-    ("rejected_frames",   re.compile(r"(\d+)\s+frame[s]?\s+rejected",
-                                     re.IGNORECASE),                            1),
-    ("accepted_frames",   re.compile(r"(\d+)\s+frame[s]?\s+stacked",
-                                     re.IGNORECASE),                            1),
-    ("output_path",       re.compile(r"Saving FITS image:\s*(.+\.fit[s]?)"),    1),
+    ("background_noise", re.compile(r"Background noise level:\s*([\d.e+-]+)"), 1),
+    ("background_mean", re.compile(r"Background mean:\s*([\d.e+-]+)"), 1),
+    ("fwhm", re.compile(r"FWHM:\s*([\d.]+)"), 1),
+    ("star_count", re.compile(r"(\d+)\s+stars?\s+detected",
+                                     re.IGNORECASE), 1),
+    ("snr", re.compile(r"SNR[:\s]+([\d.]+)"), 1),
+    ("rejected_frames", re.compile(r"(\d+)\s+frame[s]?\s+rejected",
+                                     re.IGNORECASE), 1),
+    ("accepted_frames", re.compile(r"(\d+)\s+frame[s]?\s+stacked",
+                                     re.IGNORECASE), 1),
+    ("output_path", re.compile(r"Saving FITS image:\s*(.+\.fit[s]?)"), 1),
 ]
 
 _SUCCESS_MARKER = "Script execution finished successfully"
 
-# Patterns that indicate a real script failure.  Applied only when the script
+# Patterns that indicate a real script failure. Applied only when the script
 # did NOT report success (the success marker gates pattern-based detection).
 # Verified against Siril 1.4.2 runtime output — "Error in line N" is the
 # definitive per-command failure message; "Script execution failed" is the
 # global failure message.
 _ERROR_PATTERNS: list[re.Pattern] = [
-    re.compile(r"Error in line \d+",            re.IGNORECASE),
-    re.compile(r"Script execution failed",      re.IGNORECASE),
-    re.compile(r"command not found",            re.IGNORECASE),
-    re.compile(r"No such file or directory",    re.IGNORECASE),
+    re.compile(r"Error in line \d+", re.IGNORECASE),
+    re.compile(r"Script execution failed", re.IGNORECASE),
+    re.compile(r"command not found", re.IGNORECASE),
+    re.compile(r"No such file or directory", re.IGNORECASE),
 ]
 
 
@@ -183,9 +183,9 @@ def _parse_stdout(stdout: str) -> dict:
         match = pattern.search(stdout)
         if match:
             try:
-                parsed[key] = float(match.group(group))  # type: ignore[arg-type]
+                parsed[key] = float(match.group(group)) # type: ignore[arg-type]
             except (ValueError, TypeError):
-                parsed[key] = match.group(group)         # keep as string if not numeric
+                parsed[key] = match.group(group) # keep as string if not numeric
     return parsed
 
 
@@ -199,7 +199,7 @@ def _check_for_errors(result: SirilResult, exit_code: int) -> None:
         )
 
     # If Siril itself reports success, trust it — do not second-guess with
-    # pattern matching.  The old broad "^\s*ERROR\b" regex was triggering on
+    # pattern matching. The old broad "^\s*ERROR\b" regex was triggering on
     # informational log lines that contained the word ERROR even when the
     # script completed without any command failures.
     if _SUCCESS_MARKER in result.stdout:
@@ -251,20 +251,20 @@ def run_siril_script(
     output, parses known metrics from stdout, and raises SirilError on failure.
 
     Args:
-        commands:    Siril script commands to execute (without 'requires'/'close').
+        commands: Siril script commands to execute (without 'requires'/'close').
         working_dir: Absolute path passed to siril-cli via -d flag. Siril treats
                      this as the working directory for all relative file paths.
-        requires:    Minimum Siril version declared in the script header.
-        timeout:     Subprocess timeout in seconds. Default 600s (10 min) for
+        requires: Minimum Siril version declared in the script header.
+        timeout: Subprocess timeout in seconds. Default 600s (10 min) for
                      long operations like stacking.
-        siril_bin:   Override the siril-cli binary path. Falls back to SIRIL_BIN
+        siril_bin: Override the siril-cli binary path. Falls back to SIRIL_BIN
                      env var, then 'siril-cli'.
 
     Returns:
         SirilResult with stdout, stderr, the script content, and parsed metrics.
 
     Raises:
-        SirilError:  Non-zero exit code or error pattern found in output.
+        SirilError: Non-zero exit code or error pattern found in output.
         FileNotFoundError: working_dir does not exist.
         subprocess.TimeoutExpired: Script exceeded timeout.
     """

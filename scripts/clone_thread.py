@@ -342,7 +342,7 @@ def _copy_rows(
 
 
 def _print_list(summaries: list[CheckpointSummary]) -> None:
-    print("checkpoint_id                           step   phase        hitl  msgs  next")
+    print("checkpoint_id step phase hitl msgs next")
     print("-" * 84)
     previous_phase: str | None = None
     for summary in _sort_summaries(summaries):
@@ -355,9 +355,9 @@ def _print_list(summaries: list[CheckpointSummary]) -> None:
         step_label = str(summary.step) if summary.step is not None else "-"
         print(
             f"{marker} {summary.row.checkpoint_id:<36} "
-            f"{step_label:>5}  {phase:<11} "
+            f"{step_label:>5} {phase:<11} "
             f"{str(summary.active_hitl):<5} "
-            f"{summary.messages_count:>5}  {next_label}"
+            f"{summary.messages_count:>5} {next_label}"
         )
 
 
@@ -480,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
             summaries = [_row_to_summary(row) for row in rows]
             if args.list:
                 print(f"Thread: {args.source_thread_id}")
-                print(f"DB:     {db_path}")
+                print(f"DB: {db_path}")
                 print()
                 _print_list(summaries)
                 return 0
@@ -508,14 +508,14 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.dry_run:
                 print("Dry run — no checkpoint rows copied.")
-                print(f"Source:     {args.source_thread_id}")
-                print(f"Dest:       {dest_thread_id}")
-                print(f"Selection:  {selection_label}")
-                print(f"Phase:      {selected.phase}")
+                print(f"Source: {args.source_thread_id}")
+                print(f"Dest: {dest_thread_id}")
+                print(f"Selection: {selection_label}")
+                print(f"Phase: {selected.phase}")
                 print(f"Active HITL:{selected.active_hitl}")
-                print(f"Messages:   {selected.messages_count}")
-                print(f"Current:    {selected.current_image or '(none)'}")
-                print(f"Work dir:   {working_dir or '(not found)'}")
+                print(f"Messages: {selected.messages_count}")
+                print(f"Current: {selected.current_image or '(none)'}")
+                print(f"Work dir: {working_dir or '(not found)'}")
                 return 0
 
             if dest_thread_id == args.source_thread_id:
@@ -554,20 +554,20 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"Cloned {checkpoint_count} checkpoint row(s), {write_count} write row(s)")
-    print(f"Source:     {args.source_thread_id}")
-    print(f"Dest:       {dest_thread_id}")
-    print(f"Selection:  {selection_label}")
-    print(f"Phase:      {graph_summary.get('phase') if graph_summary else selected.phase}")
+    print(f"Source: {args.source_thread_id}")
+    print(f"Dest: {dest_thread_id}")
+    print(f"Selection: {selection_label}")
+    print(f"Phase: {graph_summary.get('phase') if graph_summary else selected.phase}")
     print(
         "Active HITL:"
         f"{graph_summary.get('active_hitl') if graph_summary else selected.active_hitl}"
     )
     print(
-        f"Messages:   "
+        f"Messages: "
         f"{graph_summary.get('messages_count') if graph_summary else selected.messages_count}"
     )
     print(
-        f"Current:    "
+        f"Current: "
         f"{(graph_summary.get('current_image') if graph_summary else selected.current_image) or '(none)'}"
     )
     if graph_summary:
@@ -576,9 +576,9 @@ def main(argv: list[str] | None = None) -> int:
         next_or_tasks = next_nodes or tasks
         print(f"Next/tasks: {', '.join(next_or_tasks) if next_or_tasks else '-'}")
     if working_dir:
-        print(f"Work dir:   {working_dir}")
+        print(f"Work dir: {working_dir}")
     else:
-        print("Work dir:   (not found; Gradio may derive previews from state paths)")
+        print("Work dir: (not found; Gradio may derive previews from state paths)")
     print()
     print(f"Resume in Gradio with: {dest_thread_id}")
     return 0

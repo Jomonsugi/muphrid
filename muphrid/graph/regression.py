@@ -36,11 +36,11 @@ from muphrid.graph.state import RegressionWarning
 # ── Monitored metrics ─────────────────────────────────────────────────────────
 
 # For each monitored metric:
-#   direction:  "higher" or "lower" — which way is "worse"
-#   min_abs:    absolute-delta threshold in the metric's native units
-#   min_rel:    relative-delta threshold (fraction; applies when baseline ≠ 0)
-#   label:      human-readable name for the summary string
-#   unit:       display unit ("%", "", "dB", etc.) for the summary string
+# direction: "higher" or "lower" — which way is "worse"
+# min_abs: absolute-delta threshold in the metric's native units
+# min_rel: relative-delta threshold (fraction; applies when baseline ≠ 0)
+# label: human-readable name for the summary string
+# unit: display unit ("%", "", "dB", etc.) for the summary string
 #
 # Both thresholds must be crossed for a warning to fire — this keeps
 # near-zero baselines from producing spurious relative-delta warnings and
@@ -51,59 +51,59 @@ from muphrid.graph.state import RegressionWarning
 METRIC_RULES: dict[str, dict[str, Any]] = {
     "clipped_shadows_pct": {
         "direction": "higher",
-        "min_abs":   0.5,    # +0.5 percentage points
-        "min_rel":   0.25,   # +25% relative
-        "label":     "Shadow clipping",
-        "unit":      "%",
+        "min_abs": 0.5, # +0.5 percentage points
+        "min_rel": 0.25, # +25% relative
+        "label": "Shadow clipping",
+        "unit": "%",
     },
     "clipped_highlights_pct": {
         "direction": "higher",
-        "min_abs":   0.3,
-        "min_rel":   0.25,
-        "label":     "Highlight clipping",
-        "unit":      "%",
+        "min_abs": 0.3,
+        "min_rel": 0.25,
+        "label": "Highlight clipping",
+        "unit": "%",
     },
     "gradient_magnitude": {
         "direction": "higher",
-        "min_abs":   0.01,
-        "min_rel":   0.25,
-        "label":     "Gradient magnitude",
-        "unit":      "",
+        "min_abs": 0.01,
+        "min_rel": 0.25,
+        "label": "Gradient magnitude",
+        "unit": "",
     },
     "background_flatness": {
         "direction": "lower",
-        "min_abs":   0.05,   # drop of at least 0.05 on the 0–1 scale
-        "min_rel":   0.10,
-        "label":     "Background flatness",
-        "unit":      "",
+        "min_abs": 0.05, # drop of at least 0.05 on the 0–1 scale
+        "min_rel": 0.10,
+        "label": "Background flatness",
+        "unit": "",
     },
     "current_noise": {
         "direction": "higher",
-        "min_abs":   0.0,    # any relative increase that crosses min_rel counts
-        "min_rel":   0.25,
-        "label":     "Noise",
-        "unit":      "",
+        "min_abs": 0.0, # any relative increase that crosses min_rel counts
+        "min_rel": 0.25,
+        "label": "Noise",
+        "unit": "",
     },
     "wavelet_noise": {
         "direction": "higher",
-        "min_abs":   0.0,
-        "min_rel":   0.25,
-        "label":     "Wavelet noise",
-        "unit":      "",
+        "min_abs": 0.0,
+        "min_rel": 0.25,
+        "label": "Wavelet noise",
+        "unit": "",
     },
     "channel_imbalance": {
         "direction": "higher",
-        "min_abs":   0.01,
-        "min_rel":   0.25,
-        "label":     "Channel imbalance",
-        "unit":      "",
+        "min_abs": 0.01,
+        "min_rel": 0.25,
+        "label": "Channel imbalance",
+        "unit": "",
     },
     "snr_estimate": {
         "direction": "lower",
-        "min_abs":   0.0,
-        "min_rel":   0.15,   # 15% SNR drop is significant
-        "label":     "SNR estimate",
-        "unit":      "",
+        "min_abs": 0.0,
+        "min_rel": 0.15, # 15% SNR drop is significant
+        "label": "SNR estimate",
+        "unit": "",
     },
 }
 
@@ -122,13 +122,13 @@ def detect_regressions(
     metric that worsened past its configured thresholds.
 
     Args:
-      current:  metrics dict from the just-completed analyze_image
+      current: metrics dict from the just-completed analyze_image
       baseline: metrics dict from the prior analyze_image (from
                 metadata.last_analysis_snapshot). If None or missing keys,
                 no comparison runs for those keys.
-      phase:    ProcessingPhase value at detection time (for the warning's
+      phase: ProcessingPhase value at detection time (for the warning's
                 phase_origin field).
-      now:      clock-injection hook for tests; defaults to real UTC now.
+      now: clock-injection hook for tests; defaults to real UTC now.
 
     Returns a possibly-empty list of RegressionWarning dicts. Order
     follows METRIC_RULES key order for deterministic output.
@@ -228,7 +228,7 @@ def filter_resolved(
         if direction == "higher":
             threshold = base_v * (1 + tolerance_ratio) if base_v != 0 else rule["min_abs"]
             resolved = cur_v <= threshold
-        else:  # "lower"
+        else: # "lower"
             threshold = base_v * (1 - tolerance_ratio) if base_v != 0 else -rule["min_abs"]
             resolved = cur_v >= threshold
         if not resolved:
@@ -311,7 +311,7 @@ def format_warnings(warnings: list[RegressionWarning]) -> str:
         return ""
     lines = ["Outstanding regression warnings:"]
     for w in warnings:
-        lines.append(f"  • {w['summary']}")
+        lines.append(f" • {w['summary']}")
     return "\n".join(lines)
 
 

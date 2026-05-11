@@ -8,7 +8,7 @@ Run from project root:
 Exit 0 = all checks pass. Exit 1 = one or more failed.
 
 The architecture:
-  - state.variant_pool   → canonical store for active HITL gate variants
+  - state.variant_pool → canonical store for active HITL gate variants
   - state.visual_context → non-variant working set (present_images, phase_carry)
 
 _select_visible_refs reads BOTH and produces the filtered VisualRef list the
@@ -17,8 +17,8 @@ an ephemeral multimodal HumanMessage and appends it to the message list. No
 "retention policy" walks messages — state owns visibility end to end.
 
 Tests cover:
-  1. _select_visible_refs   (pure-ish: state → filtered VisualRef list)
-  2. _build_vlm_view        (state + messages → messages + ephemeral VLM msg)
+  1. _select_visible_refs (pure-ish: state → filtered VisualRef list)
+  2. _build_vlm_view (state + messages → messages + ephemeral VLM msg)
 
 Stub JPGs are written to a tempdir so _make_vlm_message has real bytes to
 base64-encode.
@@ -50,7 +50,7 @@ from muphrid.graph.nodes import (
     build_variant_promotion_update,
 )
 from muphrid.graph.state import Variant, VisualRef
-from muphrid.tools.utility.t31_commit_variant import commit_variant
+from muphrid.tools.utility.commit_variant import commit_variant
 
 
 _failures: list[str] = []
@@ -58,7 +58,7 @@ _failures: list[str] = []
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     status = "\u2713" if ok else "\u2717"
-    msg = f"  {status} {name}"
+    msg = f" {status} {name}"
     if detail:
         msg += f" \u2014 {detail}"
     print(msg)
@@ -100,8 +100,8 @@ def stub_variant(preview_path: str, vid: str = "T09_v1", label: str | None = Non
         tool_name="remove_gradient",
         label=label or f"variant {vid}",
         params={},
-        file_path=preview_path,           # stub: same as preview for tests
-        preview_path=preview_path,        # _resolve_variant_preview returns this if it exists
+        file_path=preview_path, # stub: same as preview for tests
+        preview_path=preview_path, # _resolve_variant_preview returns this if it exists
         metrics={},
         created_at="2026-04-08T00:00:00Z",
         rationale=None,
@@ -140,7 +140,7 @@ def reset_vlm_modes(hitl: bool, auto: bool, cap: int = 8) -> None:
     with legacy test cases but has no effect — when False, the test case
     is exercising a state that is no longer reachable in production.
     """
-    _ = hitl  # legacy: vlm_hitl is always on now
+    _ = hitl # legacy: vlm_hitl is always on now
     hitl_mod._RUNTIME_VLM_AUTONOMOUS = auto
     hitl_mod._RUNTIME_VLM_RETENTION_MAX = cap
 
@@ -375,7 +375,7 @@ historical_msg = HumanMessage(content=[
 ])
 messages = [
     SystemMessage(content="sys"),
-    historical_msg,  # 3 stale images
+    historical_msg, # 3 stale images
     AIMessage(content="ok"),
 ]
 state = make_state(
@@ -715,7 +715,7 @@ print("\n" + "=" * 40)
 if _failures:
     print(f"FAILED: {len(_failures)} check(s)")
     for f in _failures:
-        print(f"  - {f}")
+        print(f" - {f}")
     sys.exit(1)
 else:
     print("All checks passed.")

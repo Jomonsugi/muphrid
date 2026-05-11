@@ -28,8 +28,8 @@ from muphrid.graph import hitl as hitl_mod
 from muphrid.graph import nodes
 from muphrid.graph import review as review_ctl
 from muphrid.graph.state import ProcessingPhase
-from muphrid.tools.utility.t31_commit_variant import commit_variant
-from muphrid.tools.utility.t39_present_for_review import present_for_review
+from muphrid.tools.utility.commit_variant import commit_variant
+from muphrid.tools.utility.present_for_review import present_for_review
 
 
 _failures: list[str] = []
@@ -37,7 +37,7 @@ _failures: list[str] = []
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     status = "ok" if ok else "FAIL"
-    msg = f"  {status} {name}"
+    msg = f" {status} {name}"
     if detail:
         msg += f" - {detail}"
     print(msg)
@@ -47,7 +47,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 def temp_fit(name: str = "variant.fit") -> str:
     path = Path(tempfile.mkdtemp(prefix="hitl_review_test_")) / name
-    path.write_bytes(b"SIMPLE  =                    T\nEND\n")
+    path.write_bytes(b"SIMPLE =                    T\nEND\n")
     return str(path)
 
 

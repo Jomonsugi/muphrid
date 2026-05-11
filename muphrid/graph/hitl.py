@@ -131,7 +131,7 @@ def vlm_window_cap() -> int:
 # image will inform a decision the metrics cannot.
 
 _VLM_AUTO_PHASES = frozenset({
-    "stacking",   # current_image becomes meaningful after siril_stack
+    "stacking", # current_image becomes meaningful after siril_stack
     "linear",
     "stretch",
     "nonlinear",
@@ -168,42 +168,42 @@ def vlm_phase_eligible(phase) -> bool:
 
 TOOL_TO_HITL: dict[str, str] = {
     # Calibration
-    "build_masters":          "T02_masters",
-    "convert_sequence":       "T02b_convert",
-    "calibrate":              "T03_calibrate",
+    "build_masters": "T02_masters",
+    "convert_sequence": "T02b_convert",
+    "calibrate": "T03_calibrate",
     # Registration
-    "siril_register":         "T04_register",
+    "siril_register": "T04_register",
     # Analysis
-    "analyze_frames":         "T05_analyze",
+    "analyze_frames": "T05_analyze",
     # Stacking
-    "select_frames":          "T06_select",
-    "siril_stack":            "T07_stack",
-    "auto_crop":              "T08_crop",
+    "select_frames": "T06_select",
+    "siril_stack": "T07_stack",
+    "auto_crop": "T08_crop",
     # Linear
-    "remove_gradient":        "T09_gradient",
-    "color_calibrate":        "T10_color",
-    "remove_green_noise":     "T11_green",
-    "noise_reduction":        "T12_denoise",
-    "deconvolution":          "T13_decon",
+    "remove_gradient": "T09_gradient",
+    "color_calibrate": "T10_color",
+    "remove_green_noise": "T11_green",
+    "noise_reduction": "T12_denoise",
+    "deconvolution": "T13_decon",
     # Stretch
-    "stretch_image":          "T14_stretch",
+    "stretch_image": "T14_stretch",
     # Non-linear
-    "star_removal":           "T15_star_removal",
-    "curves_adjust":          "T16_curves",
+    "star_removal": "T15_star_removal",
+    "curves_adjust": "T16_curves",
     "local_contrast_enhance": "T17_local_contrast",
-    "saturation_adjust":      "T18_saturation",
-    "star_restoration":       "T19_star_restoration",
-    "create_mask":            "T25_mask",
-    "reduce_stars":           "T26_reduce_stars",
-    "multiscale_process":     "T27_multiscale",
+    "saturation_adjust": "T18_saturation",
+    "star_restoration": "T19_star_restoration",
+    "create_mask": "T25_mask",
+    "reduce_stars": "T26_reduce_stars",
+    "multiscale_process": "T27_multiscale",
     "selective_star_reblend": "T41_selective_star_reblend",
-    "enhance_star_color":     "T42_enhance_star_color",
+    "enhance_star_color": "T42_enhance_star_color",
     # Export — gated as a final review on the actual JPG export artifact
     # (not on a FITS-derived preview). When the gate is enabled, export_final
     # produces the export to a tentative subdirectory; the human reviews
     # the rendered JPG; on approval, the backend moves the tentative files
     # into the final output_dir.
-    "export_final":           "T24_export",
+    "export_final": "T24_export",
 }
 
 

@@ -2,10 +2,10 @@
 """
 Smoke tests for the expert star-treatment tools:
 
-  - t26 reduce_stars regression: star_mask_path field/param wired.
-  - t40 analyze_star_population: detection + ranking on synthetic stars.
-  - t41 selective_star_reblend: tiered keep/suppress; region zoning.
-  - t42 enhance_star_color: HSV saturation boost on the star contribution.
+  - reduce_stars regression: star_mask_path field/param wired.
+  - analyze_star_population: detection + ranking on synthetic stars.
+  - selective_star_reblend: tiered keep/suppress; region zoning.
+  - enhance_star_color: HSV saturation boost on the star contribution.
 
 Run from project root:
     uv run python scripts/test_selective_star_reblend.py
@@ -30,14 +30,14 @@ import numpy as np
 from astropy.io import fits as astropy_fits
 from skimage.color import rgb2hsv
 
-from muphrid.tools.utility.t40_analyze_star_population import (
+from muphrid.tools.utility.analyze_star_population import (
     analyze_star_population,
 )
-from muphrid.tools.scikit.t26_reduce_stars import reduce_stars
-from muphrid.tools.scikit.t41_selective_star_reblend import (
+from muphrid.tools.scikit.reduce_stars import reduce_stars
+from muphrid.tools.scikit.selective_star_reblend import (
     selective_star_reblend,
 )
-from muphrid.tools.scikit.t42_enhance_star_color import enhance_star_color
+from muphrid.tools.scikit.enhance_star_color import enhance_star_color
 
 
 _failures: list[str] = []
@@ -45,7 +45,7 @@ _failures: list[str] = []
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     status = "ok" if ok else "FAIL"
-    msg = f"  {status} {name}"
+    msg = f" {status} {name}"
     if detail:
         msg += f" - {detail}"
     print(msg)
@@ -65,7 +65,7 @@ def make_two_peak_fixture(workdir: Path) -> dict:
     """
     Two stars on a flat dark sky, in a 256×256 RGB image.
 
-      Peak A at (60,60):  bright, very red (high R, near-zero G/B)
+      Peak A at (60,60): bright, very red (high R, near-zero G/B)
       Peak B at (180,180): bright, neutral (white — equal R/G/B)
 
     Saved as starless (flat dark sky), star_mask (just the peaks), and an
@@ -100,7 +100,7 @@ def make_two_peak_fixture(workdir: Path) -> dict:
     original = (starless + mask).astype(np.float32)
 
     starless_p = workdir / "fixture_starless.fits"
-    mask_p     = workdir / "fixture_starmask.fits"
+    mask_p = workdir / "fixture_starmask.fits"
     original_p = workdir / "fixture_original.fits"
     astropy_fits.HDUList([astropy_fits.PrimaryHDU(data=starless)]).writeto(starless_p, overwrite=True)
     astropy_fits.HDUList([astropy_fits.PrimaryHDU(data=mask)]).writeto(mask_p, overwrite=True)
@@ -119,7 +119,7 @@ def make_clean_star_mask_fixture(workdir: Path) -> dict:
     """
     Same two-star geometry as make_two_peak_fixture, but the star mask has an
     exactly zero background. This models a clean component/mask image rather
-    than real sky luminance, and should exercise t41's mask-native fallback.
+    than real sky luminance, and should exercise selective_star_reblend's mask-native fallback.
     """
     h, w = 256, 256
     sigma = 3.0
@@ -173,9 +173,9 @@ def _read_fits(path: str) -> np.ndarray:
 # ── Tests ──────────────────────────────────────────────────────────────────────
 
 
-def test_t26_star_mask_path_wired():
-    """reduce_stars with star_mask_path must not raise NameError (t26 fix)."""
-    workdir = Path(tempfile.mkdtemp(prefix="t26_fix_"))
+def test_reduce_stars_star_mask_path_wired():
+    """reduce_stars with star_mask_path must not raise NameError (reduce_stars fix)."""
+    workdir = Path(tempfile.mkdtemp(prefix="fix_"))
     fx = make_two_peak_fixture(workdir)
     state = make_state(workdir, fx)
 
@@ -194,9 +194,9 @@ def test_t26_star_mask_path_wired():
             peak_exclude_border=True,
             label_connectivity=2,
             feather_px=2,
-            output_stem="t26_test",
+            output_stem="test",
             star_mask_path=fx["star_mask"],
-            tool_call_id="t26-tcid",
+            tool_call_id="reduce_stars-tcid",
             state=state,
         )
         ran = True
@@ -206,19 +206,19 @@ def test_t26_star_mask_path_wired():
     except NameError as e:
         ran = False
         wrote_image = False
-        check("t26_star_mask_path_wired", False, f"NameError: {e}")
+        check("star_mask_path_wired", False, f"NameError: {e}")
         return
     except Exception as e:
         ran = False
         wrote_image = False
-        check("t26_star_mask_path_wired", False, f"unexpected: {type(e).__name__}: {e}")
+        check("star_mask_path_wired", False, f"unexpected: {type(e).__name__}: {e}")
         return
 
-    check("t26_star_mask_path_wired", ran and wrote_image)
+    check("star_mask_path_wired", ran and wrote_image)
 
 
 def test_analyze_star_population_finds_both_peaks():
-    workdir = Path(tempfile.mkdtemp(prefix="t40_"))
+    workdir = Path(tempfile.mkdtemp(prefix="analyze_star_pop_"))
     fx = make_two_peak_fixture(workdir)
     state = make_state(workdir, fx)
 
@@ -230,18 +230,18 @@ def test_analyze_star_population_finds_both_peaks():
         chroma_sample_mode="annulus",
         score_mode="brightness_priority",
         return_table_rows=10,
-        tool_call_id="t40-tcid",
+        tool_call_id="analyze_star_population-tcid",
         state=state,
     )
     msg_payload = json.loads(result.update["messages"][0].content)
     detected = msg_payload.get("count", 0)
     check(
-        "t40_detects_both_peaks",
+        "detects_both_peaks",
         detected >= 2,
         f"detected count={detected}",
     )
     check(
-        "t40_writes_sidecar_catalog",
+        "writes_sidecar_catalog",
         Path(msg_payload.get("source_catalog_path", "")).exists(),
         str(msg_payload.get("source_catalog_path")),
     )
@@ -255,7 +255,7 @@ def test_analyze_star_population_finds_both_peaks():
         chroma_sample_mode="annulus",
         score_mode="color_priority",
         return_table_rows=10,
-        tool_call_id="t40-color",
+        tool_call_id="analyze_star_population-color",
         state=state,
     )
     payload_c = json.loads(result_color.update["messages"][0].content)
@@ -265,16 +265,16 @@ def test_analyze_star_population_finds_both_peaks():
         d_to_a = lambda r: (r["x"] - 60) ** 2 + (r["y"] - 60) ** 2
         ranked_first_is_a = d_to_a(top[0]) < d_to_a(top[1])
         check(
-            "t40_color_priority_ranks_red_first",
+            "color_priority_ranks_red_first",
             ranked_first_is_a,
             f"top 2 = {[(round(t['x']),round(t['y']),round(t['chroma'],2)) for t in top]}",
         )
     else:
-        check("t40_color_priority_ranks_red_first", False, "fewer than 2 sources")
+        check("color_priority_ranks_red_first", False, "fewer than 2 sources")
 
 
 def test_selective_reblend_clean_mask_fallback_and_edges():
-    workdir = Path(tempfile.mkdtemp(prefix="t41_clean_"))
+    workdir = Path(tempfile.mkdtemp(prefix="clean_"))
     fx = make_clean_star_mask_fixture(workdir)
     state = make_state(workdir, fx)
 
@@ -290,14 +290,14 @@ def test_selective_reblend_clean_mask_fallback_and_edges():
         fwhm_guess=3.0,
         min_separation_fwhm=2.0,
         max_sources=100,
-        output_stem="t41_clean_full",
-        tool_call_id="t41-clean-full",
+        output_stem="clean_full",
+        tool_call_id="selective_star_reblend-clean-full",
         state=state,
     )
     full = _read_fits(result_full.update["paths"]["current_image"])
     original = _read_fits(fx["original"])
     check(
-        "t41_clean_mask_keep_all_full_restore",
+        "clean_mask_keep_all_full_restore",
         np.allclose(full, np.clip(original, 0.0, 1.0), atol=1e-5),
     )
 
@@ -313,27 +313,27 @@ def test_selective_reblend_clean_mask_fallback_and_edges():
         fwhm_guess=3.0,
         min_separation_fwhm=2.0,
         max_sources=100,
-        output_stem="t41_clean_none",
-        tool_call_id="t41-clean-none",
+        output_stem="clean_none",
+        tool_call_id="selective_star_reblend-clean-none",
         state=state,
     )
     none = _read_fits(result_none.update["paths"]["current_image"])
     starless = _read_fits(fx["starless"])
     check(
-        "t41_clean_mask_keep_none_suppresses_all",
+        "clean_mask_keep_none_suppresses_all",
         np.allclose(none, starless, atol=1e-5),
     )
 
 
 def test_selective_reblend_color_priority_keeps_red():
-    workdir = Path(tempfile.mkdtemp(prefix="t41_color_"))
+    workdir = Path(tempfile.mkdtemp(prefix="color_"))
     fx = make_two_peak_fixture(workdir)
     state = make_state(workdir, fx)
 
     result = selective_star_reblend.func(
         mode="color_priority",
-        keep_fraction=0.5,         # keep 1 of 2
-        suppress_strength=0.0,     # remove the other entirely
+        keep_fraction=0.5, # keep 1 of 2
+        suppress_strength=0.0, # remove the other entirely
         core_radius_factor=2.0,
         feather_sigma_px=1.0,
         mask_dilation_px=0,
@@ -342,31 +342,31 @@ def test_selective_reblend_color_priority_keeps_red():
         fwhm_guess=3.0,
         min_separation_fwhm=2.0,
         max_sources=100,
-        output_stem="t41_color",
-        tool_call_id="t41-color",
+        output_stem="color",
+        tool_call_id="selective_star_reblend-color",
         state=state,
     )
     out = result.update["paths"]["current_image"]
     img = _read_fits(out)
 
     # Sample at peak A (red, kept) vs peak B (white, suppressed).
-    val_a = float(img[0, 60, 60])  # red channel near peak A
-    val_b = float(img[0, 180, 180])  # red channel near peak B
+    val_a = float(img[0, 60, 60]) # red channel near peak A
+    val_b = float(img[0, 180, 180]) # red channel near peak B
     # Peak A should retain most of its bright red contribution; peak B
     # should be suppressed close to the starless background (~0.02).
     check(
-        "t41_color_priority_kept_red",
+        "color_priority_kept_red",
         val_a > 0.5 and val_b < 0.2,
         f"R@A={val_a:.3f} R@B={val_b:.3f}",
     )
 
     # image_space delta passed through.
     md = result.update.get("metadata", {})
-    check("t41_emits_image_space", md.get("image_space") == "display")
+    check("selective_star_reblend_emits_image_space", md.get("image_space") == "display")
 
 
 def test_selective_reblend_brightness_priority_keeps_brighter():
-    workdir = Path(tempfile.mkdtemp(prefix="t41_bright_"))
+    workdir = Path(tempfile.mkdtemp(prefix="bright_"))
     fx = make_two_peak_fixture(workdir)
     state = make_state(workdir, fx)
 
@@ -384,8 +384,8 @@ def test_selective_reblend_brightness_priority_keeps_brighter():
         fwhm_guess=3.0,
         min_separation_fwhm=2.0,
         max_sources=100,
-        output_stem="t41_bright",
-        tool_call_id="t41-bright",
+        output_stem="bright",
+        tool_call_id="selective_star_reblend-bright",
         state=state,
     )
     out = result.update["paths"]["current_image"]
@@ -393,10 +393,10 @@ def test_selective_reblend_brightness_priority_keeps_brighter():
 
     # Peak B kept (high all channels); peak A's red should be suppressed
     # (still present from starless ~0.02 only).
-    val_b_g = float(img[1, 180, 180])  # green at B (B is white)
+    val_b_g = float(img[1, 180, 180]) # green at B (B is white)
     val_a_r = float(img[0, 60, 60])
     check(
-        "t41_brightness_priority_kept_white",
+        "brightness_priority_kept_white",
         val_b_g > 0.5 and val_a_r < 0.2,
         f"G@B={val_b_g:.3f} R@A={val_a_r:.3f}",
     )
@@ -405,7 +405,7 @@ def test_selective_reblend_brightness_priority_keeps_brighter():
 def test_selective_reblend_confine_to_region():
     """region_mask covering only the right half: left half stars suppressed,
     right half restored to W=1.0 regardless of keep_fraction/suppress_strength."""
-    workdir = Path(tempfile.mkdtemp(prefix="t41_region_"))
+    workdir = Path(tempfile.mkdtemp(prefix="region_"))
     fx = make_two_peak_fixture(workdir)
     h, w = fx["shape"]
 
@@ -422,8 +422,8 @@ def test_selective_reblend_confine_to_region():
     # Peak B is at (180, 180) — right half (inside region) → suppress=0.
     result = selective_star_reblend.func(
         mode="brightness_priority",
-        keep_fraction=0.0,         # nothing in keep set inside region
-        suppress_strength=0.0,     # inside region: full removal
+        keep_fraction=0.0, # nothing in keep set inside region
+        suppress_strength=0.0, # inside region: full removal
         core_radius_factor=2.0,
         feather_sigma_px=1.0,
         mask_dilation_px=0,
@@ -432,29 +432,29 @@ def test_selective_reblend_confine_to_region():
         fwhm_guess=3.0,
         min_separation_fwhm=2.0,
         max_sources=100,
-        output_stem="t41_region",
-        tool_call_id="t41-region",
+        output_stem="region",
+        tool_call_id="selective_star_reblend-region",
         state=state,
     )
     out = result.update["paths"]["current_image"]
     img = _read_fits(out)
 
-    val_a_r = float(img[0, 60, 60])    # outside region: full restore
-    val_b_g = float(img[1, 180, 180])  # inside region: suppressed
+    val_a_r = float(img[0, 60, 60]) # outside region: full restore
+    val_b_g = float(img[1, 180, 180]) # inside region: suppressed
     check(
-        "t41_confine_to_region_outside_full",
+        "confine_to_region_outside_full",
         val_a_r > 0.5,
         f"R@A={val_a_r:.3f} (expected > 0.5)",
     )
     check(
-        "t41_confine_to_region_inside_suppressed",
+        "confine_to_region_inside_suppressed",
         val_b_g < 0.2,
         f"G@B={val_b_g:.3f} (expected < 0.2)",
     )
 
 
 def test_selective_reblend_composes_color_boost():
-    workdir = Path(tempfile.mkdtemp(prefix="t41_color_boost_"))
+    workdir = Path(tempfile.mkdtemp(prefix="color_boost_"))
     fx = make_two_peak_fixture(workdir)
     state = make_state(workdir, fx)
 
@@ -471,8 +471,8 @@ def test_selective_reblend_composes_color_boost():
         fwhm_guess=3.0,
         min_separation_fwhm=2.0,
         max_sources=100,
-        output_stem="t41_color_boost",
-        tool_call_id="t41-color-boost",
+        output_stem="color_boost",
+        tool_call_id="selective_star_reblend-color-boost",
         state=state,
     )
     boosted = _read_fits(result.update["paths"]["current_image"])
@@ -480,21 +480,21 @@ def test_selective_reblend_composes_color_boost():
     o_hsv_at_a = rgb2hsv(np.moveaxis(original[:, 55:65, 55:65], 0, -1))
     b_hsv_at_a = rgb2hsv(np.moveaxis(boosted[:, 55:65, 55:65], 0, -1))
     check(
-        "t41_color_boost_composes_with_reblend",
+        "color_boost_composes_with_reblend",
         float(np.mean(b_hsv_at_a[..., 1])) > float(np.mean(o_hsv_at_a[..., 1])),
     )
 
 
 def test_enhance_star_color_increases_saturation():
-    workdir = Path(tempfile.mkdtemp(prefix="t42_"))
+    workdir = Path(tempfile.mkdtemp(prefix="enhance_star_color_"))
     fx = make_two_peak_fixture(workdir)
     state = make_state(workdir, fx)
 
     result = enhance_star_color.func(
         saturation_multiplier=2.0,
         confine_to_region_mask=False,
-        output_stem="t42_test",
-        tool_call_id="t42-tcid",
+        output_stem="test",
+        tool_call_id="enhance_star_color-tcid",
         state=state,
     )
     out = result.update["paths"]["current_image"]
@@ -505,23 +505,23 @@ def test_enhance_star_color_increases_saturation():
     # amplify saturation; peak B (already neutral) should remain low.
     original = _read_fits(fx["original"])
     o_hsv_at_a = rgb2hsv(np.moveaxis(original[:, 55:65, 55:65], 0, -1))
-    b_hsv_at_a = rgb2hsv(np.moveaxis(boosted[:, 55:65, 55:65],  0, -1))
+    b_hsv_at_a = rgb2hsv(np.moveaxis(boosted[:, 55:65, 55:65], 0, -1))
     o_sat = float(np.mean(o_hsv_at_a[..., 1]))
     b_sat = float(np.mean(b_hsv_at_a[..., 1]))
     check(
-        "t42_saturation_boost_at_red_peak",
+        "saturation_boost_at_red_peak",
         b_sat > o_sat,
         f"saturation: original={o_sat:.3f} → boosted={b_sat:.3f}",
     )
 
     md = result.update.get("metadata", {})
-    check("t42_emits_image_space", md.get("image_space") == "display")
+    check("enhance_star_color_emits_image_space", md.get("image_space") == "display")
 
 
 def test_selective_reblend_refuses_missing_starless():
     """When paths.starless_image is missing, selective_star_reblend must
     raise a clear error pointing the agent at star_removal — no fallback."""
-    workdir = Path(tempfile.mkdtemp(prefix="t41_missing_"))
+    workdir = Path(tempfile.mkdtemp(prefix="missing_"))
     fx = make_two_peak_fixture(workdir)
     state = make_state(workdir, fx)
     state["paths"]["starless_image"] = None
@@ -542,7 +542,7 @@ def test_selective_reblend_refuses_missing_starless():
             min_separation_fwhm=2.0,
             max_sources=100,
             output_stem=None,
-            tool_call_id="t41-missing",
+            tool_call_id="selective_star_reblend-missing",
             state=state,
         )
     except FileNotFoundError as e:
@@ -552,7 +552,7 @@ def test_selective_reblend_refuses_missing_starless():
         detail = f"wrong type: {type(e).__name__}: {e}"
 
     check(
-        "t41_refuses_missing_starless",
+        "refuses_missing_starless",
         raised and "star_removal" in detail.lower(),
         detail[:120],
     )
@@ -562,11 +562,11 @@ def test_star_tools_are_hitl_mapped():
     from muphrid.graph.hitl import TOOL_TO_HITL
 
     check(
-        "t41_hitl_mapped",
+        "selective_star_reblend_hitl_mapped",
         TOOL_TO_HITL.get("selective_star_reblend") == "T41_selective_star_reblend",
     )
     check(
-        "t42_hitl_mapped",
+        "enhance_star_color_hitl_mapped",
         TOOL_TO_HITL.get("enhance_star_color") == "T42_enhance_star_color",
     )
 
@@ -576,7 +576,7 @@ def test_star_tools_are_hitl_mapped():
 
 def main() -> int:
     print("== expert star treatment tests ==")
-    test_t26_star_mask_path_wired()
+    test_reduce_stars_star_mask_path_wired()
     test_analyze_star_population_finds_both_peaks()
     test_selective_reblend_clean_mask_fallback_and_edges()
     test_selective_reblend_color_priority_keeps_red()
@@ -590,7 +590,7 @@ def main() -> int:
     if _failures:
         print(f"FAILED: {len(_failures)}")
         for f in _failures:
-            print(f"  - {f}")
+            print(f" - {f}")
         return 1
     print("All checks passed.")
     return 0

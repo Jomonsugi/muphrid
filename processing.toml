@@ -24,16 +24,16 @@ default = "moonshotai/Kimi-K2.6"
 # Max LangGraph node transitions per stream() call.
 #
 # Steady-state tool-call cost: ~4 ticks per call
-#   (action → variant_snapshot → hitl_check → agent).
+# (action → variant_snapshot → hitl_check → agent).
 # HITL round cost: ~6–10 additional ticks per gate
-#   (pass-1 prompt injection → agent analysis → optional present_images
-#    tool call → pass-2 interrupt → resume → agent). Each human feedback
-#    round inside an active HITL chat burns another ~4 ticks.
+# (pass-1 prompt injection → agent analysis → optional present_images
+# tool call → pass-2 interrupt → resume → agent). Each human feedback
+# round inside an active HITL chat burns another ~4 ticks.
 #
 # Rough budgets including HITL overhead for a typical run with 4–6 gates:
-#   150 ≈ 25 tool calls   (tight — single-pass nonlinear only)
-#   200 ≈ 35 tool calls   (comfortable — iteration + a few HITL exchanges)
-#   300 ≈ 55 tool calls   (roomy — heavy iteration + multiple feedback rounds)
+# 150 ≈ 25 tool calls (tight — single-pass nonlinear only)
+# 200 ≈ 35 tool calls (comfortable — iteration + a few HITL exchanges)
+# 300 ≈ 55 tool calls (roomy — heavy iteration + multiple feedback rounds)
 #
 # Root-cause fixes for HITL tick burn are tracked separately (hitl_check
 # pass 1 could inline the present_images call instead of prompting the
@@ -71,15 +71,15 @@ max_silent_hitl_tools = 3
 # (linear, stretch, nonlinear) legitimately need higher limits for iteration.
 
 [limits.per_phase]
-ingest = 5           # safety net — only resolve_target + advance_phase
-calibration = 10     # 3 masters + convert + calibrate + possible retries
-registration = 5     # safety net — single tool (siril_register)
-analysis = 5         # safety net — single tool (analyze_frames)
-stacking = 10        # select + stack + crop + iteration loop
-linear = 20          # gradient, color, denoise, decon + iteration
-stretch = 25         # variant creation + analysis per variant
-nonlinear = 25       # fluid experimentation with checkpoints
-export = 5           # safety net — single tool (export_final)
+ingest = 5 # safety net — only resolve_target + advance_phase
+calibration = 10 # 3 masters + convert + calibrate + possible retries
+registration = 5 # safety net — single tool (siril_register)
+analysis = 5 # safety net — single tool (analyze_frames)
+stacking = 10 # select + stack + crop + iteration loop
+linear = 20 # gradient, color, denoise, decon + iteration
+stretch = 25 # variant creation + analysis per variant
+nonlinear = 25 # fluid experimentation with checkpoints
+export = 5 # safety net — single tool (export_final)
 
 # ── Behavior ──────────────────────────────────────────────────────────────────
 

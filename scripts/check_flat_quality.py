@@ -19,11 +19,11 @@ Usage:
     --bias-test test_images/bias_test
 
 Target states (per frame):
-  USABLE    — fill 30–55%, good signal, not clipped
-  UNDER     — fill < 30%, increase exposure or light brightness
-  OVER      — fill > 55%, decrease exposure or light brightness
+  USABLE — fill 30–55%, good signal, not clipped
+  UNDER — fill < 30%, increase exposure or light brightness
+  OVER — fill > 55%, decrease exposure or light brightness
   SATURATED — fill ≥ 97% OR near-zero variance at high ADU (clipped sensor well)
-  UNKNOWN   — could not read frame
+  UNKNOWN — could not read frame
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ from muphrid.tools._sensor import (
     read_frame_exif,
 )
 from muphrid.tools._siril import run_siril_script
-from muphrid.tools.preprocess.t02_masters import build_masters
+from muphrid.tools.preprocess.masters import build_masters
 
 
 RAW_EXTS = {".raf", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2", ".pef"}
@@ -73,17 +73,17 @@ IMAGE_EXTS = RAW_EXTS | FITS_EXTS
 @dataclass
 class FlatEval:
     name: str
-    state: str                          # USABLE / UNDER / OVER / SATURATED / UNKNOWN
-    fill_pct: float | None              # primary metric: fraction of usable sensor range
+    state: str # USABLE / UNDER / OVER / SATURATED / UNKNOWN
+    fill_pct: float | None # primary metric: fraction of usable sensor range
     median_adu: int | None
     std_adu: float | None
     black_level: int | None
     white_level: int | None
-    distance_to_target: float | None    # |fill - TARGET_FILL_CENTER|
-    exposure_time: float | None = None  # shutter speed in seconds from EXIF
-    siril_norm_median: float | None = None   # populated by folder aggregate (T02)
-    siril_norm_min: float | None = None      # sensor-relative T02 threshold min
-    siril_norm_max: float | None = None      # sensor-relative T02 threshold max
+    distance_to_target: float | None # |fill - TARGET_FILL_CENTER|
+    exposure_time: float | None = None # shutter speed in seconds from EXIF
+    siril_norm_median: float | None = None # populated by folder aggregate
+    siril_norm_min: float | None = None # sensor-relative build_masters threshold min
+    siril_norm_max: float | None = None # sensor-relative build_masters threshold max
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
 
@@ -244,10 +244,10 @@ def _run_bias_test(working_dir: Path, bias_files: list[Path]) -> list[BiasEval]:
     return results
 
 
-# ── Folder aggregate (T02) ─────────────────────────────────────────────────────
+# ── Folder aggregate ─────────────────────────────────────────────────────
 
 def _stack_params(n: int) -> tuple[str, str]:
-    """Pick stack_method/rejection_method by frame count (matches T02 docstrings)."""
+    """Pick stack_method/rejection_method by frame count (matches build_masters docstrings)."""
     if n < 15:
         return "mean", "winsorized"
     if n <= 50:
@@ -257,7 +257,7 @@ def _stack_params(n: int) -> tuple[str, str]:
 
 def _synthetic_state(
     working_dir: Path,
-    files_kind: str,  # "biases" or "flats"
+    files_kind: str, # "biases" or "flats"
     files: list[Path],
     master_bias_path: str | None = None,
 ) -> dict:
@@ -306,7 +306,7 @@ def _run_t02_folder_flat(
     master_bias_path: str,
     label: str,
 ) -> FlatEval:
-    """Run T02 on a group of flats. Reports Siril-normalized median + sensor thresholds."""
+    """Run build_masters on a group of flats. Reports Siril-normalized median + sensor thresholds."""
     stack_method, rejection_method = _stack_params(len(flat_files))
     try:
         state = _synthetic_state(working_dir, "flats", flat_files, master_bias_path)
@@ -371,10 +371,10 @@ def main() -> int:
         print("Bias Quality Check (per-frame ADU)")
         print("=" * 72)
         print(f"Bias folder: {args.bias_test} ({len(bias_files)} file(s))")
-        print(f"Work:        {wd}")
+        print(f"Work: {wd}")
         print("-" * 72)
-        print("  Good bias: low median (near sensor black level), low std (read noise)")
-        print("  Bad  bias: high or maxed-out median, zero std (not a real bias frame)")
+        print(" Good bias: low median (near sensor black level), low std (read noise)")
+        print(" Bad bias: high or maxed-out median, zero std (not a real bias frame)")
         print("-" * 72)
 
         results = _run_bias_test(wd, bias_files)
@@ -382,7 +382,7 @@ def main() -> int:
         print("-" * 72)
         for r in results:
             if r.error:
-                print(f"{r.name[:20]:20}   error: {r.error}")
+                print(f"{r.name[:20]:20} error: {r.error}")
             else:
                 rank_str = f"#{r.rank}" if r.rank else "-"
                 print(f"{r.name[:20]:20} {r.median_adu:10.1f} {r.std_adu:10.2f} "
@@ -413,14 +413,14 @@ def main() -> int:
     print("=" * 72)
     print("Flat Quality Check")
     print("=" * 72)
-    print(f"Flats:  {args.flats} ({len(flats)} file(s))")
+    print(f"Flats: {args.flats} ({len(flats)} file(s))")
     print(f"Biases: {args.biases} ({len(biases)} file(s))")
-    print(f"Work:   {wd}")
+    print(f"Work: {wd}")
     print("-" * 72)
     print(f"Target fill: {TARGET_FILL_MIN*100:.0f}–{TARGET_FILL_MAX*100:.0f}% of usable sensor range")
-    print(f"  (fill% = (median_adu - black_level) / (white_level - black_level))")
-    print(f"  States: USABLE={TARGET_FILL_MIN*100:.0f}–{TARGET_FILL_MAX*100:.0f}%  "
-          f"UNDER=<{TARGET_FILL_MIN*100:.0f}%  OVER=>{TARGET_FILL_MAX*100:.0f}%  "
+    print(f" (fill% = (median_adu - black_level) / (white_level - black_level))")
+    print(f" States: USABLE={TARGET_FILL_MIN*100:.0f}–{TARGET_FILL_MAX*100:.0f}% "
+          f"UNDER=<{TARGET_FILL_MIN*100:.0f}% OVER=>{TARGET_FILL_MAX*100:.0f}% "
           f"SATURATED=clipped")
 
     # Build master bias only when the folder-aggregate path will consume it.
@@ -453,8 +453,8 @@ def main() -> int:
             bl = first_valid.black_level
             wl = first_valid.white_level
             adu_lo, adu_hi, adu_ideal = flat_adu_range(bl, wl)
-            print(f"Sensor:  black={bl}  white={wl}  usable={wl - bl} ADU")
-            print(f"Target ADU range: {adu_lo}–{adu_hi}  (ideal center ~{adu_ideal})")
+            print(f"Sensor: black={bl} white={wl} usable={wl - bl} ADU")
+            print(f"Target ADU range: {adu_lo}–{adu_hi} (ideal center ~{adu_ideal})")
 
         print()
         print(f"{'Flat':24} {'Shutter':8} {'State':10} {'Fill%':6} {'Target':6} "
@@ -470,9 +470,9 @@ def main() -> int:
             print(f"{ev.name[:24]:24} {exp_str:>8} {ev.state:10} {fill_str:>6} {target_lbl:6} "
                   f"{adu_str:>10} {std_str:>9} {rank:>5}")
             if ev.error:
-                print(f"  error: {ev.error}")
+                print(f" error: {ev.error}")
             for w in ev.warnings:
-                print(f"  warn: {w}")
+                print(f" warn: {w}")
 
         usable = [r for r in results if r.state == "USABLE"]
         print("-" * 80)
@@ -482,9 +482,9 @@ def main() -> int:
         if best is not None:
             fill_str = f"{best.fill_pct*100:.1f}%" if best.fill_pct is not None else "n/a"
             print(f"Closest to target ({TARGET_FILL_CENTER*100:.1f}%): "
-                  f"{best.name}  fill={fill_str}  state={best.state}  ADU={best.median_adu}")
+                  f"{best.name} fill={fill_str} state={best.state} ADU={best.median_adu}")
 
-    # ── Folder aggregate check (T02) ───────────────────────────────────────────
+    # ── Folder aggregate check ───────────────────────────────────────────
     if not args.skip_folder and len(flats) > 1:
         print("\n[Folder Aggregate — Siril master flat]")
         folder_dir = wd / "folder_aggregate"
@@ -492,11 +492,11 @@ def main() -> int:
         ev = _run_t02_folder_flat(folder_dir, flats, master_bias_path, "ALL_FLATS")
         print(f"Siril normalized median: {_fmt_float(ev.siril_norm_median)}")
         if ev.siril_norm_min is not None:
-            print(f"Sensor-relative target:  [{ev.siril_norm_min:.4f}, {ev.siril_norm_max:.4f}]"
-                  f"  (= 30–55% fill, sensor black={ev.black_level} white={ev.white_level})")
+            print(f"Sensor-relative target: [{ev.siril_norm_min:.4f}, {ev.siril_norm_max:.4f}]"
+                  f" (= 30–55% fill, sensor black={ev.black_level} white={ev.white_level})")
             if ev.siril_norm_median is not None:
                 in_range = ev.siril_norm_min <= ev.siril_norm_median <= ev.siril_norm_max
-                print(f"T02 HITL triggered: {'NO — within range' if in_range else 'YES — outside range'}")
+                print(f"build_masters HITL triggered: {'NO — within range' if in_range else 'YES — outside range'}")
         if ev.error:
             print(f"Error: {ev.error}")
         for w in ev.warnings:

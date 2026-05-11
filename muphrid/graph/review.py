@@ -421,7 +421,7 @@ def parse_human_event(response: Any) -> ReviewHumanEvent:
         event_type = str(response.get("type", "") or "feedback")
         text = str(response.get("text", "") or "")
         event = ReviewHumanEvent(
-            type=event_type,  # type: ignore[typeddict-item]
+            type=event_type, # type: ignore[typeddict-item]
             text=text,
             received_at=now,
         )

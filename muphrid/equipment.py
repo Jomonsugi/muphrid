@@ -28,7 +28,7 @@ from typing import Any
 try:
     import tomllib
 except ModuleNotFoundError:
-    import tomli as tomllib  # Python < 3.11 fallback
+    import tomli as tomllib # Python < 3.11 fallback
 
 
 def _find_config_path() -> Path | None:
