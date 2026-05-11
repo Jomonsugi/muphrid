@@ -92,7 +92,7 @@ def vref(path: str, source: str, label: str = "stub", phase: str = "linear") -> 
     return VisualRef(path=path, label=label, source=source, phase=phase)
 
 
-def stub_variant(preview_path: str, vid: str = "T09_v1", label: str | None = None) -> Variant:
+def stub_variant(preview_path: str, vid: str = "remove_gradient_v1", label: str | None = None) -> Variant:
     """Build a stub Variant pointing at an existing JPG preview path."""
     return Variant(
         id=vid,
@@ -153,7 +153,7 @@ print("_select_visible_refs cases\n" + "=" * 40)
 reset_vlm_modes(hitl=False, auto=False, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
-    variant_pool=[stub_variant(paths[0], "T09_v1")],
+    variant_pool=[stub_variant(paths[0], "remove_gradient_v1")],
     visual_context=[vref(paths[1], "present_images")],
 )
 out = _select_visible_refs(state)
@@ -168,8 +168,8 @@ reset_vlm_modes(hitl=True, auto=False, cap=8)
 paths = make_stub_jpgs(4)
 state = make_state(
     variant_pool=[
-        stub_variant(paths[0], "T09_v1"),
-        stub_variant(paths[1], "T09_v2"),
+        stub_variant(paths[0], "remove_gradient_v1"),
+        stub_variant(paths[1], "remove_gradient_v2"),
     ],
     visual_context=[
         vref(paths[2], "present_images"),
@@ -239,7 +239,7 @@ check(
 reset_vlm_modes(hitl=True, auto=True, cap=4)
 paths = make_stub_jpgs(9)
 state = make_state(
-    variant_pool=[stub_variant(paths[i + 1], f"T09_v{i+1}") for i in range(8)],
+    variant_pool=[stub_variant(paths[i + 1], f"remove_gradient_v{i+1}") for i in range(8)],
     visual_context=[vref(paths[0], "present_images")],
 )
 out = _select_visible_refs(state)
@@ -254,9 +254,9 @@ reset_vlm_modes(hitl=True, auto=True, cap=8)
 paths = make_stub_jpgs(5)
 state = make_state(
     variant_pool=[
-        stub_variant(paths[2], "T09_v1"),
-        stub_variant(paths[3], "T09_v2"),
-        stub_variant(paths[4], "T09_v3"),
+        stub_variant(paths[2], "remove_gradient_v1"),
+        stub_variant(paths[3], "remove_gradient_v2"),
+        stub_variant(paths[4], "remove_gradient_v3"),
     ],
     visual_context=[
         vref(paths[0], "present_images"),
@@ -275,8 +275,8 @@ reset_vlm_modes(hitl=True, auto=True, cap=3)
 paths = make_stub_jpgs(4)
 state = make_state(
     variant_pool=[
-        stub_variant(paths[2], "T09_v1"),
-        stub_variant(paths[3], "T09_v2"),
+        stub_variant(paths[2], "remove_gradient_v1"),
+        stub_variant(paths[3], "remove_gradient_v2"),
     ],
     visual_context=[
         vref(paths[0], "present_images"),
@@ -329,7 +329,7 @@ messages = [
     historical_msg,
     AIMessage(content="ok"),
 ]
-state = make_state(variant_pool=[stub_variant(paths[0], "T09_v1")])
+state = make_state(variant_pool=[stub_variant(paths[0], "remove_gradient_v1")])
 out = _build_vlm_view(state, messages)
 check(
     "case 8: historical images stripped; HITL state ref injected",
@@ -380,8 +380,8 @@ messages = [
 ]
 state = make_state(
     variant_pool=[
-        stub_variant(paths[0], "T09_v1"),
-        stub_variant(paths[1], "T09_v2"),
+        stub_variant(paths[0], "remove_gradient_v1"),
+        stub_variant(paths[1], "remove_gradient_v2"),
     ],
 )
 out = _build_vlm_view(state, messages)
@@ -396,7 +396,7 @@ check(
 reset_vlm_modes(hitl=True, auto=True, cap=4)
 paths = make_stub_jpgs(7)
 state = make_state(
-    variant_pool=[stub_variant(paths[i + 1], f"T09_v{i+1}") for i in range(6)],
+    variant_pool=[stub_variant(paths[i + 1], f"remove_gradient_v{i+1}") for i in range(6)],
     visual_context=[vref(paths[0], "present_images", label="earlier autonomous")],
     active_hitl=True,
 )
@@ -436,14 +436,14 @@ print("\nbuild_variant_promotion_update + commit_variant cases\n" + "=" * 40)
 paths = make_stub_jpgs(3)
 state = make_state(
     variant_pool=[
-        stub_variant(paths[0], "T09_v1", label="gradient pass A"),
-        stub_variant(paths[1], "T09_v2", label="gradient pass B"),
-        stub_variant(paths[2], "T09_v3", label="gradient pass C"),
+        stub_variant(paths[0], "remove_gradient_v1", label="gradient pass A"),
+        stub_variant(paths[1], "remove_gradient_v2", label="gradient pass B"),
+        stub_variant(paths[2], "remove_gradient_v3", label="gradient pass C"),
     ],
     visual_context=[],
     paths={"current_image": "/old/path.fits"},
 )
-result = build_variant_promotion_update(state, "T09_v2")
+result = build_variant_promotion_update(state, "remove_gradient_v2")
 check(
     "case 13: build_variant_promotion_update returns (variant, update) for valid id",
     result is not None,
@@ -468,9 +468,9 @@ check(
 
 # Case 14: invalid variant id → None
 state = make_state(
-    variant_pool=[stub_variant(make_stub_jpgs(1)[0], "T09_v1")],
+    variant_pool=[stub_variant(make_stub_jpgs(1)[0], "remove_gradient_v1")],
 )
-result = build_variant_promotion_update(state, "T09_v999")
+result = build_variant_promotion_update(state, "remove_gradient_v999")
 check(
     "case 14: build_variant_promotion_update returns None for unknown id",
     result is None,
@@ -482,10 +482,10 @@ paths = make_stub_jpgs(3)
 existing_present = vref(paths[0], "present_images", label="prior inspection")
 existing_carry = vref(paths[1], "phase_carry", label="earlier carry")
 state = make_state(
-    variant_pool=[stub_variant(paths[2], "T09_v1", label="new variant")],
+    variant_pool=[stub_variant(paths[2], "remove_gradient_v1", label="new variant")],
     visual_context=[existing_present, existing_carry],
 )
-_, update = build_variant_promotion_update(state, "T09_v1")
+_, update = build_variant_promotion_update(state, "remove_gradient_v1")
 new_visual = update["visual_context"]
 check(
     "case 15: present_images survives and stale phase_carry is cleared",
@@ -507,12 +507,12 @@ check(
 paths = make_stub_jpgs(2)
 state = make_state(
     variant_pool=[
-        stub_variant(paths[0], "T09_v1", label="pass A"),
-        stub_variant(paths[1], "T09_v2", label="pass B"),
+        stub_variant(paths[0], "remove_gradient_v1", label="pass A"),
+        stub_variant(paths[1], "remove_gradient_v2", label="pass B"),
     ],
 )
 cmd = commit_variant.invoke({
-    "variant_id": "T09_v2",
+    "variant_id": "remove_gradient_v2",
     "rationale": "cleaner gradient",
     "state": state,
     "tool_call_id": "test_tcid_1",
@@ -547,13 +547,13 @@ payload = _json.loads(text_content(tool_msgs[0].content))
 check(
     "case 16: ToolMessage payload reports committed variant id and rationale",
     payload.get("status") == "committed"
-    and payload.get("variant_id") == "T09_v2"
+    and payload.get("variant_id") == "remove_gradient_v2"
     and payload.get("rationale") == "cleaner gradient",
     f"got {payload}",
 )
 check(
     "case 16: ToolMessage payload lists the dropped variants",
-    payload.get("dropped_variants") == ["T09_v1"],
+    payload.get("dropped_variants") == ["remove_gradient_v1"],
     f"got {payload.get('dropped_variants')}",
 )
 
@@ -561,12 +561,12 @@ check(
 paths = make_stub_jpgs(2)
 state = make_state(
     variant_pool=[
-        stub_variant(paths[0], "T09_v1"),
-        stub_variant(paths[1], "T09_v2"),
+        stub_variant(paths[0], "remove_gradient_v1"),
+        stub_variant(paths[1], "remove_gradient_v2"),
     ],
 )
 cmd = commit_variant.invoke({
-    "variant_id": "T09_v99",
+    "variant_id": "remove_gradient_v99",
     "state": state,
     "tool_call_id": "test_tcid_2",
 })
@@ -579,7 +579,7 @@ check(
 )
 check(
     "case 17: error payload includes the list of valid ids",
-    err_payload.get("valid_ids") == ["T09_v1", "T09_v2"],
+    err_payload.get("valid_ids") == ["remove_gradient_v1", "remove_gradient_v2"],
     f"got {err_payload.get('valid_ids')}",
 )
 check(
@@ -596,12 +596,12 @@ reset_vlm_modes(hitl=False, auto=True, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
     variant_pool=[
-        stub_variant(paths[0], "T09_v1"),
-        stub_variant(paths[1], "T09_v2"),
+        stub_variant(paths[0], "remove_gradient_v1"),
+        stub_variant(paths[1], "remove_gradient_v2"),
     ],
 )
 cmd = commit_variant.invoke({
-    "variant_id": "T09_v1",
+    "variant_id": "remove_gradient_v1",
     "state": state,
     "tool_call_id": "test_tcid_3",
 })
@@ -642,9 +642,9 @@ check(
 )
 
 # Case 20: pool with three variants → markdown section listing all ids and labels
-v1 = stub_variant(make_stub_jpgs(1)[0], "T09_v1", label="gradient pass A")
-v2 = stub_variant(make_stub_jpgs(1)[0], "T09_v2", label="gradient pass B")
-v3 = stub_variant(make_stub_jpgs(1)[0], "T09_v3", label="gradient pass C")
+v1 = stub_variant(make_stub_jpgs(1)[0], "remove_gradient_v1", label="gradient pass A")
+v2 = stub_variant(make_stub_jpgs(1)[0], "remove_gradient_v2", label="gradient pass B")
+v3 = stub_variant(make_stub_jpgs(1)[0], "remove_gradient_v3", label="gradient pass C")
 out_text = _format_variant_pool_for_prompt([v1, v2, v3])
 check(
     "case 20: section header is present",
@@ -653,7 +653,7 @@ check(
 )
 check(
     "case 20: all three variant ids appear in the section",
-    "T09_v1" in out_text and "T09_v2" in out_text and "T09_v3" in out_text,
+    "remove_gradient_v1" in out_text and "remove_gradient_v2" in out_text and "remove_gradient_v3" in out_text,
     "missing variant ids",
 )
 check(
@@ -671,7 +671,7 @@ check(
 
 # Case 21: variant with metrics → metrics rendered inline
 v_with_metrics = Variant(
-    id="T09_v1",
+    id="remove_gradient_v1",
     phase="linear",
     tool_name="remove_gradient",
     label="gradient pass",

@@ -511,7 +511,7 @@ class Variant(TypedDict):
 
     See variant_pool design discussion for the full rationale.
     """
-    id:           str           # stable id, e.g. "T09_v3"
+    id:           str           # stable id, e.g. "remove_gradient_v3"
     phase:        str           # ProcessingPhase value when the variant was created
     tool_name:    str           # the tool that produced it (e.g. "remove_gradient")
     label:        str           # auto-generated human-readable label

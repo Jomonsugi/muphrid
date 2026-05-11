@@ -4,11 +4,15 @@
 # Every phase-specific tool can be toggled for HITL — the human chooses
 # where and when to get involved.
 #
-# autonomous = true skip all HITL interrupts for unattended runs
-# enabled = false skip HITL for a specific tool only
+# Section keys match the tool function name (see TOOL_TO_HITL in
+# muphrid/graph/hitl.py). Each `[hitl.<tool_name>]` block configures the
+# gate for that tool.
 #
-# type = "data_review" show metrics/stats, no image display required
-# type = "image_review" show current image(s), chat-based feedback
+# autonomous = true        skip all HITL interrupts for unattended runs
+# enabled = false          skip HITL for a specific tool only
+#
+# type = "data_review"     show metrics/stats, no image display required
+# type = "image_review"    show current image(s), chat-based feedback
 #
 # CLI reads this file directly. The Gradio app shows these as defaults
 # and overrides them at runtime via checkboxes.
@@ -35,141 +39,141 @@ vlm_retention_max_images = 8
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 
-[hitl.T02_masters]
+[hitl.build_masters]
 enabled = false
-type = "data_review"
-title = "Master Frame Diagnostics"
+type    = "data_review"
+title   = "Master Frame Diagnostics"
 
-[hitl.T02b_convert]
+[hitl.convert_sequence]
 enabled = false
-type = "data_review"
-title = "Sequence Conversion"
+type    = "data_review"
+title   = "Sequence Conversion"
 
-[hitl.T03_calibrate]
+[hitl.calibrate]
 enabled = false
-type = "data_review"
-title = "Calibration"
+type    = "data_review"
+title   = "Calibration"
 
 # ── Registration ──────────────────────────────────────────────────────────────
 
-[hitl.T04_register]
+[hitl.siril_register]
 enabled = false
-type = "data_review"
-title = "Registration"
+type    = "data_review"
+title   = "Registration"
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
 
-[hitl.T05_analyze]
+[hitl.analyze_frames]
 enabled = false
-type = "data_review"
-title = "Frame Analysis"
+type    = "data_review"
+title   = "Frame Analysis"
 
 # ── Stacking ──────────────────────────────────────────────────────────────────
 
-[hitl.T06_select]
+[hitl.select_frames]
 enabled = false
-type = "data_review"
-title = "Frame Selection"
+type    = "data_review"
+title   = "Frame Selection"
 
-[hitl.T07_stack]
+[hitl.siril_stack]
 enabled = false
-type = "data_review"
-title = "Stack Results"
+type    = "data_review"
+title   = "Stack Results"
 
-[hitl.T08_crop]
+[hitl.auto_crop]
 enabled = false
-type = "data_review"
-title = "Auto Crop"
+type    = "data_review"
+title   = "Auto Crop"
 
 # ── Linear processing ────────────────────────────────────────────────────────
 
-[hitl.T09_gradient]
+[hitl.remove_gradient]
 enabled = true
-type = "image_review"
-title = "Gradient Removal"
+type    = "image_review"
+title   = "Gradient Removal"
 
-[hitl.T10_color]
+[hitl.color_calibrate]
 enabled = false
-type = "data_review"
-title = "Color Calibration"
+type    = "data_review"
+title   = "Color Calibration"
 
-[hitl.T11_green]
+[hitl.remove_green_noise]
 enabled = false
-type = "data_review"
-title = "Green Noise Removal"
+type    = "data_review"
+title   = "Green Noise Removal"
 
-[hitl.T12_denoise]
+[hitl.noise_reduction]
 enabled = false
-type = "data_review"
-title = "Noise Reduction"
+type    = "data_review"
+title   = "Noise Reduction"
 
-[hitl.T13_decon]
+[hitl.deconvolution]
 enabled = false
-type = "image_review"
-title = "Deconvolution"
+type    = "image_review"
+title   = "Deconvolution"
 
 # ── Stretch ───────────────────────────────────────────────────────────────────
 
-[hitl.T14_stretch]
+[hitl.stretch_image]
 enabled = true
-type = "image_review"
-title = "Stretch"
+type    = "image_review"
+title   = "Stretch"
 
 # ── Non-linear processing ────────────────────────────────────────────────────
 
-[hitl.T15_star_removal]
+[hitl.star_removal]
 enabled = false
-type = "image_review"
-title = "Star Removal"
+type    = "image_review"
+title   = "Star Removal"
 
-[hitl.T16_curves]
+[hitl.curves_adjust]
 enabled = true
-type = "image_review"
-title = "Curves"
+type    = "image_review"
+title   = "Curves"
 
-[hitl.T17_local_contrast]
+[hitl.local_contrast_enhance]
 enabled = false
-type = "image_review"
-title = "Local Contrast"
+type    = "image_review"
+title   = "Local Contrast"
 
-[hitl.T18_saturation]
+[hitl.saturation_adjust]
 enabled = false
-type = "image_review"
-title = "Saturation"
+type    = "image_review"
+title   = "Saturation"
 
-[hitl.T19_star_restoration]
+[hitl.star_restoration]
 enabled = true
-type = "image_review"
-title = "Star Restoration"
+type    = "image_review"
+title   = "Star Restoration"
 
-[hitl.T25_mask]
+[hitl.create_mask]
 enabled = false
-type = "image_review"
-title = "Mask Creation"
+type    = "image_review"
+title   = "Mask Creation"
 
-[hitl.T26_reduce_stars]
+[hitl.reduce_stars]
 enabled = false
-type = "image_review"
-title = "Star Reduction"
+type    = "image_review"
+title   = "Star Reduction"
 
-[hitl.T27_multiscale]
+[hitl.multiscale_process]
 enabled = false
-type = "image_review"
-title = "Multiscale Sharpening"
+type    = "image_review"
+title   = "Multiscale Sharpening"
 
-[hitl.T41_selective_star_reblend]
+[hitl.selective_star_reblend]
 enabled = false
-type = "image_review"
-title = "Selective Star Reblend"
+type    = "image_review"
+title   = "Selective Star Reblend"
 
-[hitl.T42_enhance_star_color]
+[hitl.enhance_star_color]
 enabled = false
-type = "image_review"
-title = "Enhance Star Color"
+type    = "image_review"
+title   = "Enhance Star Color"
 
 # ── Export ───────────────────────────────────────────────────────────────────
 
-[hitl.T24_export]
+[hitl.export_final]
 enabled = true
-type = "image_review"
-title = "Final Export Review"
+type    = "image_review"
+title   = "Final Export Review"

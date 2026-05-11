@@ -13,9 +13,9 @@ as linear, and binding the export to the heuristic would write a different
 artifact than what was approved. State authority means state, full stop;
 the heuristic stays diagnostic.
 
-Tentative-export pattern (when the T24_export HITL gate is enabled):
+Tentative-export pattern (when the export_final HITL gate is enabled):
 
-  1. export_final writes tentatively when the T24_export HITL gate is
+  1. export_final writes tentatively when the export_final HITL gate is
      enabled. This is system-derived, not model-selected.
      Files are written to `<output_dir>/.tentative_<stem>/`.
   2. The tool emits a ReviewSession proposal whose visual_path points
@@ -193,7 +193,7 @@ class ExportFinalInput(BaseModel):
             "state.metadata.tentative_export so the HITL gate can present "
             "the actual rendered JPG before committing. This field is kept "
             "for compatibility, but the effective behavior is system-owned: "
-            "when the T24_export HITL gate is enabled, export_final stages "
+            "when the export_final HITL gate is enabled, export_final stages "
             "tentatively regardless of the model-provided value; autonomous "
             "mode writes directly into output_dir."
         ),
@@ -312,7 +312,7 @@ def export_final(
     disagree with the artifact the human approved. Override `source_profile`
     explicitly only for unusual workflows.
 
-    Tentative mode: when the T24_export HITL gate is enabled, files are
+    Tentative mode: when the export_final HITL gate is enabled, files are
     written to <output_dir>/.tentative_<stem>/ and recorded in
     state.metadata.tentative_export. The human reviews the rendered JPG,
     and the backend approval path moves files into output_dir. The model
@@ -367,7 +367,7 @@ def export_final(
     # flag is HITL policy, not an LLM-controlled escape hatch.
     from muphrid.graph.hitl import is_enabled
 
-    effective_tentative = bool(is_enabled("T24_export"))
+    effective_tentative = bool(is_enabled("export_final"))
 
     if effective_tentative:
         write_dir = export_dir / f".tentative_{stem}"
@@ -522,7 +522,7 @@ def commit_export_update(
     if not isinstance(tentative, dict):
         raise RuntimeError(
             "commit_export: state.metadata.tentative_export is not set. "
-            "Run export_final with the T24_export HITL gate enabled to produce "
+            "Run export_final with the export_final HITL gate enabled to produce "
             "a staged export, then approve it."
         )
 

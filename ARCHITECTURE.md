@@ -236,7 +236,7 @@ This distinction prevents the UI and graph from disagreeing about what is action
 
 ## Variant Pool and Proposals
 
-At reviewable stages, tool outputs are snapshotted into `runs/<thread-id>/variants/` with stable ids such as `T09_v1` or `T14_v3`.
+At reviewable stages, tool outputs are snapshotted into `runs/<thread-id>/variants/` with stable ids such as `remove_gradient_v1` or `stretch_image_v3`.
 
 The agent can:
 

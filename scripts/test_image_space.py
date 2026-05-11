@@ -217,7 +217,7 @@ def test_export_picks_correct_source_profile() -> None:
 def test_export_review_is_system_owned() -> None:
     """
     Final export review must be system-owned: export_final derives tentative
-    staging from T24_export HITL policy, commit_export is not model-bound, and
+    staging from export_final HITL policy, commit_export is not model-bound, and
     backend commit updates metadata without mutating paths.current_image.
     """
     print("\n[4b] export review is system-owned")
@@ -228,8 +228,8 @@ def test_export_review_is_system_owned() -> None:
 
     src = inspect_source(export.export_final.func)
     check(
-        "export_final derives tentative from T24_export",
-        'is_enabled("T24_export")' in src and "effective_tentative" in src,
+        "export_final derives tentative from export_final",
+        'is_enabled("export_final")' in src and "effective_tentative" in src,
     )
 
     export_tool_names = {t.name for t in tools_for_phase(ProcessingPhase.EXPORT)}

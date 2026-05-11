@@ -1470,15 +1470,15 @@ _VARIANT_METRIC_KEYS = (
 )
 
 
-def _phase_short_code(hitl_key: str | None) -> str:
+def _variant_short_code(tool_name: str | None) -> str:
     """
-    Extract the 'remove_gradient'-style prefix from a hitl_key like 'T09_gradient'.
-    Falls back to 'TXX' if the key doesn't follow the convention.
+    Short code used as the variant id prefix. The tool function name is the
+    canonical vocabulary across agent, system, UI, and human chat — variant
+    ids look like 'remove_gradient_v1', 'stretch_image_v3'. Tool messages
+    without a recognized tool name fall back to 'unknown' so the id remains
+    a valid string.
     """
-    if not hitl_key:
-        return "TXX"
-    head = hitl_key.split("_", 1)[0]
-    return head if head.startswith("T") else "TXX"
+    return tool_name or "unknown"
 
 
 def _find_ai_message_for_tool_call(messages: list, tool_call_id: str) -> AIMessage | None:
@@ -1599,8 +1599,7 @@ def _make_variant(
     """
     from datetime import datetime, timezone
 
-    hitl_key = TOOL_TO_HITL.get(tool_msg.name)
-    short = _phase_short_code(hitl_key)
+    short = _variant_short_code(tool_msg.name)
 
     file_path, preview_path = _extract_variant_paths(tool_msg)
     if not file_path:
@@ -1608,13 +1607,13 @@ def _make_variant(
 
     params = _extract_variant_params(tool_msg, ai_msg)
 
-    # Generate stable id: T09_v1, T09_v2, ... (counts existing entries with
-    # the same prefix; pool is per-gate so this stays small)
+    # Stable id: <tool_name>_v1, <tool_name>_v2, ... Counts existing entries
+    # with the same prefix; pool is per-gate so this stays small.
     same_phase = [v for v in pool if v.get("id", "").startswith(f"{short}_v")]
     n = len(same_phase) + 1
     variant_id = f"{short}_v{n}"
 
-    # Label: prefer tool's own variant_label, else synthesize from params
+    # Label: prefer tool's own variant_label, else synthesize from params.
     tool_label = _extract_variant_label(tool_msg, params)
     if tool_label:
         label = f"{short} v{n} — {tool_label}"

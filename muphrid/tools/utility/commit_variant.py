@@ -51,10 +51,9 @@ class CommitVariantInput(BaseModel):
     """Input schema for commit_variant."""
     variant_id: str = Field(
         description=(
-            "The id of the variant to commit, e.g. 'T09_v3'. Variant ids are "
-            "issued by variant_snapshot when HITL-mapped tools execute, in the "
-            "format '<tool_short_code>_v<n>'. If you don't know the id, run "
-            "the tool again or check your prior tool results."
+            "Id of an entry in state.variant_pool. The pool is surfaced in "
+            "the system prompt every turn — pick an id from there. Unknown "
+            "ids are rejected with the valid options."
         ),
     )
     rationale: str | None = Field(

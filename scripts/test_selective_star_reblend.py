@@ -563,11 +563,11 @@ def test_star_tools_are_hitl_mapped():
 
     check(
         "selective_star_reblend_hitl_mapped",
-        TOOL_TO_HITL.get("selective_star_reblend") == "T41_selective_star_reblend",
+        TOOL_TO_HITL.get("selective_star_reblend") == "selective_star_reblend",
     )
     check(
         "enhance_star_color_hitl_mapped",
-        TOOL_TO_HITL.get("enhance_star_color") == "T42_enhance_star_color",
+        TOOL_TO_HITL.get("enhance_star_color") == "enhance_star_color",
     )
 
 

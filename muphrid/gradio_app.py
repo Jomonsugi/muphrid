@@ -716,12 +716,11 @@ async def _stream_graph(
         # gallery preview. Raw pool entries are shown only in the bottom
         # workbench filmstrip.
         # (2) Every gallery entry whose source matches a variant has the
-        # variant id visible in its caption. This is the fix for
-        # the user's "neither matches the image" confusion: the
-        # Approve button says "T14_v1" so the gallery caption needs
-        # to start with "T14_v1" too. The agent's descriptive label
-        # (e.g. "GHS D3 SP0.15") is preserved when it provided one
-        # via present_images — we just prefix it with the id.
+        # variant id visible in its caption. The Approve button shows
+        # the variant id (e.g. "stretch_image_v1"), so the gallery caption
+        # has to start with the same id. The agent's descriptive label
+        # (e.g. "GHS D3 SP0.15") is preserved when it provided one via
+        # present_images — we just prefix it with the id.
         review_variants = _proposal_variants(proposal)
         if review_variants and working_dir:
             # Compute predicted preview paths for every variant once and
@@ -2225,38 +2224,38 @@ def build_app() -> gr.Blocks:
                 return cb
 
             gr.Markdown("**Calibration**")
-            _hitl_cb("T02_masters", "build_masters Master Frame Diagnostics")
-            _hitl_cb("T02b_convert", "convert_sequence Sequence Conversion")
-            _hitl_cb("T03_calibrate", "calibrate Calibration")
+            _hitl_cb("build_masters", "build_masters Master Frame Diagnostics")
+            _hitl_cb("convert_sequence", "convert_sequence Sequence Conversion")
+            _hitl_cb("calibrate", "calibrate Calibration")
             gr.Markdown("**Registration**")
-            _hitl_cb("T04_register", "siril_register Registration")
+            _hitl_cb("siril_register", "siril_register Registration")
             gr.Markdown("**Analysis**")
-            _hitl_cb("T05_analyze", "analyze_frames Frame Analysis")
+            _hitl_cb("analyze_frames", "analyze_frames Frame Analysis")
             gr.Markdown("**Stacking**")
-            _hitl_cb("T06_select", "select_frames Frame Selection")
-            _hitl_cb("T07_stack", "siril_stack Stack Results")
-            _hitl_cb("T08_crop", "auto_crop Auto Crop")
+            _hitl_cb("select_frames", "select_frames Frame Selection")
+            _hitl_cb("siril_stack", "siril_stack Stack Results")
+            _hitl_cb("auto_crop", "auto_crop Auto Crop")
             gr.Markdown("**Linear**")
-            _hitl_cb("T09_gradient", "remove_gradient Gradient Removal", default=True)
-            _hitl_cb("T10_color", "color_calibrate Color Calibration")
-            _hitl_cb("T11_green", "remove_green_noise Green Noise Removal")
-            _hitl_cb("T12_denoise", "noise_reduction Noise Reduction")
-            _hitl_cb("T13_decon", "deconvolution Deconvolution")
+            _hitl_cb("remove_gradient", "remove_gradient Gradient Removal", default=True)
+            _hitl_cb("color_calibrate", "color_calibrate Color Calibration")
+            _hitl_cb("remove_green_noise", "remove_green_noise Green Noise Removal")
+            _hitl_cb("noise_reduction", "noise_reduction Noise Reduction")
+            _hitl_cb("deconvolution", "deconvolution Deconvolution")
             gr.Markdown("**Stretch**")
-            _hitl_cb("T14_stretch", "stretch_image Stretch", default=True)
+            _hitl_cb("stretch_image", "stretch_image Stretch", default=True)
             gr.Markdown("**Non-linear**")
-            _hitl_cb("T15_star_removal", "star_removal Star Removal")
-            _hitl_cb("T16_curves", "curves_adjust Curves", default=True)
-            _hitl_cb("T17_local_contrast", "local_contrast_enhance Local Contrast")
-            _hitl_cb("T18_saturation", "saturation_adjust Saturation")
-            _hitl_cb("T19_star_restoration", "star_restoration Star Restoration", default=True)
-            _hitl_cb("T25_mask", "create_mask Mask Creation")
-            _hitl_cb("T26_reduce_stars", "reduce_stars Star Reduction")
-            _hitl_cb("T27_multiscale", "multiscale_process Multiscale Sharpening")
-            _hitl_cb("T41_selective_star_reblend", "selective_star_reblend Selective Star Reblend")
-            _hitl_cb("T42_enhance_star_color", "enhance_star_color Enhance Star Color")
+            _hitl_cb("star_removal", "star_removal Star Removal")
+            _hitl_cb("curves_adjust", "curves_adjust Curves", default=True)
+            _hitl_cb("local_contrast_enhance", "local_contrast_enhance Local Contrast")
+            _hitl_cb("saturation_adjust", "saturation_adjust Saturation")
+            _hitl_cb("star_restoration", "star_restoration Star Restoration", default=True)
+            _hitl_cb("create_mask", "create_mask Mask Creation")
+            _hitl_cb("reduce_stars", "reduce_stars Star Reduction")
+            _hitl_cb("multiscale_process", "multiscale_process Multiscale Sharpening")
+            _hitl_cb("selective_star_reblend", "selective_star_reblend Selective Star Reblend")
+            _hitl_cb("enhance_star_color", "enhance_star_color Enhance Star Color")
             gr.Markdown("**Export**")
-            _hitl_cb("T24_export", "export_final Final Export Review", default=True)
+            _hitl_cb("export_final", "export_final Final Export Review", default=True)
 
         # ── Model & Limits tab ───────────────────────────────────────
         with gr.Tab("Model & Limits"):

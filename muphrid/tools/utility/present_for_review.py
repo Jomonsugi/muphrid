@@ -90,12 +90,11 @@ class PresentForReviewInput(BaseModel):
 
     variant_ids: list[str] = Field(
         description=(
-            "Variant ids from state.variant_pool that you are deliberately "
-            "presenting as candidates for human review. Format: 'T<NN>_v<n>' "
-            "(e.g. 'T14_v1', 'T14_v3'). Each id must exist in the current "
-            "pool; unknown ids are rejected with the valid options. Include "
-            "only variants that are fair approval candidates. Pool entries "
-            "you omit remain observational workbench history."
+            "Ids of entries in state.variant_pool to deliberately present as "
+            "candidates for human review. The pool is surfaced in the system "
+            "prompt every turn — pick ids from there. Unknown ids are rejected "
+            "with the valid options. Pool entries you omit remain observational "
+            "workbench history."
         ),
     )
     rationale: str = Field(
@@ -176,9 +175,9 @@ def present_for_review(
 
     Concretely, if your reasoning is "v1 has artifacts, v2 looks better,
     we should go with v2":
-      * RIGHT: present_for_review([T??_v2], rationale="v2 addresses the
+      * RIGHT: present_for_review([<tool>_v2], rationale="v2 addresses the
         artifacts in v1. The pool has both for comparison.")
-      * WRONG: present_for_review([T??_v1], rationale="v1 has artifacts,
+      * WRONG: present_for_review([<tool>_v1], rationale="v1 has artifacts,
         try v2 instead") — this presents the broken result as approvable.
 
     If you want the human to weigh both in (you genuinely don't know
@@ -187,9 +186,9 @@ def present_for_review(
     the same incoherence at smaller scale.
 
     Pool ids the human sees in the review surface match the ids you
-    reference here (e.g. T14_v1, T14_v3) — same vocabulary across agent,
-    system, and chat, so the human can refer back to specific variants by
-    name when giving feedback.
+    reference here (e.g. stretch_image_v1, stretch_image_v3) — same
+    vocabulary across agent, system, and chat, so the human can refer back
+    to specific variants by name when giving feedback.
 
     In autonomous mode, do not use this to make your own decision. Use
     commit_variant with your chosen variant id and rationale.

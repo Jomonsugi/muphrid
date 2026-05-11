@@ -67,7 +67,7 @@ def base_state() -> dict:
     }
 
 
-def make_variant(variant_id: str = "T14_v1") -> dict:
+def make_variant(variant_id: str = "stretch_image_v1") -> dict:
     path = temp_fit(f"{variant_id}.fit")
     return {
         "id": variant_id,
@@ -90,18 +90,18 @@ def test_typed_events() -> None:
     check("question event stays typed", question["type"] == "question")
 
     approval = review_ctl.parse_human_event(
-        {"type": "approve_variant", "variant_id": "T14_v2", "rationale": "best balance"}
+        {"type": "approve_variant", "variant_id": "stretch_image_v2", "rationale": "best balance"}
     )
     check(
         "approval event carries variant id",
-        approval["type"] == "approve_variant" and approval["variant_id"] == "T14_v2",
+        approval["type"] == "approve_variant" and approval["variant_id"] == "stretch_image_v2",
     )
-    legacy = review_ctl.parse_human_event('__APPROVE_VARIANT__{"id": "T14_v2"}')
+    legacy = review_ctl.parse_human_event('__APPROVE_VARIANT__{"id": "stretch_image_v2"}')
     check("legacy sentinel is plain feedback, not approval", legacy["type"] == "feedback")
 
 
 def test_review_session_and_prompt() -> None:
-    hitl_mod.set_hitl_tool_enabled("T14_stretch", True)
+    hitl_mod.set_hitl_tool_enabled("stretch_image", True)
     state = base_state()
     state["messages"] = [
         ToolMessage(
@@ -121,7 +121,7 @@ def test_review_session_and_prompt() -> None:
 
 
 def test_present_for_review_artifact() -> None:
-    hitl_mod.set_hitl_tool_enabled("T14_stretch", True)
+    hitl_mod.set_hitl_tool_enabled("stretch_image", True)
     state = base_state()
     variant = make_variant()
     state["active_hitl"] = True
@@ -135,14 +135,14 @@ def test_present_for_review_artifact() -> None:
     ]
     state["review_session"] = review_ctl.make_review_session(
         state=state,
-        hitl_key="T14_stretch",
+        hitl_key="stretch_image",
         tool_name="stretch_image",
     )
 
     command = present_for_review.func(
-        variant_ids=["T14_v1"],
+        variant_ids=["stretch_image_v1"],
         rationale="Best balance of highlights and nebulosity.",
-        recommendation="T14_v1",
+        recommendation="stretch_image_v1",
         tradeoffs=["Protects highlights better than the stronger stretch."],
         metric_highlights={"signal_coverage_pct": 42.0},
         mode="replace",
@@ -151,18 +151,18 @@ def test_present_for_review_artifact() -> None:
     )
     update = command.update
     artifact = update["review_session"]["proposal"]
-    check("present_for_review writes proposal artifact", artifact["candidates"][0]["variant_id"] == "T14_v1")
-    check("proposal artifact carries recommendation", artifact["recommendation"] == "T14_v1")
+    check("present_for_review writes proposal artifact", artifact["candidates"][0]["variant_id"] == "stretch_image_v1")
+    check("proposal artifact carries recommendation", artifact["recommendation"] == "stretch_image_v1")
     check("proposal artifact carries tradeoffs", bool(artifact["tradeoffs"]))
 
 
 def test_missing_review_session_is_not_gate() -> None:
-    hitl_mod.set_hitl_tool_enabled("T14_stretch", True)
+    hitl_mod.set_hitl_tool_enabled("stretch_image", True)
     state = base_state()
     state["active_hitl"] = True
     state["variant_pool"] = [make_variant()]
     command = present_for_review.func(
-        variant_ids=["T14_v1"],
+        variant_ids=["stretch_image_v1"],
         rationale="Should block without explicit session.",
         mode="replace",
         tool_call_id="present-missing-session",
@@ -173,24 +173,24 @@ def test_missing_review_session_is_not_gate() -> None:
 
 
 def test_typed_approval_closes_review() -> None:
-    hitl_mod.set_hitl_tool_enabled("T14_stretch", True)
+    hitl_mod.set_hitl_tool_enabled("stretch_image", True)
     state = base_state()
     variant = make_variant()
     state["active_hitl"] = True
     state["variant_pool"] = [variant]
     state["review_session"] = review_ctl.make_review_session(
         state=state,
-        hitl_key="T14_stretch",
+        hitl_key="stretch_image",
         tool_name="stretch_image",
         status="awaiting_human_approval",
     )
     state["review_session"]["proposal"] = review_ctl.proposal_from_candidates(
         [{
-            "variant_id": "T14_v1",
+            "variant_id": "stretch_image_v1",
             "rationale": "Best balance.",
             "presented_at": review_ctl.utc_now(),
         }],
-        recommendation="T14_v1",
+        recommendation="stretch_image_v1",
         rationale="Best balance.",
     )
     state["messages"] = [
@@ -199,11 +199,11 @@ def test_typed_approval_closes_review() -> None:
             name="stretch_image",
             tool_call_id="tool-1",
         ),
-        AIMessage(content="I recommend T14_v1."),
+        AIMessage(content="I recommend stretch_image_v1."),
     ]
 
     old_interrupt = nodes.interrupt
-    nodes.interrupt = lambda payload: review_ctl.approval_resume_event("T14_v1", "approved")
+    nodes.interrupt = lambda payload: review_ctl.approval_resume_event("stretch_image_v1", "approved")
     try:
         update = nodes.hitl_check(state)
     finally:
@@ -215,25 +215,25 @@ def test_typed_approval_closes_review() -> None:
 
 
 def test_unpresented_variant_approval_rejected() -> None:
-    hitl_mod.set_hitl_tool_enabled("T14_stretch", True)
+    hitl_mod.set_hitl_tool_enabled("stretch_image", True)
     state = base_state()
-    v1 = make_variant("T14_v1")
-    v2 = make_variant("T14_v2")
+    v1 = make_variant("stretch_image_v1")
+    v2 = make_variant("stretch_image_v2")
     state["active_hitl"] = True
     state["variant_pool"] = [v1, v2]
     state["review_session"] = review_ctl.make_review_session(
         state=state,
-        hitl_key="T14_stretch",
+        hitl_key="stretch_image",
         tool_name="stretch_image",
         status="awaiting_human_approval",
     )
     state["review_session"]["proposal"] = review_ctl.proposal_from_candidates(
         [{
-            "variant_id": "T14_v1",
+            "variant_id": "stretch_image_v1",
             "rationale": "Only v1 has been presented.",
             "presented_at": review_ctl.utc_now(),
         }],
-        recommendation="T14_v1",
+        recommendation="stretch_image_v1",
         rationale="Only v1 has been presented.",
     )
     state["messages"] = [
@@ -242,11 +242,11 @@ def test_unpresented_variant_approval_rejected() -> None:
             name="stretch_image",
             tool_call_id="tool-1",
         ),
-        AIMessage(content="I recommend T14_v1."),
+        AIMessage(content="I recommend stretch_image_v1."),
     ]
 
     old_interrupt = nodes.interrupt
-    nodes.interrupt = lambda payload: review_ctl.approval_resume_event("T14_v2", "wrong button")
+    nodes.interrupt = lambda payload: review_ctl.approval_resume_event("stretch_image_v2", "wrong button")
     try:
         update = nodes.hitl_check(state)
     finally:
@@ -264,7 +264,7 @@ def test_visible_answer_required_before_tools() -> None:
     state = base_state()
     session = review_ctl.make_review_session(
         state=state,
-        hitl_key="T14_stretch",
+        hitl_key="stretch_image",
         tool_name="stretch_image",
         status="awaiting_agent_response",
     )
@@ -281,7 +281,7 @@ def test_visible_answer_required_before_tools() -> None:
                 content="",
                 tool_calls=[{
                     "name": "present_for_review",
-                    "args": {"variant_ids": ["T14_v1"], "rationale": "best"},
+                    "args": {"variant_ids": ["stretch_image_v1"], "rationale": "best"},
                     "id": "call-1",
                 }],
             )
@@ -311,7 +311,7 @@ def test_visible_answer_with_tool_calls_is_allowed() -> None:
     state = base_state()
     session = review_ctl.make_review_session(
         state=state,
-        hitl_key="T14_stretch",
+        hitl_key="stretch_image",
         tool_name="stretch_image",
         status="awaiting_agent_response",
     )
@@ -326,13 +326,13 @@ def test_visible_answer_with_tool_calls_is_allowed() -> None:
         def invoke(self, messages):
             return AIMessage(
                 content=(
-                    "T14_v2 is flatter — its background quadrants are within "
-                    "0.5% of each other vs 2.1% for T14_v1. Surfacing it now."
+                    "stretch_image_v2 is flatter — its background quadrants are within "
+                    "0.5% of each other vs 2.1% for stretch_image_v1. Surfacing it now."
                 ),
                 tool_calls=[{
                     "name": "present_for_review",
                     "args": {
-                        "variant_ids": ["T14_v2"],
+                        "variant_ids": ["stretch_image_v2"],
                         "rationale": "Flatter background per quadrant analysis.",
                     },
                     "id": "call-2",
@@ -365,16 +365,16 @@ def test_visible_answer_with_tool_calls_is_allowed() -> None:
 
 
 def test_commit_variant_blocked_by_review_session() -> None:
-    hitl_mod.set_hitl_tool_enabled("T14_stretch", True)
+    hitl_mod.set_hitl_tool_enabled("stretch_image", True)
     state = base_state()
     state["review_session"] = review_ctl.make_review_session(
         state=state,
-        hitl_key="T14_stretch",
+        hitl_key="stretch_image",
         tool_name="stretch_image",
         status="awaiting_human_approval",
     )
     command = commit_variant.func(
-        variant_id="T14_v1",
+        variant_id="stretch_image_v1",
         rationale="agent should not self-commit",
         state=state,
         tool_call_id="commit-1",
@@ -387,7 +387,7 @@ def test_tool_run_budget_helpers() -> None:
     state = base_state()
     session = review_ctl.make_review_session(
         state=state,
-        hitl_key="T14_stretch",
+        hitl_key="stretch_image",
         tool_name="stretch_image",
         status="awaiting_agent_response",
     )
