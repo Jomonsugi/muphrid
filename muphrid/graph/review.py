@@ -94,7 +94,7 @@ def make_review_session(
         updated_at=now,
         last_human_event=None,
         turn_policy="answer_visible_text_before_action",
-        tool_runs_since_human=0,
+        tool_runs_since_hitl=0,
         visible_response_required=False,
         proposal=empty_proposal(now),
     )
@@ -132,14 +132,14 @@ def close_review_session(
     return updated
 
 
-def tool_runs_since_human(review_session: dict | None) -> int:
+def tool_runs_since_hitl(review_session: dict | None) -> int:
     """Return the explicit HITL tool-run counter for an open review session."""
     if not isinstance(review_session, dict):
         return 0
-    return int(review_session.get("tool_runs_since_human", 0) or 0)
+    return int(review_session.get("tool_runs_since_hitl", 0) or 0)
 
 
-def increment_tool_runs_since_human(
+def increment_tool_runs_since_hitl(
     review_session: dict | None,
     *,
     status: str = "awaiting_agent_response",
@@ -148,13 +148,13 @@ def increment_tool_runs_since_human(
     return update_review_session(
         review_session,
         status=status,
-        tool_runs_since_human=tool_runs_since_human(review_session) + 1,
+        tool_runs_since_hitl=tool_runs_since_hitl(review_session) + 1,
     )
 
 
 def silent_tool_limit_reached(review_session: dict | None, limit: int) -> bool:
     """True when HITL tool runs since human feedback meet the configured cap."""
-    return limit > 0 and tool_runs_since_human(review_session) >= limit
+    return limit > 0 and tool_runs_since_hitl(review_session) >= limit
 
 
 def empty_proposal(now: str | None = None) -> ReviewProposal:
@@ -310,7 +310,7 @@ def feedback_update(
             state.get("review_session"),
             status="awaiting_agent_response",
             last_human_event=event,
-            tool_runs_since_human=0,
+            tool_runs_since_hitl=0,
             visible_response_required=True,
         ),
         "user_feedback": {

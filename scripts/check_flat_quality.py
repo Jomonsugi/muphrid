@@ -337,6 +337,189 @@ def _run_t02_folder_flat(
         )
 
 
+# ── Radial-profile flat-vs-light geometry check ───────────────────────────────
+#
+# Quality checks on flats in isolation only catch exposure problems. They
+# cannot detect when the master flat's illumination profile does not match
+# the lights' illumination profile — the most common silent failure mode
+# (aperture drift between sessions on manual lenses, non-uniform flat-panel
+# illumination, focus drift, dust shift). The signature shows up only after
+# stacking and stretching, as residual rings/gradient in the master light.
+#
+# This check applies the master flat to one sample light, computes the
+# azimuthally-averaged sky-background radial profile (sigma-clipped to
+# reject stars/signal — works for any target, no target-specific masking),
+# and compares it to the master flat's profile. If the calibrated frame
+# still has significant radial structure, the flat's geometry does not
+# match the lights' geometry and the full run will produce artifacts.
+
+def _radial_profile_sky(img: np.ndarray, n_bins: int = 80, sigma: float = 2.0) -> np.ndarray:
+    """
+    Azimuthally-averaged sky-background radial profile, normalized so the
+    innermost annulus is 1.0. Uses sigma-clipped median per annular bin so
+    stars / nebula / signal are rejected automatically — no target mask.
+    """
+    from astropy.stats import sigma_clip
+
+    if img.ndim == 3:
+        img = np.median(img, axis=0)
+    h, w = img.shape
+    cy, cx = h / 2.0, w / 2.0
+    y, x = np.indices(img.shape, dtype=np.float32)
+    r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    r_norm = r / r.max()
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    profile = np.empty(n_bins)
+    for i in range(n_bins):
+        m = (r_norm >= edges[i]) & (r_norm < edges[i + 1])
+        if not m.any():
+            profile[i] = np.nan
+            continue
+        clipped = sigma_clip(img[m], sigma=sigma, maxiters=3, masked=False)
+        profile[i] = float(np.median(clipped)) if clipped.size else np.nan
+
+    center = profile[0]
+    if not np.isfinite(center) or center == 0:
+        return profile
+    return profile / center
+
+
+def _load_fits_2d(path: Path) -> np.ndarray:
+    """Load a FITS as float32. Collapses 3-channel to median for shape work."""
+    with fits.open(str(path), memmap=False) as hdul:
+        for h in hdul:
+            if h.data is not None and h.data.size > 0:
+                return np.asarray(h.data, dtype=np.float32)
+    raise ValueError(f"no image HDU in {path}")
+
+
+def _run_sample_light_check(
+    working_dir: Path,
+    sample_light_path: Path,
+    master_bias_path: str,
+    master_flat_path: Path,
+) -> None:
+    """
+    Calibrate one sample light frame and compare its post-calibration radial
+    profile to the master flat's. Prints a pass/warn verdict.
+    """
+    print("\n[Sample Light Calibration Check]")
+    print(f"Sample:      {sample_light_path}")
+    print(f"Master flat: {master_flat_path}")
+
+    # Convert sample light to FITSEQ if it's a raw camera file.
+    sample_dir = working_dir / "sample_light"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    if sample_light_path.suffix.lower() in RAW_EXTS:
+        light_fits = _convert_single_to_fitseq(sample_dir, sample_light_path, "sample_light")
+    elif sample_light_path.suffix.lower() in FITS_EXTS:
+        light_fits = sample_light_path
+    else:
+        print(f"  ERROR: unsupported extension {sample_light_path.suffix}")
+        return
+
+    # Load arrays.
+    light = _load_fits_2d(light_fits)
+    bias = _load_fits_2d(Path(master_bias_path))
+    flat = _load_fits_2d(master_flat_path)
+
+    if light.shape != bias.shape or light.shape != flat.shape:
+        print(f"  ERROR: shape mismatch — light={light.shape}, "
+              f"bias={bias.shape}, flat={flat.shape}")
+        print("  Sample light must come from the same sensor as the flats/biases.")
+        return
+
+    # Calibrate: (light - bias) / (flat normalized to its median).
+    flat_median = float(np.median(flat))
+    if flat_median <= 0:
+        print(f"  ERROR: master flat median is {flat_median:.4g} (must be > 0)")
+        return
+    flat_norm = flat / flat_median
+    # Guard against zero/near-zero values in the normalized flat (would
+    # divide by ~0 and produce inf at vignetted corners).
+    flat_norm = np.where(flat_norm > 0.05, flat_norm, np.nan)
+    calibrated = (light - bias) / flat_norm
+
+    # Radial profiles, normalized to center=1.
+    prof_flat = _radial_profile_sky(flat)
+    prof_cal = _radial_profile_sky(calibrated)
+
+    if not (np.isfinite(prof_flat).all() and np.isfinite(prof_cal).all()):
+        print("  warn: NaN in radial profile — proceeding with valid annuli only")
+
+    # Strip NaNs for stats.
+    flat_clean = prof_flat[np.isfinite(prof_flat)]
+    cal_clean = prof_cal[np.isfinite(prof_cal)]
+    if len(flat_clean) < 4 or len(cal_clean) < 4:
+        print("  ERROR: too few valid annular bins to compare profiles")
+        return
+
+    flat_range = float(np.max(flat_clean) - np.min(flat_clean))
+    cal_range = float(np.max(cal_clean) - np.min(cal_clean))
+    flat_corner = float(flat_clean[-1])
+    cal_corner = float(cal_clean[-1])
+
+    # Sample of the profile at a handful of radii for the report.
+    print()
+    print(f"{'r/r_max':>8}  {'flat':>10}  {'cal light':>10}")
+    n = len(prof_flat)
+    idxs = [int(round(p * (n - 1))) for p in (0.0, 0.13, 0.25, 0.38, 0.50, 0.63, 0.75, 0.88, 1.00)]
+    for i in idxs:
+        f = prof_flat[i] if np.isfinite(prof_flat[i]) else float("nan")
+        c = prof_cal[i] if np.isfinite(prof_cal[i]) else float("nan")
+        print(f"{i / (n - 1):>8.3f}  {f:>10.4f}  {c:>10.4f}")
+
+    print()
+    print(f"Master flat radial range:        {flat_range:.4f}  "
+          f"(corner = {flat_corner*100:.1f}% of center; "
+          f"flat captured {(1-flat_corner)*100:.1f}% falloff)")
+    print(f"Calibrated light radial range:   {cal_range:.4f}  "
+          f"(corner = {cal_corner*100:.1f}% of center)")
+
+    if flat_range > 0:
+        residual_ratio = cal_range / flat_range
+        print(f"Residual / captured ratio:       {residual_ratio*100:.0f}%")
+    else:
+        residual_ratio = 0.0
+
+    # Verdict.
+    print()
+    if cal_range > 0.10 or residual_ratio > 0.30:
+        print(f"⚠ FLAT-LIGHT GEOMETRY MISMATCH detected.")
+        if cal_corner > 1.10:
+            print(f"  Calibrated corners are {(cal_corner-1)*100:.0f}% brighter than center "
+                  f"→ master flat captured MORE radial falloff than the lights "
+                  f"actually had.")
+            print(f"  Possible causes (any of these can produce this signature):")
+            print(f"    • Flat aperture wider than light aperture "
+                  f"(manual-ring drift, no click stops).")
+            print(f"    • Light source for flats has its own radial brightness "
+                  f"falloff (edge-lit LCD, screen edges inside the field of view, "
+                  f"flat source not subtending more than the lens FOV).")
+            print(f"    • Focus shifted between sessions, changing the "
+                  f"vignetting profile shape.")
+        elif cal_corner < 0.90:
+            print(f"  Calibrated corners are {(1-cal_corner)*100:.0f}% darker than center "
+                  f"→ master flat captured LESS radial falloff than the lights "
+                  f"actually had.")
+            print(f"  Possible causes:")
+            print(f"    • Flat aperture narrower than light aperture.")
+            print(f"    • Light source for flats overfilled the lens FOV "
+                  f"more uniformly than the actual sky illumination implies.")
+            print(f"    • Focus shifted between sessions.")
+        else:
+            print(f"  Profile structure does not match a simple over/under correction.")
+            print(f"  Likely focus drift, dust shift, or wavelength-dependent "
+                  f"correction error between sessions.")
+        print(f"  Whatever your flat method is, re-shoot with: same aperture as "
+              f"lights, same focus, light source uniform across the full lens "
+              f"FOV with margin (so corners see source interior, not edges).")
+    else:
+        print(f"✓ Flat correction looks geometrically consistent. "
+              f"Residual radial structure is small "
+              f"({cal_range*100:.1f}% range, {residual_ratio*100:.0f}% of captured).")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -355,7 +538,25 @@ def main() -> int:
                         help="Skip per-flat individual checks.")
     parser.add_argument("--skip-folder", action="store_true",
                         help="Skip aggregate folder check.")
+    parser.add_argument("--sample-light", type=Path, default=None,
+                        help=(
+                            "One light frame (RAW or FITS) to calibrate with the "
+                            "computed master flat and bias. Runs a radial-profile "
+                            "check that catches flat-vs-light illumination "
+                            "mismatch — aperture drift on manual lenses, panel "
+                            "non-uniformity, focus shift between sessions. "
+                            "Requires the folder-aggregate path (>1 flat, no "
+                            "--skip-folder)."
+                        ))
     args = parser.parse_args()
+
+    if args.sample_light is not None and args.skip_folder:
+        print("Error: --sample-light requires the folder-aggregate path "
+              "(remove --skip-folder).")
+        return 1
+    if args.sample_light is not None and not args.sample_light.exists():
+        print(f"Error: --sample-light path does not exist: {args.sample_light}")
+        return 1
 
     wd = args.working_dir.resolve()
     wd.mkdir(parents=True, exist_ok=True)
@@ -423,9 +624,11 @@ def main() -> int:
           f"UNDER=<{TARGET_FILL_MIN*100:.0f}% OVER=>{TARGET_FILL_MAX*100:.0f}% "
           f"SATURATED=clipped")
 
-    # Build master bias only when the folder-aggregate path will consume it.
+    # Build master bias only when the folder-aggregate path or the
+    # sample-light check will consume it.
+    needs_masters = (not args.skip_folder and len(flats) > 1) or args.sample_light is not None
     master_bias_path: str | None = None
-    if not args.skip_folder and len(flats) > 1:
+    if needs_masters:
         bias_master_dir = wd / "bias_master"
         bias_master_dir.mkdir(parents=True, exist_ok=True)
         master_bias_path, _ = _run_t02_bias(bias_master_dir, biases)
@@ -485,6 +688,7 @@ def main() -> int:
                   f"{best.name} fill={fill_str} state={best.state} ADU={best.median_adu}")
 
     # ── Folder aggregate check ───────────────────────────────────────────
+    master_flat_path: Path | None = None
     if not args.skip_folder and len(flats) > 1:
         print("\n[Folder Aggregate — Siril master flat]")
         folder_dir = wd / "folder_aggregate"
@@ -501,8 +705,23 @@ def main() -> int:
             print(f"Error: {ev.error}")
         for w in ev.warnings:
             print(f"Warn: {w}")
+        if not ev.error:
+            master_flat_path = folder_dir / "master_flat.fit"
+            if not master_flat_path.exists():
+                master_flat_path = folder_dir / "master_flat.fits"
+                if not master_flat_path.exists():
+                    master_flat_path = None
     elif not args.skip_folder:
         print("\n[Folder Aggregate] Skipped: need >1 flat file.")
+
+    # ── Sample-light geometry check ──────────────────────────────────────
+    if args.sample_light is not None:
+        if master_flat_path is None or master_bias_path is None:
+            print("\nError: --sample-light needs a successful master flat + bias build.")
+            return 1
+        _run_sample_light_check(
+            wd, args.sample_light.resolve(), master_bias_path, master_flat_path,
+        )
 
     print("\nDone.")
     return 0

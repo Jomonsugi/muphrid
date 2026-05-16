@@ -949,9 +949,14 @@ def _rescue_raw_tool_calls(response: AIMessage) -> AIMessage:
 # rule is a wire-format invariant, not a provider quirk. Substituting a
 # non-empty placeholder keeps the conversation valid for any backend while
 # still signalling to the agent_chat nudger that this turn was a no-op.
-_EMPTY_RESPONSE_PLACEHOLDER = (
-    "(no response — I should call a tool or respond with text on the next turn)"
-)
+# Wire-format invariant: chat completion APIs reject AIMessages with no
+# content AND no tool_calls (HTTP 400 across OpenAI-compatible providers and
+# Anthropic). When the model produces an empty completion we must store
+# *something* non-empty in its place. Choose a stub that describes what
+# happened in third-person system voice rather than impersonating the agent
+# — the agent reads its own message history, and "I should call a tool" in
+# its own voice would be a fabricated commitment.
+_EMPTY_RESPONSE_PLACEHOLDER = "[model returned no content]"
 
 
 def _is_empty_ai_message(msg: AIMessage) -> bool:
@@ -2014,10 +2019,10 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
             # the current pool before it keeps experimenting.
             import os
             silent_limit = int(os.environ.get("MAX_SILENT_HITL_TOOLS", "3"))
-            updated_session = review_ctl.increment_tool_runs_since_human(
+            updated_session = review_ctl.increment_tool_runs_since_hitl(
                 state.get("review_session"),
             )
-            tool_count = review_ctl.tool_runs_since_human(updated_session)
+            tool_count = review_ctl.tool_runs_since_hitl(updated_session)
             if review_ctl.silent_tool_limit_reached(updated_session, silent_limit):
                 logger.warning(
                     f"HITL tool-run backstop tripped: {tool_count} "
@@ -2034,7 +2039,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                 )
             logger.info(
                 f"HITL tool {tool_name} re-executed "
-                f"(tool_runs_since_human={tool_count}/{silent_limit}) — "
+                f"(tool_runs_since_hitl={tool_count}/{silent_limit}) — "
                 f"letting agent analyze new result"
             )
             return {"review_session": updated_session}
@@ -2126,7 +2131,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                     state.get("review_session"),
                     status="awaiting_agent_response",
                     last_human_event=human_event,
-                    tool_runs_since_human=0,
+                    tool_runs_since_hitl=0,
                     visible_response_required=True,
                 ),
             }
@@ -2151,7 +2156,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                     state.get("review_session"),
                     status="awaiting_human_approval",
                     last_human_event=human_event,
-                    tool_runs_since_human=0,
+                    tool_runs_since_hitl=0,
                     visible_response_required=True,
                 ),
             }
@@ -2180,7 +2185,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                         state.get("review_session"),
                         status="awaiting_agent_response",
                         last_human_event=human_event,
-                        tool_runs_since_human=0,
+                        tool_runs_since_hitl=0,
                         visible_response_required=True,
                     ),
                 }
@@ -2246,7 +2251,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                     state.get("review_session"),
                     status="awaiting_human_approval",
                     last_human_event=human_event,
-                    tool_runs_since_human=0,
+                    tool_runs_since_hitl=0,
                     visible_response_required=True,
                 ),
             }
@@ -2276,7 +2281,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                     state.get("review_session"),
                     status="awaiting_curation",
                     last_human_event=human_event,
-                    tool_runs_since_human=0,
+                    tool_runs_since_hitl=0,
                     visible_response_required=True,
                 ),
             }
@@ -2329,10 +2334,16 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
 # Text-only responses mean the model is hesitating, narrating, or stuck.
 # Always nudge it to act.
 
+# Factual observation, not prescription. The agent reads its own message
+# history; this HumanMessage tells it what the system observed about the
+# previous turn. The agent reasons over the same state and tool context it
+# already has — no "call X" or "do not Y" coaching. The hard backstop is
+# the consecutive_text_only counter that raises NudgeLimitError after
+# MAX_AUTONOMOUS_NUDGES turns, so this nudge does not need to push the
+# agent toward any specific action.
 _AUTONOMOUS_NUDGE = (
-    "Either call a tool to continue processing, or call advance_phase "
-    "to move to the next phase. Do not respond with text without "
-    "calling a tool."
+    "[system] The previous turn produced no tool call. "
+    "State and the available tools are unchanged from before that turn."
 )
 
 

@@ -391,9 +391,9 @@ def test_tool_run_budget_helpers() -> None:
         tool_name="stretch_image",
         status="awaiting_agent_response",
     )
-    first = review_ctl.increment_tool_runs_since_human(session)
-    second = review_ctl.increment_tool_runs_since_human(first)
-    check("tool-run helper increments counter", review_ctl.tool_runs_since_human(second) == 2)
+    first = review_ctl.increment_tool_runs_since_hitl(session)
+    second = review_ctl.increment_tool_runs_since_hitl(first)
+    check("tool-run helper increments counter", review_ctl.tool_runs_since_hitl(second) == 2)
     check("tool-run limit not reached below cap", not review_ctl.silent_tool_limit_reached(second, 3))
     check("tool-run limit reached at cap", review_ctl.silent_tool_limit_reached(second, 2))
     check("disabled tool-run limit never trips", not review_ctl.silent_tool_limit_reached(second, 0))

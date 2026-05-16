@@ -587,7 +587,7 @@ class ReviewSession(TypedDict, total=False):
     close_reason:          NotRequired[str]
     last_human_event:      ReviewHumanEvent | None
     turn_policy:           str
-    tool_runs_since_human: int
+    tool_runs_since_hitl: int
     visible_response_required: bool
     proposal:              ReviewProposal
 
