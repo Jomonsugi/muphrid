@@ -11,12 +11,12 @@
 
 # ── Uncomment for Fuji X-T30 II + Samyang 135mm f/2 (.RAF files) ────────────
 
-[camera]
-pixel_size_um = 3.76
-sensor_type = "xtrans"          # Required for X-Trans 3-pass demosaic in Siril
+# [camera]
+# pixel_size_um = 3.76
+# sensor_type = "xtrans"          # Required for X-Trans 3-pass demosaic in Siril
 
-[optics]
-focal_length_mm = 129.5         # Plate-solve-measured. Samyang 135mm f/2.8 nominal.
+# [optics]
+# focal_length_mm = 129.5         # Plate-solve-measured. Samyang 135mm f/2.8 nominal.
 
 # ── ZWO ASI 2600MC Pro (.FITS files) — nothing needed ───────────────────────
 # All values read from FITS headers automatically.

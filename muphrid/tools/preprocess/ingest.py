@@ -183,15 +183,16 @@ def _sample_frame(file_path: Path) -> _FrameSample | None:
     )
 
 
-def _extract_raw_meta(
+def _extract_acquisition_meta(
     light_files: list[Path],
     override_target_name: str | None,
     override_focal_length_mm: float | None = None,
     override_pixel_size_um: float | None = None,
     override_sensor_type: str | None = None,
+    input_format: str = "raw",
 ) -> AcquisitionMeta:
     """
-    Sample the first light frame for EXIF + sensor metadata using ExifTool.
+    Sample the first light frame for EXIF/FITS metadata using ExifTool.
     Returns a fully typed AcquisitionMeta with sensor characterization fields.
 
     Override priority (highest wins) for each hardware fact:
@@ -201,7 +202,7 @@ def _extract_raw_meta(
         → null
     """
     if not light_files:
-        meta = _empty_meta("raw", override_target_name)
+        meta = _empty_meta(input_format, override_target_name)
         if override_focal_length_mm and override_focal_length_mm > 0:
             meta["focal_length_mm"] = float(override_focal_length_mm)
         if override_pixel_size_um and override_pixel_size_um > 0:
@@ -215,7 +216,7 @@ def _extract_raw_meta(
             tags = et.get_metadata(str(light_files[0]))[0]
     except Exception as e:
         logger.warning("ExifTool failed on %s: %s — returning empty metadata", light_files[0], e)
-        return _empty_meta("raw", override_target_name)
+        return _empty_meta(input_format, override_target_name)
 
     raw_iso = _first(tags, _ISO_KEYS)
     iso: int | None = int(raw_iso) if raw_iso is not None else None
@@ -280,7 +281,7 @@ def _extract_raw_meta(
         bortle=None,
         camera_model=camera_model,
         telescope=None,
-        input_format="raw",
+        input_format=input_format,
         # Sensor characterization (new)
         black_level=sensor.black_level,
         white_level=sensor.white_level,
@@ -504,7 +505,7 @@ def _ingest_raw(
         )
 
     light_paths = [Path(p) for p in buckets["lights"]]
-    meta = _extract_raw_meta(
+    meta = _extract_acquisition_meta(
         light_paths,
         target_name,
         override_focal_length_mm=override_focal_length_mm,
@@ -699,15 +700,16 @@ def _ingest_fits(
             "with IMAGETYP header."
         )
 
-    # Extract metadata using the same function as RAW
-    # (key tuples now include FITS fallbacks)
+    # Extract metadata through the shared acquisition path; key tuples include
+    # FITS fallbacks and input_format keeps the downstream state contract exact.
     light_paths = [Path(p) for p in buckets["lights"]]
-    meta = _extract_raw_meta(
+    meta = _extract_acquisition_meta(
         light_paths,
         target_name,
         override_focal_length_mm=override_focal_length_mm,
         override_pixel_size_um=override_pixel_size_um,
         override_sensor_type=override_sensor_type,
+        input_format="fits",
     )
 
     calib_warnings = _cross_validate_calibration(meta, buckets)

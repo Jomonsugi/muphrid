@@ -27,6 +27,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from muphrid.graph import hitl as hitl_mod
 from muphrid.graph import nodes
 from muphrid.graph import review as review_ctl
+from muphrid.graph.registry import all_tools
 from muphrid.graph.state import ProcessingPhase
 from muphrid.tools.utility.commit_variant import commit_variant
 from muphrid.tools.utility.present_for_review import present_for_review
@@ -81,6 +82,24 @@ def make_variant(variant_id: str = "stretch_image_v1") -> dict:
         "created_at": review_ctl.utc_now(),
         "rationale": None,
     }
+
+
+def test_hitl_config_matches_registered_tools() -> None:
+    registered_tool_names = {tool.name for tool in all_tools()}
+    mapped_tool_names = set(hitl_mod.TOOL_TO_HITL)
+    config_keys = set((hitl_mod._CFG.get("hitl") or {}).keys())  # noqa: SLF001 - contract test
+    hitl_keys = set(hitl_mod.TOOL_TO_HITL.values())
+
+    check(
+        "all HITL mapped tools are registered",
+        mapped_tool_names <= registered_tool_names,
+        f"missing={sorted(mapped_tool_names - registered_tool_names)}",
+    )
+    check(
+        "HITL config keys match controller keys",
+        config_keys == hitl_keys,
+        f"missing={sorted(hitl_keys - config_keys)} extra={sorted(config_keys - hitl_keys)}",
+    )
 
 
 def test_typed_events() -> None:
@@ -398,9 +417,23 @@ def test_tool_run_budget_helpers() -> None:
     check("tool-run limit reached at cap", review_ctl.silent_tool_limit_reached(second, 2))
     check("disabled tool-run limit never trips", not review_ctl.silent_tool_limit_reached(second, 0))
 
+    legacy_session = dict(session)
+    legacy_session.pop("tool_runs_since_hitl", None)
+    legacy_session["tool_runs_since_human"] = 2
+    check(
+        "legacy tool-run counter read on resume",
+        review_ctl.tool_runs_since_hitl(legacy_session) == 2,
+    )
+    migrated = review_ctl.increment_tool_runs_since_hitl(legacy_session)
+    check(
+        "legacy tool-run counter increments into canonical key",
+        migrated.get("tool_runs_since_hitl") == 3,
+    )
+
 
 def main() -> int:
     print("HITL Review Mode smoke tests")
+    test_hitl_config_matches_registered_tools()
     test_typed_events()
     test_review_session_and_prompt()
     test_present_for_review_artifact()

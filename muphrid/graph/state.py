@@ -187,8 +187,6 @@ class Metadata(TypedDict):
     is_osc:             bool         # True for OSC / DSLR (CFA sensor)
     pixel_scale:        float | None # arcsec/pixel (from plate solve)
     plate_solve_coords: dict | None  # {"ra": float, "dec": float}
-    focal_length_mm:    float | None
-    pixel_size_um:      float | None
 
     # Authoritative render state — what space the pipeline has put the
     # current image into. "linear" before stretch_image runs (stack
@@ -785,8 +783,6 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             is_osc=is_osc,
             pixel_scale=None,
             plate_solve_coords=None,
-            focal_length_mm=None,
-            pixel_size_um=None,
             # New runs always start in linear: ingest produces linear data,
             # the entire preprocess + linear pipeline preserves it, only
             # stretch_image flips this to "display". See Metadata.image_space.
@@ -852,22 +848,17 @@ def build_initial_message(dataset: Dataset, session: SessionContext, ingest_summ
     """
     Build the initial HumanMessage content with full dataset context.
 
-    This is the agent's ONLY source of truth about the dataset it's working
-    with. Without this, the agent has no idea what frames are available,
-    what camera was used, or what parameters are appropriate.
+    This message projects the canonical dataset state into the transcript.
+    Acquisition facts must come from dataset.acquisition_meta only; do not
+    re-read equipment.toml here or the prompt can drift from Gradio overrides
+    and later state updates.
 
     Everything a human post-processor would know when sitting down to process
     must be in this message: camera, sensor, optics, frame inventory, exposure,
-    sky conditions, sensor dynamic range, equipment profile, and calibration
-    strategy.
+    sky conditions, sensor dynamic range, and calibration strategy.
     """
-    from muphrid.equipment import load_equipment
-
     meta = dataset.get("acquisition_meta", {})
     files = dataset.get("files", {})
-    equipment = load_equipment()
-    equip_camera = equipment.get("camera", {})
-    equip_optics = equipment.get("optics", {})
 
     lines = [
         f"Process the astrophotography dataset for **{session['target_name']}**.",
@@ -924,19 +915,6 @@ def build_initial_message(dataset: Dataset, session: SessionContext, ingest_summ
         lines.append(f"- Usable dynamic range: ~{usable} ADU levels")
         if meta.get("raw_exposure_bias") is not None:
             lines.append(f"- Raw exposure bias: {meta['raw_exposure_bias']} stops")
-
-    # Equipment profile — shows the agent what values came from equipment.toml
-    if equip_camera or equip_optics:
-        lines.append("")
-        lines.append("## Equipment Profile (equipment.toml)")
-        if equip_camera.get("model"):
-            lines.append(f"- Camera: {equip_camera['model']}")
-        if equip_camera.get("sensor_type"):
-            lines.append(f"- Sensor: {equip_camera['sensor_type']}")
-        if equip_camera.get("pixel_size_um"):
-            lines.append(f"- Pixel size: {equip_camera['pixel_size_um']} μm")
-        if equip_optics.get("focal_length_mm"):
-            lines.append(f"- Focal length: {equip_optics['focal_length_mm']} mm (plate-solve-measured)")
 
     # Ingest sensor summary (from ingest_dataset's EXIF analysis)
     sensor_summary = ingest_summary.get("sensor")

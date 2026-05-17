@@ -8,9 +8,9 @@ read state, not this module.
 Two resolution layers, kept apart:
 
   At ingest time (called only by ingest_dataset):
-    `resolve_focal_length_for_ingest()` / `resolve_pixel_size_for_ingest()`
-    return the equipment.toml value (or None / ValueError). Ingest combines
-    them with explicit override kwargs and FITS/EXIF header values.
+    `resolve_focal_length()` / `resolve_pixel_size()` return the
+    equipment.toml value or None. Ingest combines them with explicit
+    override kwargs and FITS/EXIF header values.
 
   At downstream tool runtime:
     `equipment_from_state(state, require=(…,))` reads

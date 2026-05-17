@@ -294,13 +294,13 @@ def _invoke_build_masters(
     return json.loads(cmd.update["messages"][0].content)
 
 
-def _run_t02_bias(working_dir: Path, bias_files: list[Path]) -> tuple[str, float | None]:
+def _run_master_bias(working_dir: Path, bias_files: list[Path]) -> tuple[str, float | None]:
     state = _synthetic_state(working_dir, "biases", bias_files)
     result = _invoke_build_masters(state, "bias", "median", "none")
     return result["master_path"], result["quality_flags"].get("median")
 
 
-def _run_t02_folder_flat(
+def _run_folder_master_flat(
     working_dir: Path,
     flat_files: list[Path],
     master_bias_path: str,
@@ -631,7 +631,7 @@ def main() -> int:
     if needs_masters:
         bias_master_dir = wd / "bias_master"
         bias_master_dir.mkdir(parents=True, exist_ok=True)
-        master_bias_path, _ = _run_t02_bias(bias_master_dir, biases)
+        master_bias_path, _ = _run_master_bias(bias_master_dir, biases)
 
     # ── Individual flat checks ─────────────────────────────────────────────────
     if not args.skip_individual:
@@ -693,7 +693,7 @@ def main() -> int:
         print("\n[Folder Aggregate — Siril master flat]")
         folder_dir = wd / "folder_aggregate"
         folder_dir.mkdir(parents=True, exist_ok=True)
-        ev = _run_t02_folder_flat(folder_dir, flats, master_bias_path, "ALL_FLATS")
+        ev = _run_folder_master_flat(folder_dir, flats, master_bias_path, "ALL_FLATS")
         print(f"Siril normalized median: {_fmt_float(ev.siril_norm_median)}")
         if ev.siril_norm_min is not None:
             print(f"Sensor-relative target: [{ev.siril_norm_min:.4f}, {ev.siril_norm_max:.4f}]"
