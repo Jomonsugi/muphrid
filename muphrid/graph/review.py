@@ -32,8 +32,6 @@ OPEN_REVIEW_STATUSES = {
     "awaiting_human_approval",
 }
 
-_LEGACY_TOOL_RUN_COUNTER = "tool_runs_since_human"
-
 
 def utc_now() -> str:
     """Return a checkpoint-serializable UTC timestamp."""
@@ -138,10 +136,7 @@ def tool_runs_since_hitl(review_session: dict | None) -> int:
     """Return the explicit HITL tool-run counter for an open review session."""
     if not isinstance(review_session, dict):
         return 0
-    if "tool_runs_since_hitl" in review_session:
-        return int(review_session.get("tool_runs_since_hitl") or 0)
-    # Checkpoint compatibility for sessions written before the rename.
-    return int(review_session.get(_LEGACY_TOOL_RUN_COUNTER, 0) or 0)
+    return int(review_session.get("tool_runs_since_hitl", 0) or 0)
 
 
 def increment_tool_runs_since_hitl(

@@ -154,7 +154,7 @@ class AnalyzeImageInput(BaseModel):
             "existing `wavelet_noise` scalar). Each successive scale is "
             "~2x coarser. 3 scales is enough to distinguish pixel-scale "
             "noise from low-frequency pattern noise (walking, banding, "
-            "residual gradient). Set 1 to match the legacy single-scale "
+            "residual gradient). Set 1 to match the scalar single-scale "
             "output; 5 for very detailed structured-noise profiling."
         ),
         ge=1,
@@ -429,8 +429,8 @@ def _flatness_score(
 def _clipping(channel: np.ndarray) -> tuple[float, float]:
     """Return (shadows_pct, highlights_pct) clipping percentages at 0.001/0.999.
 
-    Preserved for the legacy flat `clipped_shadows_pct` / `clipped_highlights_pct`
-    fields. For richer reporting use `_clipping_at_thresholds` below.
+    Preserves the flat `clipped_shadows_pct` / `clipped_highlights_pct`
+    summary fields. For richer reporting use `_clipping_at_thresholds` below.
     """
     total = channel.size
     shadows_pct = float(np.sum(channel <= 0.001) / total * 100)
@@ -874,7 +874,7 @@ def analyze_image(
       positive skewness is characteristic of linear data (most pixels near
       zero with a long tail from stars/nebula).
 
-    **Clipping (flat, legacy)**
+    **Clipping (flat summary)**
     - clipped_shadows_pct: worst-channel percentage at or below 0.001.
       High values in linear data indicate most pixels are at the noise floor —
       expected for short exposures or uncropped frames. For fine-grained

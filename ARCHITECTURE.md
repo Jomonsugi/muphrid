@@ -270,7 +270,7 @@ The UI is intentionally not the policy authority. It renders state from the grap
 - approval controls from the proposal candidates
 - resume/recovery state from LangGraph checkpoints
 
-If a saved checkpoint predates Review Mode and has `active_hitl=True` without `review_session`, the UI refuses to consume a resume value as approval. That is deliberate: old implicit states are not safe approval contracts.
+If a saved checkpoint has `active_hitl=True` without an open `review_session`, the UI refuses to consume a resume value as approval. That is deliberate: inconsistent state is not a safe approval contract.
 
 ---
 

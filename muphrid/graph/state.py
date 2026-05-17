@@ -322,7 +322,7 @@ class Metrics(TypedDict):
     contrast_ratio:      float | None
 
     # Structured additions from analyze_image. See analyze_image docstring for the
-    # full definition of each. All optional so legacy callers keep working.
+    # full definition of each. All optional so callers can consume them incrementally.
     pixel_coverage:        dict | None            # total / n_valid / valid_pct / etc.
     clipping_per_channel:  dict | None            # per-channel clip staircase at chosen thresholds
     mode_estimate:         dict | None            # histogram-peak per channel + luminance
@@ -711,7 +711,7 @@ class AstroState(TypedDict):
     # Accumulated HITL preferences — written by hitl_node, read by planner
     user_feedback: dict
 
-    # Derived HITL conversation flag for logs/legacy inspection. Review policy
+    # Derived HITL conversation flag for logs and UI status. Review policy
     # must read review_session instead.
     active_hitl: bool
 

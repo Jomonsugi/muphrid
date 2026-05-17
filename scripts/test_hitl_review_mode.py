@@ -115,8 +115,8 @@ def test_typed_events() -> None:
         "approval event carries variant id",
         approval["type"] == "approve_variant" and approval["variant_id"] == "stretch_image_v2",
     )
-    legacy = review_ctl.parse_human_event('__APPROVE_VARIANT__{"id": "stretch_image_v2"}')
-    check("legacy sentinel is plain feedback, not approval", legacy["type"] == "feedback")
+    free_text = review_ctl.parse_human_event("please compare these again before approval")
+    check("non-dict response is plain feedback, not approval", free_text["type"] == "feedback")
 
 
 def test_review_session_and_prompt() -> None:
@@ -132,7 +132,7 @@ def test_review_session_and_prompt() -> None:
     update = nodes.hitl_check(state)
     session = update.get("review_session")
     check("hitl_check opens review_session", review_ctl.review_is_open(session))
-    check("active_hitl compatibility mirror set", update.get("active_hitl") is True)
+    check("active_hitl status mirror set", update.get("active_hitl") is True)
     check(
         "review open prompt injected",
         bool(update.get("messages")) and "HITL REVIEW OPEN" in update["messages"][0].content,
@@ -416,19 +416,6 @@ def test_tool_run_budget_helpers() -> None:
     check("tool-run limit not reached below cap", not review_ctl.silent_tool_limit_reached(second, 3))
     check("tool-run limit reached at cap", review_ctl.silent_tool_limit_reached(second, 2))
     check("disabled tool-run limit never trips", not review_ctl.silent_tool_limit_reached(second, 0))
-
-    legacy_session = dict(session)
-    legacy_session.pop("tool_runs_since_hitl", None)
-    legacy_session["tool_runs_since_human"] = 2
-    check(
-        "legacy tool-run counter read on resume",
-        review_ctl.tool_runs_since_hitl(legacy_session) == 2,
-    )
-    migrated = review_ctl.increment_tool_runs_since_hitl(legacy_session)
-    check(
-        "legacy tool-run counter increments into canonical key",
-        migrated.get("tool_runs_since_hitl") == 3,
-    )
 
 
 def main() -> int:

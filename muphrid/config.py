@@ -156,8 +156,8 @@ def _get_model_defaults(model: str) -> dict:
 
 
 def load_settings() -> Settings:
-    # Priority: os.environ (if set) > processing.toml > hardcoded default
-    # This lets env vars override TOML for backwards compat and CI/testing.
+    # Priority: os.environ (if set) > processing.toml > hardcoded default.
+    # Env vars intentionally override TOML for CI and one-off runtime control.
 
     # Model: env var overrides processing.toml
     model = _optional("LLM_MODEL", "") or _pcfg("model", "default", "moonshotai/Kimi-K2.6")

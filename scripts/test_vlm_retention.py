@@ -132,15 +132,13 @@ def total_image_count(messages: list) -> int:
     )
 
 
-def reset_vlm_modes(hitl: bool, auto: bool, cap: int = 8) -> None:
+def reset_vlm_modes(auto: bool, cap: int = 8) -> None:
     """Set VLM mode flags via the runtime override globals.
 
-    Note: vlm_hitl() now always returns True (collaboration requires visual
-    access). The `hitl` parameter is retained for call-site compatibility
-    with legacy test cases but has no effect — when False, the test case
-    is exercising a state that is no longer reachable in production.
+    vlm_hitl() always returns True because collaboration requires visual
+    access. Runtime overrides only control autonomous visual access and the
+    total image cap.
     """
-    _ = hitl # legacy: vlm_hitl is always on now
     hitl_mod._RUNTIME_VLM_AUTONOMOUS = auto
     hitl_mod._RUNTIME_VLM_RETENTION_MAX = cap
 
@@ -150,7 +148,7 @@ def reset_vlm_modes(hitl: bool, auto: bool, cap: int = 8) -> None:
 print("_select_visible_refs cases\n" + "=" * 40)
 
 # Case 1: vlm_hitl is always on; auto off still shows explicit state refs
-reset_vlm_modes(hitl=False, auto=False, cap=8)
+reset_vlm_modes(auto=False, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
     variant_pool=[stub_variant(paths[0], "remove_gradient_v1")],
@@ -164,7 +162,7 @@ check(
 )
 
 # Case 2: vlm_hitl only → variant pool plus explicit visual_context are visible
-reset_vlm_modes(hitl=True, auto=False, cap=8)
+reset_vlm_modes(auto=False, cap=8)
 paths = make_stub_jpgs(4)
 state = make_state(
     variant_pool=[
@@ -187,7 +185,7 @@ check(
 )
 
 # Case 3: vlm_hitl only, empty variant_pool → explicit visual_context remains visible
-reset_vlm_modes(hitl=True, auto=False, cap=8)
+reset_vlm_modes(auto=False, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
     variant_pool=[],
@@ -204,7 +202,7 @@ check(
 )
 
 # Case 4: vlm_autonomous on, total entries ≤ cap → all visible
-reset_vlm_modes(hitl=False, auto=True, cap=8)
+reset_vlm_modes(auto=True, cap=8)
 paths = make_stub_jpgs(5)
 state = make_state(
     visual_context=[vref(p, "present_images") for p in paths],
@@ -217,7 +215,7 @@ check(
 )
 
 # Case 5: vlm_autonomous on, total entries > cap → newest cap visible
-reset_vlm_modes(hitl=False, auto=True, cap=3)
+reset_vlm_modes(auto=True, cap=3)
 paths = make_stub_jpgs(5)
 state = make_state(
     visual_context=[
@@ -236,7 +234,7 @@ check(
 )
 
 # Case 6 (concern 2): gate overflow — variant_pool alone exceeds cap
-reset_vlm_modes(hitl=True, auto=True, cap=4)
+reset_vlm_modes(auto=True, cap=4)
 paths = make_stub_jpgs(9)
 state = make_state(
     variant_pool=[stub_variant(paths[i + 1], f"remove_gradient_v{i+1}") for i in range(8)],
@@ -250,7 +248,7 @@ check(
 )
 
 # Case 6b: pool fits within cap → variants + visual_context all visible
-reset_vlm_modes(hitl=True, auto=True, cap=8)
+reset_vlm_modes(auto=True, cap=8)
 paths = make_stub_jpgs(5)
 state = make_state(
     variant_pool=[
@@ -271,7 +269,7 @@ check(
 )
 
 # Case 6c: pool ≤ cap but total > cap → newest cap entries (variants prioritized)
-reset_vlm_modes(hitl=True, auto=True, cap=3)
+reset_vlm_modes(auto=True, cap=3)
 paths = make_stub_jpgs(4)
 state = make_state(
     variant_pool=[
@@ -296,7 +294,7 @@ check(
 )
 
 # Case 7: phase_carry + present_images, vlm_autonomous, no variants
-reset_vlm_modes(hitl=False, auto=True, cap=8)
+reset_vlm_modes(auto=True, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
     visual_context=[
@@ -317,10 +315,10 @@ check(
 print("\n_build_vlm_view cases\n" + "=" * 40)
 
 # Case 8: auto off but HITL visual access on → historical images stripped, state refs injected
-reset_vlm_modes(hitl=False, auto=False, cap=8)
+reset_vlm_modes(auto=False, cap=8)
 paths = make_stub_jpgs(1)
 historical_msg = HumanMessage(content=[
-    {"type": "text", "text": "old VLM injection from legacy state"},
+    {"type": "text", "text": "checkpointed message with embedded images"},
     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,XYZ"}},
     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,XYZ"}},
 ])
@@ -338,7 +336,7 @@ check(
 )
 
 # Case 9: autonomous on, refs in state → builds fresh multimodal message
-reset_vlm_modes(hitl=False, auto=True, cap=8)
+reset_vlm_modes(auto=True, cap=8)
 paths = make_stub_jpgs(3)
 messages = [
     SystemMessage(content="sys"),
@@ -365,10 +363,10 @@ check(
 )
 
 # Case 10: historical multimodal in messages + state refs → historical stripped, state wins
-reset_vlm_modes(hitl=False, auto=True, cap=8)
+reset_vlm_modes(auto=True, cap=8)
 paths = make_stub_jpgs(2)
 historical_msg = HumanMessage(content=[
-    {"type": "text", "text": "stale legacy VLM"},
+    {"type": "text", "text": "stale checkpointed VLM payload"},
     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,STALE"}},
     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,STALE"}},
     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,STALE"}},
@@ -393,7 +391,7 @@ check(
 )
 
 # Case 11 (concern 2 end-to-end): cap=4, 6 variants in pool → all 6 visible
-reset_vlm_modes(hitl=True, auto=True, cap=4)
+reset_vlm_modes(auto=True, cap=4)
 paths = make_stub_jpgs(7)
 state = make_state(
     variant_pool=[stub_variant(paths[i + 1], f"remove_gradient_v{i+1}") for i in range(6)],
@@ -410,7 +408,7 @@ check(
 )
 
 # Case 12: vlm_hitl only, empty pool → explicit visual_context is still visible
-reset_vlm_modes(hitl=True, auto=False, cap=8)
+reset_vlm_modes(auto=False, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
     variant_pool=[],
@@ -592,7 +590,7 @@ check(
 
 # Case 18: end-to-end with VLM autonomous on — current_image auto-projection
 # replaces the old phase_carry mechanism.
-reset_vlm_modes(hitl=False, auto=True, cap=8)
+reset_vlm_modes(auto=True, cap=8)
 paths = make_stub_jpgs(2)
 state = make_state(
     variant_pool=[

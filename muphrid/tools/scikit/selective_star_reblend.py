@@ -163,18 +163,6 @@ def _luminance(data: np.ndarray) -> np.ndarray:
     return 0.2126 * data[0] + 0.7152 * data[1] + 0.0722 * data[2]
 
 
-def _normalize_mask_to_2d(mask: np.ndarray) -> np.ndarray:
-    """Collapse a mask FITS to (H, W) float32 by per-pixel max across channels."""
-    mask = np.squeeze(mask)
-    if mask.ndim == 3:
-        if mask.shape[0] == 3:
-            return mask.max(axis=0).astype(np.float32)
-        if mask.shape[2] == 3:
-            return mask.max(axis=2).astype(np.float32)
-        raise ValueError(f"Unexpected mask shape {mask.shape}")
-    return mask.astype(np.float32)
-
-
 def _saturation_at(rgb: np.ndarray, y: int, x: int) -> float:
     r, g, b = float(rgb[0, y, x]), float(rgb[1, y, x]), float(rgb[2, y, x])
     mx = max(r, g, b)

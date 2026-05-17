@@ -88,10 +88,6 @@ DEFAULT_FORMATS = [
     },
 ]
 
-# Keep for backward compat with verify scripts
-VALID_PROFILES = BUILTIN_PROFILES
-
-
 # ── Pydantic input schema ──────────────────────────────────────────────────────
 
 class FormatSpec(BaseModel):
@@ -191,8 +187,8 @@ class ExportFinalInput(BaseModel):
             "When True, write export artifacts to "
             "<output_dir>/.tentative_<stem>/ and record their paths in "
             "state.metadata.tentative_export so the HITL gate can present "
-            "the actual rendered JPG before committing. This field is kept "
-            "for compatibility, but the effective behavior is system-owned: "
+            "the actual rendered JPG before committing. The effective "
+            "behavior is system-owned: "
             "when the export_final HITL gate is enabled, export_final stages "
             "tentatively regardless of the model-provided value; autonomous "
             "mode writes directly into output_dir."
@@ -335,7 +331,7 @@ def export_final(
             "authoritative render-state to choose the correct ICC source "
             "profile. Every writer of paths.current_image must also write "
             "metadata.image_space (enforced by the registry drift check). "
-            "This looks like a legacy checkpoint or a writer that skipped "
+            "The current state is incomplete or a writer skipped "
             "its bookkeeping. Refusing to guess — restart from a fresh "
             "checkpoint."
         )

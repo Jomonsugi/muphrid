@@ -24,7 +24,7 @@ What this exercises (not a full pipeline run):
      image_space (its metadata delta only touches last_analysis_snapshot).
 
   4. Checkpoint round-trip — save_checkpoint records image_space alongside
-     path; restore_checkpoint refuses legacy bare-string entries.
+     path; restore_checkpoint refuses malformed bare-string entries.
 
   5. commit_export round-trip — refuses without tentative_export, moves
      files on success, clears the tentative marker.
@@ -327,7 +327,7 @@ def test_analyze_image_does_not_clobber_image_space() -> None:
 def test_checkpoint_save_restore_round_trip() -> None:
     """
     save_checkpoint records {"path", "image_space"}. restore_checkpoint
-    refuses bare-string legacy entries. Both branches re-assert image_space
+    refuses malformed bare-string entries. Both branches re-assert image_space
     on restore.
     """
     print("\n[6] checkpoint save/restore round-trip preserves image_space")
@@ -372,15 +372,15 @@ def test_checkpoint_save_restore_round_trip() -> None:
     except Exception as e:
         check("restore re-asserts image_space", False, f"{type(e).__name__}: {e}")
 
-    # Legacy bare-string entry must be refused.
-    state["metadata"]["checkpoints"] = {"ck_legacy": str(fit)}
+    # Bare-string entries cannot satisfy the checkpoint state contract.
+    state["metadata"]["checkpoints"] = {"ck_malformed": str(fit)}
     try:
-        restore_checkpoint.func(name="ck_legacy", state=state, tool_call_id="test")
-        check("legacy bare-string entry rejected", False, "did not raise")
+        restore_checkpoint.func(name="ck_malformed", state=state, tool_call_id="test")
+        check("malformed bare-string entry rejected", False, "did not raise")
     except RuntimeError as e:
-        check("legacy bare-string entry rejected", "legacy" in str(e).lower())
+        check("malformed bare-string entry rejected", "malformed" in str(e).lower())
     except Exception as e:
-        check("legacy bare-string entry rejected", False, f"unexpected: {type(e).__name__}: {e}")
+        check("malformed bare-string entry rejected", False, f"unexpected: {type(e).__name__}: {e}")
 
 
 # ── 6. commit_export round-trip ──────────────────────────────────────────────

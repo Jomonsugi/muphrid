@@ -465,7 +465,7 @@ def multiscale_process(
             "multiscale_process: state.metadata.image_space is missing or "
             f"invalid (got {incoming_image_space!r}). Every writer of "
             "paths.current_image must also write metadata.image_space; "
-            "this looks like a legacy checkpoint or a writer that skipped "
+            "the current state is incomplete or a writer skipped "
             "its bookkeeping. Refusing to guess — restart from a fresh "
             "checkpoint."
         )

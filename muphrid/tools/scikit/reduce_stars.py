@@ -403,8 +403,8 @@ def reduce_stars(
         raise RuntimeError(
             "reduce_stars: state.metadata.image_space is missing or invalid "
             f"(got {incoming_image_space!r}). Every writer of paths.current_image "
-            "must also write metadata.image_space; this looks like a legacy "
-            "checkpoint or a writer that skipped its bookkeeping. Refusing to "
+            "must also write metadata.image_space; the current state is incomplete "
+            "or a writer skipped its bookkeeping. Refusing to "
             "guess — restart from a fresh checkpoint."
         )
 

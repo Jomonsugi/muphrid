@@ -100,7 +100,7 @@ def _load_equipment_defaults() -> dict:
 
 
 def _load_processing_defaults() -> dict:
-    """Read defaults from processing.toml, with env var overrides for backwards compat."""
+    """Read defaults from processing.toml, with env var overrides for CI/runtime control."""
     from muphrid.config import _pcfg
     per_phase = _pcfg("limits", "per_phase") or {}
     return {
@@ -279,8 +279,8 @@ def _resolve_image_space(saved_values: dict) -> str:
     Read the authoritative image_space from a checkpoint snapshot. Refuses
     on missing/invalid — every writer of paths.current_image must also
     write metadata.image_space (enforced by registry._assert_image_space_writers).
-    A snapshot without image_space is a legacy checkpoint and cannot be
-    rendered faithfully. See CLAUDE.md (no-fallbacks-for-authoritative-state).
+    A snapshot without image_space cannot be rendered faithfully. See
+    CLAUDE.md (no-fallbacks-for-authoritative-state).
     """
     metadata = saved_values.get("metadata") or {}
     image_space = metadata.get("image_space")
@@ -1485,23 +1485,22 @@ async def resume_session(
         snapshot = await _GRAPH.aget_state(config)
         saved_values = snapshot.values if snapshot else {}
         is_paused_at_hitl = review_ctl.review_is_open(saved_values.get("review_session"))
-        is_legacy_hitl = bool(saved_values.get("active_hitl")) and not is_paused_at_hitl
+        has_broken_hitl_state = bool(saved_values.get("active_hitl")) and not is_paused_at_hitl
     except Exception as e:
         logger.warning(f"resume_session: aget_state failed (non-fatal): {e}")
         saved_values = {}
         is_paused_at_hitl = False
-        is_legacy_hitl = False
+        has_broken_hitl_state = False
 
-    if is_legacy_hitl:
+    if has_broken_hitl_state:
         chat_messages.append({
             "role": "assistant",
             "content": (
-                "**This saved checkpoint predates Review Mode state.** It has "
+                "**This saved checkpoint has inconsistent HITL state.** It has "
                 "`active_hitl=True` but no open `review_session`, so the app "
                 "cannot safely reconstruct the approval contract or consume a "
                 "resume value as human approval. Start from a clean cloned "
-                "checkpoint before the gate, or rerun this phase with the "
-                "current Review Mode implementation."
+                "checkpoint before the gate, or rerun this phase."
             ),
         })
         yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state

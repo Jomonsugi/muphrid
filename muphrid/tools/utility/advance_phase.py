@@ -454,8 +454,7 @@ def _get_advance_reasoning(messages: list, tool_call_id: str | None) -> str:
     rationale for each transition survives the conversation window.
 
     Returns an empty string if no matching AIMessage is found, which is
-    the expected case for backward compatibility in tests that inject
-    ToolMessages directly.
+    the expected case in tests that inject ToolMessages directly.
     """
     if not messages or not tool_call_id:
         return ""
@@ -714,8 +713,8 @@ def _scan_hitl_conversations(messages: list, phase_start: int) -> list[dict]:
                 conversations.append(current)
             # Typed Review Mode approval events are rendered into explicit
             # model-visible HumanMessages by hitl_check/promote_variant. Read
-            # that narrative for audit reporting; do not support legacy
-            # sentinel-string approval parsing here.
+            # that narrative for audit reporting; do not parse free-form
+            # approval strings here.
             if content.startswith("HUMAN APPROVED"):
                 current["approval_kind"] = "bare"
                 for line in content.splitlines():

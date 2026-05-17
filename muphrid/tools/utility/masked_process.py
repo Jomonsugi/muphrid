@@ -414,8 +414,8 @@ def masked_process(
     # preserved it. State authority demands we re-emit it as a delta on
     # the outer Command.update — without this, the outer state's
     # image_space would not reflect what the inner tool produced. Refuse
-    # if the subgraph state's image_space is invalid (legacy/missing
-    # writer). See Metadata.image_space.
+    # if the subgraph state's image_space is invalid or missing. See
+    # Metadata.image_space.
     final_image_space = final_state.get("metadata", {}).get("image_space")
     if final_image_space not in ("linear", "display"):
         raise RuntimeError(

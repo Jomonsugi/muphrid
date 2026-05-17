@@ -94,16 +94,16 @@ def save_checkpoint(
 
     # State authority: a checkpoint must record the image_space alongside
     # the path so restore can fully reconstitute the render contract. If
-    # state's image_space is missing, this is a legacy checkpoint or a
-    # writer that skipped its bookkeeping — refuse rather than silently
+    # state's image_space is missing, the current state is incomplete or a
+    # writer skipped its bookkeeping — refuse rather than silently
     # snapshot unknown render state. See Metadata.image_space.
     incoming_image_space = state.get("metadata", {}).get("image_space")
     if incoming_image_space not in ("linear", "display"):
         raise RuntimeError(
             "save_checkpoint: state.metadata.image_space is missing or invalid "
             f"(got {incoming_image_space!r}). Every writer of paths.current_image "
-            "must also write metadata.image_space; this looks like a legacy "
-            "checkpoint or a writer that skipped its bookkeeping. Refusing to "
+            "must also write metadata.image_space; the current state is incomplete "
+            "or a writer skipped its bookkeeping. Refusing to "
             "guess — restart from a fresh checkpoint."
         )
 
@@ -121,7 +121,7 @@ def save_checkpoint(
         "all_checkpoints": {
             k: {
                 "image": Path(v["path"]).name if isinstance(v, dict) else Path(v).name,
-                "image_space": v["image_space"] if isinstance(v, dict) else "<legacy>",
+                "image_space": v["image_space"] if isinstance(v, dict) else "<invalid>",
             }
             for k, v in updated.items()
         },
@@ -181,19 +181,16 @@ def restore_checkpoint(
             )],
         })
 
-    # Each checkpoint entry is now {"path": str, "image_space": "linear"|"display"}.
-    # A bare-string entry is a legacy checkpoint (pre-image_space-authority)
-    # — refuse to restore rather than guess the image_space. State is the
-    # authoritative contract; legacy entries cannot satisfy it.
+    # Each checkpoint entry must be {"path": str, "image_space": "linear"|"display"}.
+    # Refuse malformed entries rather than guess the image_space. State is
+    # the authoritative contract.
     entry = checkpoints[name]
     if not isinstance(entry, dict) or "path" not in entry or "image_space" not in entry:
         raise RuntimeError(
-            f"restore_checkpoint: checkpoint '{name}' is in legacy format "
-            f"(got {type(entry).__name__}: {entry!r}). The new format records "
+            f"restore_checkpoint: checkpoint '{name}' is malformed "
+            f"(got {type(entry).__name__}: {entry!r}). Checkpoints must record "
             "{'path': str, 'image_space': 'linear'|'display'} so render-state "
-            "is reconstituted faithfully. This thread predates the change — "
-            "restart from a fresh checkpoint, or re-save the bookmark with "
-            "save_checkpoint."
+            "is reconstituted faithfully. Re-save the bookmark with save_checkpoint."
         )
     if entry["image_space"] not in ("linear", "display"):
         raise RuntimeError(
@@ -236,7 +233,7 @@ def restore_checkpoint(
         "all_checkpoints": {
             k: {
                 "image": Path(v["path"]).name if isinstance(v, dict) else Path(v).name,
-                "image_space": v["image_space"] if isinstance(v, dict) else "<legacy>",
+                "image_space": v["image_space"] if isinstance(v, dict) else "<invalid>",
             }
             for k, v in checkpoints.items()
         },

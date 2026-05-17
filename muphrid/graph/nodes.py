@@ -106,8 +106,8 @@ def route_after_phase_router(state: AstroState) -> str:
 def _strip_vlm_images(messages: list) -> list:
     """
     Strip ALL image content blocks from multimodal HumanMessages. Defensive
-    against legacy state or any path that injected images directly into
-    messages — the canonical source is now state.visual_context.
+    against checkpointed messages or any path that injected images directly
+    into messages — the canonical source is now state.visual_context.
 
     Returns a new list — does not mutate the originals.
     """
