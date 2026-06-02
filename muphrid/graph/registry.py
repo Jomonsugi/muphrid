@@ -112,8 +112,7 @@ UTILITY_TOOLS = [
 # Preprocessing: strict per-phase gating. Each step physically depends on the
 # output of the previous — no cross-phase backtracking. Within-phase iteration
 # is valid (e.g. rebuild a master, re-register with different params, re-select
-# + restack). Research confirms this is how PixInsight, Siril, and expert
-# astrophotographers work.
+# + restack). This mirrors how Siril and expert astrophotographers work.
 
 CALIBRATION_TOOLS = [
     build_masters,

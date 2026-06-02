@@ -6,9 +6,9 @@ per-channel analysis, noise estimates, star metrics, and background
 characterization. Called before and after every image-modifying tool to
 evaluate results and guide next decisions.
 
-Architecture (PixInsight-aligned):
+Architecture:
 - Zero/saturated pixel rejection: registration borders and clipped pixels
-  excluded before any computation (matches PixInsight Statistics behavior)
+  excluded before any computation
 - Background: photutils Background2D (2D median tiling with MAD RMS)
 - Noise: dual estimator — MAD (general) + wavelet MRS (signal-excluded)
 - Per-channel stats: raw percentiles + astropy mad_std
@@ -97,7 +97,7 @@ class AnalyzeImageInput(BaseModel):
             "Lower bound (exclusive) for the 'valid pixel' mask used in noise, "
             "background, and SNR computations. Pixels with lum <= this value "
             "are excluded. Default 0.0 rejects zero-padded registration borders "
-            "and calibration-clipped pixels (PixInsight-style zero rejection). "
+            "and calibration-clipped pixels. "
             "Raise slightly (e.g. 0.0001) to exclude the very bottom of the "
             "noise floor when analyzing stacks with visible pedestal noise; "
             "lower to -0.001 to include genuine negative residuals from "
@@ -108,8 +108,8 @@ class AnalyzeImageInput(BaseModel):
         default=0.999,
         description=(
             "Upper bound (exclusive) for the valid pixel mask. Pixels with "
-            "lum >= this value are excluded as saturated. Default 0.999 "
-            "matches PixInsight. Lower to 0.95 when you want to exclude the "
+            "lum >= this value are excluded as saturated. Default 0.999. "
+            "Lower to 0.95 when you want to exclude the "
             "knee of a strong stretch from noise/background measurements; "
             "raise to 1.001 to include everything (rarely useful)."
         ),
@@ -204,7 +204,7 @@ def _trim_zero_borders(data: np.ndarray) -> np.ndarray:
     debayering + Siril stacking can also produce scattered zeros. This
     function trims the rectangular bounding box of non-zero data.
 
-    PixInsight-aligned: Statistics implicitly rejects zero and one pixels.
+    Statistics here implicitly reject zero and one (saturated) pixels.
     The original FITS file is untouched — this is analysis-only.
     """
     if data.ndim == 3:
@@ -321,7 +321,7 @@ def _wavelet_noise(lum: np.ndarray) -> float:
     """
     MRS-style noise estimation using wavelet decomposition.
 
-    PixInsight's gold standard: the starlet (à trous) wavelet isolates
+    The starlet (à trous) wavelet isolates
     noise at the finest spatial scale. The MAD of the first wavelet layer
     gives the true noise floor with extended signal (nebulae, galaxies)
     excluded — because those structures occupy coarser scales.
@@ -821,7 +821,7 @@ def analyze_image(
     Returns per-channel statistics, dual noise estimation, 2D background
     modeling, star metrics, and derived quality indicators. Zero-padded
     registration borders and saturated pixels are automatically excluded
-    from all statistics (PixInsight-aligned zero/one rejection).
+    from all statistics (zero/one rejection).
 
     ## Metric Definitions
 
@@ -989,12 +989,12 @@ def analyze_image(
         r = g = b = lum
         is_color = False
 
-    # ── PixInsight-aligned: reject zero and saturated pixels ──
+    # ── reject zero and saturated pixels ──
     # Zero pixels come from registration borders, calibration clipping,
     # and X-Trans debayering artifacts. Saturated pixels (≥0.999) are
     # clipped and uninformative. Both are excluded from noise / background
-    # computations by default, matching PixInsight's implicit zero/one
-    # rejection. The bounds are agent-configurable via valid_pixel_min /
+    # computations by default. The bounds are agent-configurable via
+    # valid_pixel_min /
     # valid_pixel_max so short-exposure / heavy-stretch data can be
     # analyzed with a different notion of "valid".
     valid_mask = (lum > valid_pixel_min) & (lum < valid_pixel_max)

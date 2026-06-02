@@ -3,15 +3,13 @@ multiscale_process
 
 Decompose the image into discrete spatial frequency scales via the B3-spline
 à trous (undecimated, shift-invariant) wavelet transform, apply independent
-operations per scale, then reconstruct. This is the open-source equivalent of
-PixInsight's Multiscale Linear Transform (MLT).
+operations per scale, then reconstruct.
 
 IMPORTANT: PyWavelets has no 'b3' wavelet. The B3-spline à trous transform is
 implemented directly using scipy.ndimage.convolve1d with the kernel:
   [1/16, 4/16, 6/16, 4/16, 1/16]
 applied separably at each scale with stride=2^i (à trous = "with holes").
-This is isotropic (no orientation bias), artifact-free, and the same
-decomposition used by PixInsight MLT and NoiseXterminator.
+This is isotropic (no orientation bias) and artifact-free.
 
 Per-scale operations:
   sharpen — multiply detail coefficients by weight (>1 boosts, <1 suppresses)
@@ -350,10 +348,10 @@ def multiscale_process(
     Decompose the image into spatial frequency scales via the B3-spline à trous
     wavelet transform, apply independent operations per scale, then reconstruct.
 
-    This is the open-source equivalent of PixInsight's Multiscale Linear
-    Transform (MLT). It provides surgical control unavailable in Siril's
-    wavelet+wrecons: sharpen scale 2 while suppressing scale 1 noise, leave
-    large-scale structure untouched, and confine everything to a masked region.
+    Independent per-scale processing gives surgical control unavailable in
+    Siril's wavelet+wrecons: sharpen scale 2 while suppressing scale 1 noise,
+    leave large-scale structure untouched, and confine everything to a masked
+    region.
 
     Per-scale operation reference:
       scale 1: finest detail (2–4px, noise/grain)

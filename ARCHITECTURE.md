@@ -341,7 +341,7 @@ Runtime Gradio settings can override many config values without rebuilding the g
 
 **Why not fully automate every subjective choice?** Some choices are aesthetic: stretch intensity, contrast, star handling, saturation. The agent should provide data and recommendations, but the human can remain in the loop where taste matters.
 
-**Why open-source tools?** The project is intended to be inspectable and reproducible. The north star is PixInsight-quality output, but built from tools that can be orchestrated programmatically.
+**Why open-source tools?** The project is intended to be inspectable and reproducible, and built from tools that can be orchestrated programmatically.
 
 ---
 
