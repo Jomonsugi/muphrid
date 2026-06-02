@@ -55,6 +55,23 @@ class RestoreCheckpointInput(BaseModel):
     )
 
 
+def make_checkpoint_entry(path: str, image_space: str) -> dict[str, str]:
+    """Construct a metadata.checkpoints entry.
+
+    This is the single writer of the checkpoint-entry shape. Every entry is
+    {"path": str, "image_space": "linear"|"display"} so restore_checkpoint can
+    reconstitute render-state faithfully without guessing. Both writers of
+    metadata.checkpoints (save_checkpoint and the graph's auto_checkpoint) build
+    entries here, so readers trust the shape and do not defensively re-check it.
+    """
+    if image_space not in ("linear", "display"):
+        raise ValueError(
+            f"make_checkpoint_entry: image_space must be 'linear' or 'display', "
+            f"got {image_space!r}."
+        )
+    return {"path": path, "image_space": image_space}
+
+
 @tool(args_schema=SaveCheckpointInput)
 def save_checkpoint(
     name: str,
@@ -108,9 +125,8 @@ def save_checkpoint(
         )
 
     existing = state.get("metadata", {}).get("checkpoints") or {}
-    # Each entry is {"path": str, "image_space": "linear"|"display"}.
     # Delta-only emit: the deep-merge reducer composes with siblings.
-    entry = {"path": current_image, "image_space": incoming_image_space}
+    entry = make_checkpoint_entry(current_image, incoming_image_space)
     updated = {**existing, name: entry}
 
     summary = {
@@ -119,10 +135,7 @@ def save_checkpoint(
         "image_space": incoming_image_space,
         "overwritten": name in existing,
         "all_checkpoints": {
-            k: {
-                "image": Path(v["path"]).name if isinstance(v, dict) else Path(v).name,
-                "image_space": v["image_space"] if isinstance(v, dict) else "<invalid>",
-            }
+            k: {"image": Path(v["path"]).name, "image_space": v["image_space"]}
             for k, v in updated.items()
         },
     }
@@ -181,22 +194,9 @@ def restore_checkpoint(
             )],
         })
 
-    # Each checkpoint entry must be {"path": str, "image_space": "linear"|"display"}.
-    # Refuse malformed entries rather than guess the image_space. State is
-    # the authoritative contract.
+    # Entries are built by make_checkpoint_entry, the single writer of the
+    # checkpoint-entry shape, so {"path", "image_space"} is guaranteed here.
     entry = checkpoints[name]
-    if not isinstance(entry, dict) or "path" not in entry or "image_space" not in entry:
-        raise RuntimeError(
-            f"restore_checkpoint: checkpoint '{name}' is malformed "
-            f"(got {type(entry).__name__}: {entry!r}). Checkpoints must record "
-            "{'path': str, 'image_space': 'linear'|'display'} so render-state "
-            "is reconstituted faithfully. Re-save the bookmark with save_checkpoint."
-        )
-    if entry["image_space"] not in ("linear", "display"):
-        raise RuntimeError(
-            f"restore_checkpoint: checkpoint '{name}' has invalid image_space "
-            f"({entry['image_space']!r}). Expected 'linear' or 'display'."
-        )
     restore_path = entry["path"]
     restore_image_space = entry["image_space"]
     if not Path(restore_path).exists():
@@ -207,14 +207,15 @@ def restore_checkpoint(
             )],
         })
 
-    # `noop` tells the agent whether this restore actually changed state. The
-    # common failure mode it detects: a checkpoint was saved at a moment when
-    # current_image was stale (e.g. a sibling-writing tool did not promote its
-    # output), so the bookmark and the live current_image already point at the
-    # same file. Restoring to it is a no-op — any tool call after this restore
-    # will produce the same output as before, and the agent will keep looping
-    # unless it sees this signal and branches (fresh checkpoint from the
-    # correct starting path, or a different tool).
+    # `noop` is computed here for two local purposes: (1) telling the agent in
+    # the result whether the restore changed anything, and (2) gating the
+    # side-effect below (a real restore clears stale regression warnings /
+    # analysis baseline; a no-op must not). It is NOT what the stuck-loop
+    # detector reads — that derives no-op authoritatively from the
+    # orchestration state diff (state.tool_effects, see variant_snapshot), so
+    # this tool no longer needs to advertise no-op status for loop detection.
+    # The two agree by construction: a no-op restore leaves current_image
+    # unchanged, which the state diff also sees as "no change".
     prev_current = state["paths"].get("current_image")
     try:
         noop = (
@@ -231,10 +232,7 @@ def restore_checkpoint(
         "previous_image": Path(prev_current).name if prev_current else None,
         "noop": noop,
         "all_checkpoints": {
-            k: {
-                "image": Path(v["path"]).name if isinstance(v, dict) else Path(v).name,
-                "image_space": v["image_space"] if isinstance(v, dict) else "<invalid>",
-            }
+            k: {"image": Path(v["path"]).name, "image_space": v["image_space"]}
             for k, v in checkpoints.items()
         },
     }

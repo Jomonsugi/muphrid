@@ -23,8 +23,9 @@ What this exercises (not a full pipeline run):
      image_space is missing or invalid. analyze_image does NOT clobber
      image_space (its metadata delta only touches last_analysis_snapshot).
 
-  4. Checkpoint round-trip — save_checkpoint records image_space alongside
-     path; restore_checkpoint refuses malformed bare-string entries.
+  4. Checkpoint round-trip — save_checkpoint and auto_checkpoint both build
+     entries via the single writer make_checkpoint_entry, which records
+     image_space alongside path and is the only image_space guard.
 
   5. commit_export round-trip — refuses without tentative_export, moves
      files on success, clears the tentative marker.
@@ -326,13 +327,15 @@ def test_analyze_image_does_not_clobber_image_space() -> None:
 
 def test_checkpoint_save_restore_round_trip() -> None:
     """
-    save_checkpoint records {"path", "image_space"}. restore_checkpoint
-    refuses malformed bare-string entries. Both branches re-assert image_space
-    on restore.
+    All checkpoint entries are {"path", "image_space"}, built by the single
+    writer make_checkpoint_entry. save_checkpoint and the graph's
+    auto_checkpoint both go through it, so restore trusts the shape and
+    re-asserts image_space without defensive checks.
     """
     print("\n[6] checkpoint save/restore round-trip preserves image_space")
 
     from muphrid.tools.nonlinear.checkpoint import (
+        make_checkpoint_entry,
         restore_checkpoint,
         save_checkpoint,
     )
@@ -372,15 +375,72 @@ def test_checkpoint_save_restore_round_trip() -> None:
     except Exception as e:
         check("restore re-asserts image_space", False, f"{type(e).__name__}: {e}")
 
-    # Bare-string entries cannot satisfy the checkpoint state contract.
-    state["metadata"]["checkpoints"] = {"ck_malformed": str(fit)}
+    # The single writer is the only place the entry shape is constructed and
+    # the only place image_space is guarded. There is no bare-string format to
+    # support, so readers do not defensively re-check the shape.
+    entry = make_checkpoint_entry(str(fit), "linear")
+    check(
+        "make_checkpoint_entry builds {path, image_space}",
+        entry == {"path": str(fit), "image_space": "linear"},
+        f"entry={entry}",
+    )
     try:
-        restore_checkpoint.func(name="ck_malformed", state=state, tool_call_id="test")
-        check("malformed bare-string entry rejected", False, "did not raise")
-    except RuntimeError as e:
-        check("malformed bare-string entry rejected", "malformed" in str(e).lower())
+        make_checkpoint_entry(str(fit), "garbage")
+        check("make_checkpoint_entry refuses invalid image_space", False, "did not raise")
+    except ValueError:
+        check("make_checkpoint_entry refuses invalid image_space", True)
     except Exception as e:
-        check("malformed bare-string entry rejected", False, f"unexpected: {type(e).__name__}: {e}")
+        check(
+            "make_checkpoint_entry refuses invalid image_space",
+            False,
+            f"unexpected: {type(e).__name__}: {e}",
+        )
+
+    # The graph's auto_checkpoint must emit the SAME structured entry shape —
+    # this is the writer that historically wrote bare strings.
+    from langchain_core.messages import AIMessage
+
+    from muphrid.graph.nodes import auto_checkpoint
+    from muphrid.graph.state import ProcessingPhase
+
+    auto_state = {
+        "phase": ProcessingPhase.LINEAR,
+        "paths": {"current_image": str(fit)},
+        "metadata": {"image_space": "linear"},
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "remove_gradient",
+                    "args": {},
+                    "id": "call_1",
+                    "type": "tool_call",
+                }],
+            )
+        ],
+    }
+    auto_update = auto_checkpoint(auto_state)
+    auto_entries = (auto_update.get("metadata", {}).get("checkpoints") or {})
+    check(
+        "auto_checkpoint emits {path, image_space} entries",
+        bool(auto_entries)
+        and all(
+            isinstance(v, dict) and v.get("image_space") == "linear" and "path" in v
+            for v in auto_entries.values()
+        ),
+        f"entries={auto_entries}",
+    )
+
+    # If image_space is missing, auto_checkpoint records NO checkpoint entry
+    # rather than write an unrestorable one. (It may still emit the
+    # pre_action_image capture for the effect detector — that's orthogonal.)
+    auto_state_no_space = {**auto_state, "metadata": {}}
+    skipped = auto_checkpoint(auto_state_no_space)
+    check(
+        "auto_checkpoint records no checkpoint when image_space missing",
+        "checkpoints" not in skipped.get("metadata", {}),
+        f"got={skipped}",
+    )
 
 
 # ── 6. commit_export round-trip ──────────────────────────────────────────────

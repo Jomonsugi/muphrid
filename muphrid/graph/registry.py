@@ -491,6 +491,108 @@ def _assert_image_space_writers() -> None:
 _assert_image_space_writers()
 
 
+_CURRENT_IMAGE_WRITERS: frozenset[str] | None = None
+
+
+def current_image_writer_names() -> frozenset[str]:
+    """Names of registered tools whose Command.update advances paths.current_image.
+
+    Derived structurally from each tool's source — the same AST basis as the
+    image_space writer guard. The orchestration's effect detector (see
+    variant_snapshot) uses this to scope no-op detection to tools whose job is
+    to advance the working image, so tools that legitimately leave
+    current_image unchanged (analyze_image, save_checkpoint, ...) are never
+    mistaken for no-ops.
+
+    Self-contained on purpose: it re-walks rather than sharing the guard's
+    internals, so the critical import-time guard is never coupled to this
+    diagnostic. Compound tools that emit a name-reference `paths` (rather than
+    a dict literal) are not detected — the same documented blind spot as the
+    guard — which only costs those tools no-op collapsing, never correctness.
+
+    Memoized: registered tool sources do not change at runtime.
+    """
+    global _CURRENT_IMAGE_WRITERS
+    if _CURRENT_IMAGE_WRITERS is not None:
+        return _CURRENT_IMAGE_WRITERS
+
+    import ast
+    import textwrap
+
+    def _dict_has_key(d: ast.Dict, key: str) -> bool:
+        return any(
+            isinstance(k, ast.Constant) and k.value == key for k in d.keys
+        )
+
+    def _dict_get(d: ast.Dict, key: str) -> ast.expr | None:
+        for k, v in zip(d.keys, d.values):
+            if isinstance(k, ast.Constant) and k.value == key:
+                return v
+        return None
+
+    def _writes_current_image(t) -> bool:
+        func = getattr(t, "func", None) or getattr(t, "coroutine", None)
+        if func is None:
+            return False
+        try:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+        except (OSError, TypeError, SyntaxError):
+            return False
+
+        # Resolve `update = {...}` / `update: dict = {...}` locals so that
+        # tools building the payload in a variable before
+        # `return Command(update=update)` are covered, not just inline-dict
+        # writers. (restore_checkpoint and commit_variant use this shape.)
+        assigned: dict[str, ast.Dict] = {}
+        for node in ast.walk(tree):
+            target = value = None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target, value = node.targets[0], node.value
+            elif isinstance(node, ast.AnnAssign):
+                target, value = node.target, node.value
+            if isinstance(target, ast.Name) and isinstance(value, ast.Dict):
+                assigned[target.id] = value
+
+        def _resolve(expr: ast.expr | None) -> ast.Dict | None:
+            if isinstance(expr, ast.Dict):
+                return expr
+            if isinstance(expr, ast.Name):
+                return assigned.get(expr.id)
+            return None
+
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "Command"):
+                continue
+            update_kw = next(
+                (kw for kw in node.keywords if kw.arg == "update"), None
+            )
+            if update_kw is None:
+                continue
+            update_dict = _resolve(update_kw.value)
+            if update_dict is None:
+                continue
+            paths_val = _resolve(_dict_get(update_dict, "paths"))
+            if paths_val is not None and _dict_has_key(paths_val, "current_image"):
+                return True
+        return False
+
+    seen: set[str] = set()
+    names: set[str] = set()
+    for group in [CALIBRATION_TOOLS, REGISTRATION_TOOLS, ANALYSIS_TOOLS,
+                  STACKING_TOOLS, LINEAR_TOOLS, STRETCH_TOOLS,
+                  NONLINEAR_TOOLS, EXPORT_TOOLS, UTILITY_TOOLS]:
+        for t in group:
+            if t.name in seen:
+                continue
+            seen.add(t.name)
+            if _writes_current_image(t):
+                names.add(t.name)
+    _CURRENT_IMAGE_WRITERS = frozenset(names)
+    return _CURRENT_IMAGE_WRITERS
+
+
 def all_tools() -> list:
     """Return every registered tool. Used for ToolNode initialization."""
     seen = set()

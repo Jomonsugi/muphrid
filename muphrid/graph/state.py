@@ -745,6 +745,21 @@ class AstroState(TypedDict):
     # full new list each call. See RegressionWarning for entry shape.
     regression_warnings: list[RegressionWarning]
 
+    # Pre-action working-image pointer, captured by auto_checkpoint immediately
+    # before the tool node runs. variant_snapshot diffs paths.current_image
+    # against this to decide, from authoritative state, whether each
+    # image-advancing tool call actually changed the working image. Replace
+    # semantics — overwritten every action step.
+    pre_action_image: str | None
+
+    # Authoritative per-call effect record: tool_call_id -> did this call
+    # advance paths.current_image. Written by variant_snapshot from the
+    # state diff; read by the stuck-loop detector so "did this call do
+    # anything?" comes from state, not from scanning ToolMessage content.
+    # Keys are run-unique tool_call_ids and the detector only consults ids in
+    # the current segment, so plain key-merge accumulation is safe.
+    tool_effects: Annotated[dict[str, bool], _merge_dicts]
+
 
 # ── Factory ────────────────────────────────────────────────────────────────────
 
@@ -841,6 +856,8 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
         variant_pool=[],
         visual_context=[],
         regression_warnings=[],
+        pre_action_image=None,
+        tool_effects={},
     )
 
 

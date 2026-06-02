@@ -38,8 +38,13 @@ from muphrid.graph.content import image_blocks, text_content
 from muphrid.graph.prompts import HITL_PARTNER_FRAGMENT as _HITL_PARTNER_FRAGMENT
 from muphrid.graph.prompts import PHASE_PROMPTS as _PHASE_PROMPTS
 from muphrid.graph.prompts import SYSTEM_BASE as _SYSTEM_BASE
-from muphrid.graph.registry import all_tools, tools_for_phase
+from muphrid.graph.registry import (
+    all_tools,
+    current_image_writer_names,
+    tools_for_phase,
+)
 from muphrid.graph.state import AstroState, ProcessingPhase, Variant, VisualRef
+from muphrid.tools.nonlinear.checkpoint import make_checkpoint_entry
 
 logger = logging.getLogger(__name__)
 
@@ -394,10 +399,11 @@ def _format_checkpoints_for_prompt(checkpoints: dict | None) -> str:
     if not checkpoints:
         return ""
 
+    # Entries are built by make_checkpoint_entry: {"path", "image_space"}.
     items = [
-        (str(name), str(path))
-        for name, path in checkpoints.items()
-        if name and path
+        (str(name), entry["path"])
+        for name, entry in checkpoints.items()
+        if name and entry
     ]
     if not items:
         return ""
@@ -682,7 +688,7 @@ def _tool_message_is_error(msg, content: str) -> bool:
     return any(marker in content for marker in _TOOL_ERROR_MARKERS)
 
 
-def _check_stuck_loop(messages: list) -> None:
+def _check_stuck_loop(messages: list, tool_effects: dict | None = None) -> None:
     """
     Detect repeated identical tool calls within the current segment.
 
@@ -699,16 +705,16 @@ def _check_stuck_loop(messages: list) -> None:
     the same parameters with no-op work in between. The counter-based check
     catches this regardless of interleaving.
 
-    Effect-level collapsing: some tools report `"noop": true` in their result
-    JSON to signal that the call produced no state change (currently
-    restore_checkpoint does this when the bookmarked path already equals
-    current_image). Agents in a stuck loop often try *different argument
-    values* — restore_checkpoint("starless_base"), restore_checkpoint("v1"),
-    restore_checkpoint("good") — all noops pointing at the same stale
-    current_image. Args differ, so the args-only fingerprint never trips.
-    To catch this, any tool call whose ToolMessage carries `"noop": true` is
+    Effect-level collapsing: the orchestration records, in state.tool_effects,
+    whether each image-advancing tool call actually changed
+    paths.current_image (computed by variant_snapshot from a state diff, not
+    by scanning message content). Agents in a stuck loop often try *different
+    argument values* — restore_checkpoint("starless_base"),
+    restore_checkpoint("v1"), restore_checkpoint("good") — all no-ops pointing
+    at the same stale current_image. Args differ, so the args-only fingerprint
+    never trips. Any tool call whose recorded effect is "no change" is
     fingerprinted by effect (`{name, effect=noop}`) rather than by args, so
-    all such noops for a given tool name share one counter.
+    all such no-ops for a given tool name share one counter.
 
     Error-level collapsing: the same class of stuck loop happens when a tool
     *keeps failing*. The M31 run exhibited this: siril_stack failed on every
@@ -756,6 +762,7 @@ def _check_stuck_loop(messages: list) -> None:
     # messages twice in lockstep. The reverse walk still stops at
     # advance_phase / HumanMessage boundaries — events outside the current
     # segment must not leak in.
+    tool_effects = tool_effects or {}
     noop_tool_call_ids: set[str] = set()
     error_tool_call_ids: set[str] = set()
     for msg in reversed(messages):
@@ -764,15 +771,12 @@ def _check_stuck_loop(messages: list) -> None:
                 break
             tc_id = getattr(msg, "tool_call_id", None)
             content = msg.content if isinstance(msg.content, str) else ""
-            if '"noop": true' in content or '"noop":true' in content:
-                # Confirm by parsing — the substring match is a cheap prefilter.
-                try:
-                    parsed = json.loads(content)
-                except (json.JSONDecodeError, ValueError):
-                    parsed = None
-                if isinstance(parsed, dict) and parsed.get("noop") is True:
-                    if tc_id:
-                        noop_tool_call_ids.add(tc_id)
+            if tc_id and tool_effects.get(tc_id) is False:
+                # Authoritative no-op: the orchestration's state diff recorded
+                # that this image-advancing call did not change
+                # paths.current_image. Source of truth is state.tool_effects
+                # (see variant_snapshot), not a substring in the message.
+                noop_tool_call_ids.add(tc_id)
             elif tc_id and _tool_message_is_error(msg, content):
                 error_tool_call_ids.add(tc_id)
             continue
@@ -1058,7 +1062,9 @@ def make_agent_node(model_factory):
         raw_messages = list(state.get("messages", []))
 
         # Stuck-loop detection: hard fail if the agent repeats the same tool call.
-        _check_stuck_loop(raw_messages)
+        # No-op effect comes from authoritative state (tool_effects), not from
+        # scanning ToolMessage content.
+        _check_stuck_loop(raw_messages, state.get("tool_effects"))
 
         # Text-loop detection: hard fail if the agent emits N consecutive
         # text-only responses with high pairwise similarity. Catches the
@@ -1289,13 +1295,21 @@ def auto_checkpoint(state: AstroState) -> dict[str, Any]:
     It must not append a message, because ToolNode expects the latest message
     to be the AIMessage containing tool_calls.
     """
+    # Capture the pre-action working-image pointer for the orchestration's
+    # effect detector. variant_snapshot diffs paths.current_image against this
+    # to decide, from authoritative state, whether each image-advancing tool
+    # call actually changed the working image. This must run for every action
+    # step, independent of whether a checkpoint is recorded below.
+    current_image = (state.get("paths", {}) or {}).get("current_image")
+    pre = {"pre_action_image": current_image} if current_image else {}
+
     phase = state.get("phase", ProcessingPhase.INGEST)
     if phase not in _POST_STACK_CHECKPOINT_PHASES:
-        return {}
+        return pre
 
     messages = state.get("messages", []) or []
     if not messages or not isinstance(messages[-1], AIMessage):
-        return {}
+        return pre
 
     tool_calls = messages[-1].tool_calls or []
     mutating_tools = [
@@ -1304,17 +1318,28 @@ def auto_checkpoint(state: AstroState) -> dict[str, Any]:
         if tc.get("name") in _IMAGE_MUTATING_TOOLS
     ]
     if not mutating_tools:
-        return {}
+        return pre
 
-    current_image = (state.get("paths", {}) or {}).get("current_image")
     if not current_image:
-        return {}
+        return pre
     path = Path(current_image)
     if not path.exists():
         logger.warning(
             f"auto_checkpoint skipped: current_image does not exist: {current_image}"
         )
-        return {}
+        return pre
+
+    # A checkpoint records image_space alongside the path so restore can
+    # reconstitute render-state faithfully. If image_space is missing/invalid,
+    # an upstream writer skipped its bookkeeping — skip rather than record a
+    # checkpoint that cannot be restored.
+    image_space = (state.get("metadata", {}) or {}).get("image_space")
+    if image_space not in ("linear", "display"):
+        logger.warning(
+            f"auto_checkpoint skipped: metadata.image_space is missing or invalid "
+            f"({image_space!r}) for {path.name}"
+        )
+        return pre
 
     checkpoints = (state.get("metadata", {}) or {}).get("checkpoints") or {}
     auto_count = sum(
@@ -1330,11 +1355,13 @@ def auto_checkpoint(state: AstroState) -> dict[str, Any]:
         f"auto_checkpoint: {unique_name} → {path.name} "
         f"before {', '.join(mutating_tools)}"
     )
+    entry = make_checkpoint_entry(str(path), image_space)
     return {
+        **pre,
         "metadata": {
             "checkpoints": {
-                unique_name: str(path),
-                "auto:previous": str(path),
+                unique_name: entry,
+                "auto:previous": entry,
             }
         }
     }
@@ -1732,10 +1759,40 @@ def variant_snapshot(state: AstroState) -> dict[str, Any]:
     if not trailing:
         return {}
 
+    # Authoritative effect detection: did each image-advancing tool call in
+    # this action step actually change paths.current_image? Derived from the
+    # state diff (pre_action_image captured by auto_checkpoint vs the live
+    # current_image) rather than from scanning ToolMessage content. The
+    # stuck-loop detector reads tool_effects to collapse no-op calls. Scoped
+    # to current_image_writer_names() so tools that legitimately leave the
+    # working image unchanged (analyze_image, save_checkpoint) are never
+    # mistaken for no-ops. Errored calls are excluded — the detector handles
+    # those via its own error-collapsing.
+    effects_update: dict[str, Any] = {}
+    before = state.get("pre_action_image")
+    after = (state.get("paths") or {}).get("current_image")
+    if before is not None:
+        writers = current_image_writer_names()
+        advancing = [
+            m for m in trailing
+            if m.name in writers and getattr(m, "status", None) != "error"
+        ]
+        if len(advancing) == 1:
+            effects_update = {
+                "tool_effects": {advancing[0].tool_call_id: after != before}
+            }
+        elif len(advancing) > 1:
+            # Multiple image-advancing calls in one step: the merged
+            # current_image can't be attributed to a single call, so don't
+            # risk a false no-op — record them all as having had an effect.
+            effects_update = {
+                "tool_effects": {m.tool_call_id: True for m in advancing}
+            }
+
     # Filter to HITL-mapped tools only
     hitl_msgs = [m for m in trailing if m.name in TOOL_TO_HITL]
     if not hitl_msgs:
-        return {}
+        return effects_update
 
     phase = state.get("phase", ProcessingPhase.INGEST)
     raw_pool = list(state.get("variant_pool", []) or [])
@@ -1775,8 +1832,8 @@ def variant_snapshot(state: AstroState) -> dict[str, Any]:
     # for HITL gate variants; _select_visible_refs reads it directly when
     # building the VLM view, so there is no separate mirror to maintain.
     if snapshotted_any or pool_changed:
-        return {"variant_pool": new_pool}
-    return {}
+        return {**effects_update, "variant_pool": new_pool}
+    return effects_update
 
 
 # ── variant promotion ────────────────────────────────────────────────────────
