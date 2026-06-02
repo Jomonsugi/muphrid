@@ -104,9 +104,9 @@ Key graph nodes:
 
 - **`phase_router`** chooses whether to continue and which tools are available.
 - **`agent`** builds the prompt, attaches state-derived visual context, invokes the model, and enforces phase/tool gates.
-- **`auto_checkpoint`** captures pre-call image state before post-stack mutating tools.
+- **`auto_checkpoint`** captures pre-call image state before post-stack mutating tools, and records the pre-action working-image pointer used for effect detection.
 - **`action`** executes LangChain tools through `ToolNode`.
-- **`variant_snapshot`** captures HITL-mapped tool outputs into `variant_pool`.
+- **`variant_snapshot`** captures HITL-mapped tool outputs into `variant_pool`, and records per-call tool effects (did the call change `paths.current_image`) into `tool_effects` from the pre/post state diff.
 - **`hitl_check`** opens review sessions, interrupts for human input, validates approvals, and promotes approved variants.
 - **`agent_chat`** handles text-only responses outside active review.
 
@@ -129,6 +129,7 @@ Important state fields:
 | `review_session` | Canonical HITL review state and proposal contract |
 | `visual_context` | Non-variant images the model should see |
 | `regression_warnings` | Metric regressions detected during analysis |
+| `tool_effects` | Per-call record of whether a tool changed the working image; drives no-op loop detection |
 
 Reducers matter. Some fields are deep-merged so parallel tool calls compose safely (`paths`, `metadata`). Some are replace-aware (`metrics`). Lists such as `variant_pool` are plain replace semantics because the writer recomputes the full list.
 
