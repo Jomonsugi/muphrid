@@ -3,7 +3,7 @@ Graph nodes — phase_router, agent, action, hitl_check, phase_advance.
 
 See graph_design.md for the architecture:
 
-    phase_router → agent → action → hitl_check → agent  (ReAct loop)
+    phase_router → agent → action → hitl_check → agent (ReAct loop)
                      │
                      └── (no tool_calls) → phase_advance → phase_router
 """
@@ -38,8 +38,13 @@ from muphrid.graph.content import image_blocks, text_content
 from muphrid.graph.prompts import HITL_PARTNER_FRAGMENT as _HITL_PARTNER_FRAGMENT
 from muphrid.graph.prompts import PHASE_PROMPTS as _PHASE_PROMPTS
 from muphrid.graph.prompts import SYSTEM_BASE as _SYSTEM_BASE
-from muphrid.graph.registry import all_tools, tools_for_phase
+from muphrid.graph.registry import (
+    all_tools,
+    current_image_writer_names,
+    tools_for_phase,
+)
 from muphrid.graph.state import AstroState, ProcessingPhase, Variant, VisualRef
+from muphrid.tools.nonlinear.checkpoint import make_checkpoint_entry
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +98,11 @@ def route_after_phase_router(state: AstroState) -> str:
 # Messages stay text-only — they are the audit trail, not the visual context.
 #
 # Writers to visual_context:
-#   - variant_snapshot   → mirrors variant_pool (source="hitl_variant")
-#   - promote_variant    → drops hitl_variant entries, keeps approved as
-#                          source="phase_carry"
-#   - present_images     → replaces source="present_images" entries
-#   - advance_phase      → clears the list
+# - variant_snapshot → mirrors variant_pool (source="hitl_variant")
+# - promote_variant → drops hitl_variant entries, keeps approved as
+# source="phase_carry"
+# - present_images → replaces source="present_images" entries
+# - advance_phase → clears the list
 #
 # The helpers in this section never mutate state; they read it and return
 # a new message list to pass to the model.
@@ -106,8 +111,8 @@ def route_after_phase_router(state: AstroState) -> str:
 def _strip_vlm_images(messages: list) -> list:
     """
     Strip ALL image content blocks from multimodal HumanMessages. Defensive
-    against legacy state or any path that injected images directly into
-    messages — the canonical source is now state.visual_context.
+    against checkpointed messages or any path that injected images directly
+    into messages — the canonical source is now state.visual_context.
 
     Returns a new list — does not mutate the originals.
     """
@@ -216,7 +221,7 @@ def _current_image_ref(state: AstroState) -> VisualRef | None:
       - state.paths.current_image must be set; the derived agent-VLM preview
         (smaller sibling under <working_dir>/previews/) must exist on disk.
       - We prefer the agent-sized VLM preview (`preview_<stem>_vlm.jpg`) when
-        present — produced at ~1024px / q=85 by t22_generate_preview alongside
+        present — produced at ~1024px / q=85 by generate_preview alongside
         the human-facing 1920px preview. If only the human preview exists, we
         fall back to it rather than skipping (correctness over cost).
 
@@ -276,10 +281,10 @@ def _select_visible_refs(state: AstroState) -> list[VisualRef]:
     """
     Pick the images the agent should see right now. Four sources:
 
-      - state.variant_pool   → projected to VisualRefs (active decision space
+      - state.variant_pool → projected to VisualRefs (active decision space
                                 during a HITL gate or sandwich-iteration in
                                 autonomous mode). Source label "hitl_variant".
-      - current_image        → auto-projected anchor produced by
+      - current_image → auto-projected anchor produced by
                                 _current_image_ref(state) when vlm_phase_eligible.
                                 Source label "current_image".
       - state.visual_context → present_images and phase_carry entries the
@@ -384,7 +389,7 @@ def _format_variant_pool_for_prompt(variant_pool: list[Variant]) -> str:
                 metric_strs.append(f"{key}={val:.3f}")
             else:
                 metric_strs.append(f"{key}={val}")
-        suffix = f"  ({', '.join(metric_strs)})" if metric_strs else ""
+        suffix = f" ({', '.join(metric_strs)})" if metric_strs else ""
         lines.append(f"- **{vid}** — {label}{suffix}")
     return "\n".join(lines)
 
@@ -394,10 +399,11 @@ def _format_checkpoints_for_prompt(checkpoints: dict | None) -> str:
     if not checkpoints:
         return ""
 
+    # Entries are built by make_checkpoint_entry: {"path", "image_space"}.
     items = [
-        (str(name), str(path))
-        for name, path in checkpoints.items()
-        if name and path
+        (str(name), entry["path"])
+        for name, entry in checkpoints.items()
+        if name and entry
     ]
     if not items:
         return ""
@@ -548,9 +554,9 @@ def _check_text_loop(messages: list) -> None:
         return
 
     # Walk the tail backward. Count text-only AIMessages until we hit:
-    #   - A HumanMessage (conversation interleave — resets the run)
-    #   - An AIMessage with tool_calls (agent did something — resets)
-    #   - A ToolMessage (tool ran — resets)
+    # - A HumanMessage (conversation interleave — resets the run)
+    # - An AIMessage with tool_calls (agent did something — resets)
+    # - A ToolMessage (tool ran — resets)
     run_texts: list[str] = []
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
@@ -574,7 +580,7 @@ def _check_text_loop(messages: list) -> None:
         f"detector doesn't catch — the agent is talking to itself "
         f"instead of advancing the work. Most recent response "
         f"(first 200 chars):\n"
-        f"  {run_texts[0][:200]!r}\n"
+        f" {run_texts[0][:200]!r}\n"
         f"To override, set MAX_CONSECUTIVE_TEXT_ONLY=0 in .env. "
         f"To raise the trigger threshold, set MAX_CONSECUTIVE_TEXT_ONLY=N."
     )
@@ -606,7 +612,7 @@ def _check_phase_tool_limit(messages: list, phase) -> None:
     tool_call_count = 0
     for msg in reversed(messages):
         if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "advance_phase":
-            break  # reached the start of this phase
+            break # reached the start of this phase
         if isinstance(msg, AIMessage) and msg.tool_calls:
             tool_call_count += len(msg.tool_calls)
 
@@ -624,20 +630,20 @@ def _check_phase_tool_limit(messages: list, phase) -> None:
 # Markers that identify a ToolMessage as a failure. Successful tools return
 # JSON (dict/list) in their content; failing tools yield free-form error text
 # from _format_tool_error or raw exception strings. We check:
-#   1. content is a dict/list with "error" or "success": false
-#   2. OR content is a string that matches any known failure prefix
+# 1. content is a dict/list with "error" or "success": false
+# 2. OR content is a string that matches any known failure prefix
 # Substring matching is sufficient because _format_tool_error standardizes
 # on these prefixes and SirilError messages contain "siril-cli exited".
 _TOOL_ERROR_MARKERS: tuple[str, ...] = (
-    "Tool '",                 # "Tool 'X' failed ..." from _format_tool_error
-    "Error:",                 # generic error prefix
-    "Error in line ",         # Siril script error
-    "siril-cli exited",       # SirilError
+    "Tool '", # "Tool 'X' failed ..." from _format_tool_error
+    "Error:", # generic error prefix
+    "Error in line ", # Siril script error
+    "siril-cli exited", # SirilError
     "Traceback (most recent", # unraised exceptions leaking through
-    "validation error",       # pydantic validation
-    "FileNotFoundError",      # raised from tool bodies
-    "RuntimeError",           # raised from tool bodies
-    "ValueError",             # raised from tool bodies
+    "validation error", # pydantic validation
+    "FileNotFoundError", # raised from tool bodies
+    "RuntimeError", # raised from tool bodies
+    "ValueError", # raised from tool bodies
     "with an internal error", # _format_tool_error fallback
 )
 
@@ -682,7 +688,7 @@ def _tool_message_is_error(msg, content: str) -> bool:
     return any(marker in content for marker in _TOOL_ERROR_MARKERS)
 
 
-def _check_stuck_loop(messages: list) -> None:
+def _check_stuck_loop(messages: list, tool_effects: dict | None = None) -> None:
     """
     Detect repeated identical tool calls within the current segment.
 
@@ -699,16 +705,16 @@ def _check_stuck_loop(messages: list) -> None:
     the same parameters with no-op work in between. The counter-based check
     catches this regardless of interleaving.
 
-    Effect-level collapsing: some tools report `"noop": true` in their result
-    JSON to signal that the call produced no state change (currently
-    restore_checkpoint does this when the bookmarked path already equals
-    current_image). Agents in a stuck loop often try *different argument
-    values* — restore_checkpoint("starless_base"), restore_checkpoint("v1"),
-    restore_checkpoint("good") — all noops pointing at the same stale
-    current_image. Args differ, so the args-only fingerprint never trips.
-    To catch this, any tool call whose ToolMessage carries `"noop": true` is
+    Effect-level collapsing: the orchestration records, in state.tool_effects,
+    whether each image-advancing tool call actually changed
+    paths.current_image (computed by variant_snapshot from a state diff, not
+    by scanning message content). Agents in a stuck loop often try *different
+    argument values* — restore_checkpoint("starless_base"),
+    restore_checkpoint("v1"), restore_checkpoint("good") — all no-ops pointing
+    at the same stale current_image. Args differ, so the args-only fingerprint
+    never trips. Any tool call whose recorded effect is "no change" is
     fingerprinted by effect (`{name, effect=noop}`) rather than by args, so
-    all such noops for a given tool name share one counter.
+    all such no-ops for a given tool name share one counter.
 
     Error-level collapsing: the same class of stuck loop happens when a tool
     *keeps failing*. The M31 run exhibited this: siril_stack failed on every
@@ -756,6 +762,7 @@ def _check_stuck_loop(messages: list) -> None:
     # messages twice in lockstep. The reverse walk still stops at
     # advance_phase / HumanMessage boundaries — events outside the current
     # segment must not leak in.
+    tool_effects = tool_effects or {}
     noop_tool_call_ids: set[str] = set()
     error_tool_call_ids: set[str] = set()
     for msg in reversed(messages):
@@ -764,15 +771,12 @@ def _check_stuck_loop(messages: list) -> None:
                 break
             tc_id = getattr(msg, "tool_call_id", None)
             content = msg.content if isinstance(msg.content, str) else ""
-            if '"noop": true' in content or '"noop":true' in content:
-                # Confirm by parsing — the substring match is a cheap prefilter.
-                try:
-                    parsed = json.loads(content)
-                except (json.JSONDecodeError, ValueError):
-                    parsed = None
-                if isinstance(parsed, dict) and parsed.get("noop") is True:
-                    if tc_id:
-                        noop_tool_call_ids.add(tc_id)
+            if tc_id and tool_effects.get(tc_id) is False:
+                # Authoritative no-op: the orchestration's state diff recorded
+                # that this image-advancing call did not change
+                # paths.current_image. Source of truth is state.tool_effects
+                # (see variant_snapshot), not a substring in the message.
+                noop_tool_call_ids.add(tc_id)
             elif tc_id and _tool_message_is_error(msg, content):
                 error_tool_call_ids.add(tc_id)
             continue
@@ -785,7 +789,7 @@ def _check_stuck_loop(messages: list) -> None:
             # advance_phase marks the start of a new phase = clean slate
             if getattr(msg, "name", None) == "advance_phase":
                 break
-            continue  # other tool results don't affect the count
+            continue # other tool results don't affect the count
         if isinstance(msg, HumanMessage):
             # Human intervention resets — re-application after feedback is OK
             break
@@ -875,7 +879,7 @@ def _check_stuck_loop(messages: list) -> None:
 # DeepSeek-V3 (via Together AI) occasionally degenerates and emits its internal
 # tool-call delimiters as plain text instead of populating the tool_calls field:
 #
-#   <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_name<｜tool▁sep｜>{...}<｜tool▁call▁end｜>
+# <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_name<｜tool▁sep｜>{...}<｜tool▁call▁end｜>
 #
 # When this happens, route_after_agent sees no tool_calls and routes to
 # agent_chat, which nudges the model — making the loop worse (growing indent).
@@ -949,9 +953,14 @@ def _rescue_raw_tool_calls(response: AIMessage) -> AIMessage:
 # rule is a wire-format invariant, not a provider quirk. Substituting a
 # non-empty placeholder keeps the conversation valid for any backend while
 # still signalling to the agent_chat nudger that this turn was a no-op.
-_EMPTY_RESPONSE_PLACEHOLDER = (
-    "(no response — I should call a tool or respond with text on the next turn)"
-)
+# Wire-format invariant: chat completion APIs reject AIMessages with no
+# content AND no tool_calls (HTTP 400 across OpenAI-compatible providers and
+# Anthropic). When the model produces an empty completion we must store
+# *something* non-empty in its place. Choose a stub that describes what
+# happened in third-person system voice rather than impersonating the agent
+# — the agent reads its own message history, and "I should call a tool" in
+# its own voice would be a fabricated commitment.
+_EMPTY_RESPONSE_PLACEHOLDER = "[model returned no content]"
 
 
 def _is_empty_ai_message(msg: AIMessage) -> bool:
@@ -1053,7 +1062,9 @@ def make_agent_node(model_factory):
         raw_messages = list(state.get("messages", []))
 
         # Stuck-loop detection: hard fail if the agent repeats the same tool call.
-        _check_stuck_loop(raw_messages)
+        # No-op effect comes from authoritative state (tool_effects), not from
+        # scanning ToolMessage content.
+        _check_stuck_loop(raw_messages, state.get("tool_effects"))
 
         # Text-loop detection: hard fail if the agent emits N consecutive
         # text-only responses with high pairwise similarity. Catches the
@@ -1284,13 +1295,21 @@ def auto_checkpoint(state: AstroState) -> dict[str, Any]:
     It must not append a message, because ToolNode expects the latest message
     to be the AIMessage containing tool_calls.
     """
+    # Capture the pre-action working-image pointer for the orchestration's
+    # effect detector. variant_snapshot diffs paths.current_image against this
+    # to decide, from authoritative state, whether each image-advancing tool
+    # call actually changed the working image. This must run for every action
+    # step, independent of whether a checkpoint is recorded below.
+    current_image = (state.get("paths", {}) or {}).get("current_image")
+    pre = {"pre_action_image": current_image} if current_image else {}
+
     phase = state.get("phase", ProcessingPhase.INGEST)
     if phase not in _POST_STACK_CHECKPOINT_PHASES:
-        return {}
+        return pre
 
     messages = state.get("messages", []) or []
     if not messages or not isinstance(messages[-1], AIMessage):
-        return {}
+        return pre
 
     tool_calls = messages[-1].tool_calls or []
     mutating_tools = [
@@ -1299,17 +1318,28 @@ def auto_checkpoint(state: AstroState) -> dict[str, Any]:
         if tc.get("name") in _IMAGE_MUTATING_TOOLS
     ]
     if not mutating_tools:
-        return {}
+        return pre
 
-    current_image = (state.get("paths", {}) or {}).get("current_image")
     if not current_image:
-        return {}
+        return pre
     path = Path(current_image)
     if not path.exists():
         logger.warning(
             f"auto_checkpoint skipped: current_image does not exist: {current_image}"
         )
-        return {}
+        return pre
+
+    # A checkpoint records image_space alongside the path so restore can
+    # reconstitute render-state faithfully. If image_space is missing/invalid,
+    # an upstream writer skipped its bookkeeping — skip rather than record a
+    # checkpoint that cannot be restored.
+    image_space = (state.get("metadata", {}) or {}).get("image_space")
+    if image_space not in ("linear", "display"):
+        logger.warning(
+            f"auto_checkpoint skipped: metadata.image_space is missing or invalid "
+            f"({image_space!r}) for {path.name}"
+        )
+        return pre
 
     checkpoints = (state.get("metadata", {}) or {}).get("checkpoints") or {}
     auto_count = sum(
@@ -1325,11 +1355,13 @@ def auto_checkpoint(state: AstroState) -> dict[str, Any]:
         f"auto_checkpoint: {unique_name} → {path.name} "
         f"before {', '.join(mutating_tools)}"
     )
+    entry = make_checkpoint_entry(str(path), image_space)
     return {
+        **pre,
         "metadata": {
             "checkpoints": {
-                unique_name: str(path),
-                "auto:previous": str(path),
+                unique_name: entry,
+                "auto:previous": entry,
             }
         }
     }
@@ -1470,15 +1502,15 @@ _VARIANT_METRIC_KEYS = (
 )
 
 
-def _phase_short_code(hitl_key: str | None) -> str:
+def _variant_short_code(tool_name: str | None) -> str:
     """
-    Extract the 'T09'-style prefix from a hitl_key like 'T09_gradient'.
-    Falls back to 'TXX' if the key doesn't follow the convention.
+    Short code used as the variant id prefix. The tool function name is the
+    canonical vocabulary across agent, system, UI, and human chat — variant
+    ids look like 'remove_gradient_v1', 'stretch_image_v3'. Tool messages
+    without a recognized tool name fall back to 'unknown' so the id remains
+    a valid string.
     """
-    if not hitl_key:
-        return "TXX"
-    head = hitl_key.split("_", 1)[0]
-    return head if head.startswith("T") else "TXX"
+    return tool_name or "unknown"
 
 
 def _find_ai_message_for_tool_call(messages: list, tool_call_id: str) -> AIMessage | None:
@@ -1599,8 +1631,7 @@ def _make_variant(
     """
     from datetime import datetime, timezone
 
-    hitl_key = TOOL_TO_HITL.get(tool_msg.name)
-    short = _phase_short_code(hitl_key)
+    short = _variant_short_code(tool_msg.name)
 
     file_path, preview_path = _extract_variant_paths(tool_msg)
     if not file_path:
@@ -1608,13 +1639,13 @@ def _make_variant(
 
     params = _extract_variant_params(tool_msg, ai_msg)
 
-    # Generate stable id: T09_v1, T09_v2, ...  (counts existing entries with
-    # the same prefix; pool is per-gate so this stays small)
+    # Stable id: <tool_name>_v1, <tool_name>_v2, ... Counts existing entries
+    # with the same prefix; pool is per-gate so this stays small.
     same_phase = [v for v in pool if v.get("id", "").startswith(f"{short}_v")]
     n = len(same_phase) + 1
     variant_id = f"{short}_v{n}"
 
-    # Label: prefer tool's own variant_label, else synthesize from params
+    # Label: prefer tool's own variant_label, else synthesize from params.
     tool_label = _extract_variant_label(tool_msg, params)
     if tool_label:
         label = f"{short} v{n} — {tool_label}"
@@ -1631,6 +1662,7 @@ def _make_variant(
         file_path=file_path,
         preview_path=preview_path,
         metrics=_snapshot_metrics(state),
+        image_space=(state.get("metadata") or {}).get("image_space"),
         created_at=datetime.now(timezone.utc).isoformat(),
         rationale=None,
     )
@@ -1673,7 +1705,7 @@ def _resolve_variant_preview(
         return None
     if not working_dir:
         return None
-    from muphrid.tools.utility.t22_generate_preview import generate_preview
+    from muphrid.tools.utility.generate_preview import generate_preview
     p = Path(fits_path)
     render_mode = "linear_autostretch" if is_linear else "display_faithful"
     expected = Path(working_dir) / "previews" / f"preview_{p.stem}_{render_mode}.jpg"
@@ -1723,15 +1755,45 @@ def variant_snapshot(state: AstroState) -> dict[str, Any]:
             trailing.append(msg)
         else:
             break
-    trailing.reverse()  # restore chronological order
+    trailing.reverse() # restore chronological order
 
     if not trailing:
         return {}
 
+    # Authoritative effect detection: did each image-advancing tool call in
+    # this action step actually change paths.current_image? Derived from the
+    # state diff (pre_action_image captured by auto_checkpoint vs the live
+    # current_image) rather than from scanning ToolMessage content. The
+    # stuck-loop detector reads tool_effects to collapse no-op calls. Scoped
+    # to current_image_writer_names() so tools that legitimately leave the
+    # working image unchanged (analyze_image, save_checkpoint) are never
+    # mistaken for no-ops. Errored calls are excluded — the detector handles
+    # those via its own error-collapsing.
+    effects_update: dict[str, Any] = {}
+    before = state.get("pre_action_image")
+    after = (state.get("paths") or {}).get("current_image")
+    if before is not None:
+        writers = current_image_writer_names()
+        advancing = [
+            m for m in trailing
+            if m.name in writers and getattr(m, "status", None) != "error"
+        ]
+        if len(advancing) == 1:
+            effects_update = {
+                "tool_effects": {advancing[0].tool_call_id: after != before}
+            }
+        elif len(advancing) > 1:
+            # Multiple image-advancing calls in one step: the merged
+            # current_image can't be attributed to a single call, so don't
+            # risk a false no-op — record them all as having had an effect.
+            effects_update = {
+                "tool_effects": {m.tool_call_id: True for m in advancing}
+            }
+
     # Filter to HITL-mapped tools only
     hitl_msgs = [m for m in trailing if m.name in TOOL_TO_HITL]
     if not hitl_msgs:
-        return {}
+        return effects_update
 
     phase = state.get("phase", ProcessingPhase.INGEST)
     raw_pool = list(state.get("variant_pool", []) or [])
@@ -1771,8 +1833,8 @@ def variant_snapshot(state: AstroState) -> dict[str, Any]:
     # for HITL gate variants; _select_visible_refs reads it directly when
     # building the VLM view, so there is no separate mirror to maintain.
     if snapshotted_any or pool_changed:
-        return {"variant_pool": new_pool}
-    return {}
+        return {**effects_update, "variant_pool": new_pool}
+    return effects_update
 
 
 # ── variant promotion ────────────────────────────────────────────────────────
@@ -1801,7 +1863,7 @@ def build_variant_promotion_update(
       - paths.current_image := variant.file_path
       - variant_pool := []
       - visual_context := <existing> + phase_carry entry for the approved variant
-      - metadata.last_committed_variant := {id, file_path}  (race-fix signal:
+      - metadata.last_committed_variant := {id, file_path} (race-fix signal:
         lets commit_variant detect "already promoted via HITL" when the pool
         has been cleared and return idempotent success instead of an error)
 
@@ -1955,7 +2017,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
     # ── No HITL tool found in recent messages ────────────────────────
     if hitl_key is None:
         if not review_open:
-            return {}  # no HITL mapping, no active conversation — pass through
+            return {} # no HITL mapping, no active conversation — pass through
 
         # Active review: agent called a non-HITL tool (analyze_image, present_images)
         # Let it pass through so the agent sees the result.
@@ -2015,10 +2077,10 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
             # the current pool before it keeps experimenting.
             import os
             silent_limit = int(os.environ.get("MAX_SILENT_HITL_TOOLS", "3"))
-            updated_session = review_ctl.increment_tool_runs_since_human(
+            updated_session = review_ctl.increment_tool_runs_since_hitl(
                 state.get("review_session"),
             )
-            tool_count = review_ctl.tool_runs_since_human(updated_session)
+            tool_count = review_ctl.tool_runs_since_hitl(updated_session)
             if review_ctl.silent_tool_limit_reached(updated_session, silent_limit):
                 logger.warning(
                     f"HITL tool-run backstop tripped: {tool_count} "
@@ -2035,7 +2097,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                 )
             logger.info(
                 f"HITL tool {tool_name} re-executed "
-                f"(tool_runs_since_human={tool_count}/{silent_limit}) — "
+                f"(tool_runs_since_hitl={tool_count}/{silent_limit}) — "
                 f"letting agent analyze new result"
             )
             return {"review_session": updated_session}
@@ -2127,7 +2189,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                     state.get("review_session"),
                     status="awaiting_agent_response",
                     last_human_event=human_event,
-                    tool_runs_since_human=0,
+                    tool_runs_since_hitl=0,
                     visible_response_required=True,
                 ),
             }
@@ -2152,7 +2214,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                     state.get("review_session"),
                     status="awaiting_human_approval",
                     last_human_event=human_event,
-                    tool_runs_since_human=0,
+                    tool_runs_since_hitl=0,
                     visible_response_required=True,
                 ),
             }
@@ -2160,7 +2222,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
         _active_hitl_key, active_tool_name = review_ctl.active_review_tool(state)
         if active_tool_name == "export_final":
             try:
-                from muphrid.tools.utility.t24_export import commit_export_update
+                from muphrid.tools.utility.export import commit_export_update
 
                 commit_update, commit_summary = commit_export_update(
                     state,
@@ -2181,7 +2243,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                         state.get("review_session"),
                         status="awaiting_agent_response",
                         last_human_event=human_event,
-                        tool_runs_since_human=0,
+                        tool_runs_since_hitl=0,
                         visible_response_required=True,
                     ),
                 }
@@ -2247,7 +2309,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                     state.get("review_session"),
                     status="awaiting_human_approval",
                     last_human_event=human_event,
-                    tool_runs_since_human=0,
+                    tool_runs_since_hitl=0,
                     visible_response_required=True,
                 ),
             }
@@ -2277,7 +2339,7 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
                     state.get("review_session"),
                     status="awaiting_curation",
                     last_human_event=human_event,
-                    tool_runs_since_human=0,
+                    tool_runs_since_hitl=0,
                     visible_response_required=True,
                 ),
             }
@@ -2330,10 +2392,16 @@ def hitl_check(state: AstroState) -> dict[str, Any]:
 # Text-only responses mean the model is hesitating, narrating, or stuck.
 # Always nudge it to act.
 
+# Factual observation, not prescription. The agent reads its own message
+# history; this HumanMessage tells it what the system observed about the
+# previous turn. The agent reasons over the same state and tool context it
+# already has — no "call X" or "do not Y" coaching. The hard backstop is
+# the consecutive_text_only counter that raises NudgeLimitError after
+# MAX_AUTONOMOUS_NUDGES turns, so this nudge does not need to push the
+# agent toward any specific action.
 _AUTONOMOUS_NUDGE = (
-    "Either call a tool to continue processing, or call advance_phase "
-    "to move to the next phase. Do not respond with text without "
-    "calling a tool."
+    "[system] The previous turn produced no tool call. "
+    "State and the available tools are unchanged from before that turn."
 )
 
 
@@ -2368,9 +2436,9 @@ def agent_chat(state: AstroState) -> dict[str, Any]:
                 or msg.additional_kwargs.get("is_hitl_turn_policy")
             )
         ):
-            continue  # skip our own nudge injections
+            continue # skip our own nudge injections
         else:
-            break  # tool results, HITL feedback, etc. reset the counter
+            break # tool results, HITL feedback, etc. reset the counter
 
     if consecutive_text_only >= max_nudges:
         raise NudgeLimitError(

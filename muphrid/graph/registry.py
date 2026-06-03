@@ -19,68 +19,70 @@ from muphrid.graph.state import ProcessingPhase
 
 # ── Imports: Preprocessing ────────────────────────────────────────────────────
 
-from muphrid.tools.preprocess.t02_masters import build_masters
-from muphrid.tools.preprocess.t02b_convert_sequence import convert_sequence
-from muphrid.tools.preprocess.t03_calibrate import calibrate
-from muphrid.tools.preprocess.t04_register import siril_register
-from muphrid.tools.preprocess.t05_analyze_frames import analyze_frames
-from muphrid.tools.preprocess.t06_select_frames import select_frames
-from muphrid.tools.preprocess.t07_stack import siril_stack
-from muphrid.tools.preprocess.t08_crop import auto_crop
+from muphrid.tools.preprocess.masters import build_masters
+from muphrid.tools.preprocess.convert_sequence import convert_sequence
+from muphrid.tools.preprocess.calibrate import calibrate
+from muphrid.tools.preprocess.register import siril_register
+from muphrid.tools.preprocess.analyze_frames import analyze_frames
+from muphrid.tools.preprocess.select_frames import select_frames
+from muphrid.tools.preprocess.stack import siril_stack
+from muphrid.tools.preprocess.crop import auto_crop
 
 # ── Imports: Linear ───────────────────────────────────────────────────────────
 
-from muphrid.tools.linear.t09_gradient import remove_gradient
-from muphrid.tools.linear.t10_color_calibrate import color_calibrate
-from muphrid.tools.linear.t11_green_noise import remove_green_noise
-from muphrid.tools.linear.t12_noise_reduction import noise_reduction
-from muphrid.tools.linear.t13_deconvolution import deconvolution
+from muphrid.tools.linear.gradient import remove_gradient
+from muphrid.tools.linear.color_calibrate import color_calibrate
+from muphrid.tools.linear.green_noise import remove_green_noise
+from muphrid.tools.linear.noise_reduction import noise_reduction
+from muphrid.tools.linear.deconvolution import deconvolution
 
 # ── Imports: Stretch ──────────────────────────────────────────────────────────
 
-from muphrid.tools.nonlinear.t14_stretch import stretch_image, select_stretch_variant
+from muphrid.tools.nonlinear.stretch import stretch_image, select_stretch_variant
 
 # ── Imports: Non-linear ───────────────────────────────────────────────────────
 
-from muphrid.tools.nonlinear.t15_star_removal import star_removal
-from muphrid.tools.nonlinear.t16_curves import curves_adjust
-from muphrid.tools.nonlinear.t17_local_contrast import local_contrast_enhance
-from muphrid.tools.nonlinear.t18_saturation import saturation_adjust
-from muphrid.tools.nonlinear.t19_star_restoration import star_restoration
-from muphrid.tools.nonlinear.t38_hsv_adjust import hsv_adjust
-from muphrid.tools.scikit.t25_create_mask import create_mask
-from muphrid.tools.scikit.t26_reduce_stars import reduce_stars
-from muphrid.tools.scikit.t27_multiscale import multiscale_process
-from muphrid.tools.scikit.t41_selective_star_reblend import selective_star_reblend
-from muphrid.tools.scikit.t42_enhance_star_color import enhance_star_color
-from muphrid.tools.nonlinear.t31_checkpoint import save_checkpoint, restore_checkpoint
+from muphrid.tools.nonlinear.star_removal import star_removal
+from muphrid.tools.nonlinear.curves import curves_adjust
+from muphrid.tools.nonlinear.local_contrast import local_contrast_enhance
+from muphrid.tools.nonlinear.saturation import saturation_adjust
+from muphrid.tools.nonlinear.star_restoration import star_restoration
+from muphrid.tools.nonlinear.hsv_adjust import hsv_adjust
+from muphrid.tools.scikit.create_mask import create_mask
+from muphrid.tools.scikit.reduce_stars import reduce_stars
+from muphrid.tools.scikit.multiscale import multiscale_process
+from muphrid.tools.scikit.selective_star_reblend import selective_star_reblend
+from muphrid.tools.scikit.enhance_star_color import enhance_star_color
+from muphrid.tools.nonlinear.checkpoint import save_checkpoint, restore_checkpoint
 
 # ── Imports: Export ───────────────────────────────────────────────────────────
 
-from muphrid.tools.utility.t24_export import export_final
+from muphrid.tools.utility.export import export_final
 
 # ── Imports: Utility (available in every gate) ────────────────────────────────
 
-from muphrid.tools.utility.t20_analyze import analyze_image
-from muphrid.tools.utility.t21_plate_solve import plate_solve
-from muphrid.tools.utility.t40_analyze_star_population import analyze_star_population
-from muphrid.tools.utility.t23_pixel_math import pixel_math
-from muphrid.tools.utility.t28_extract_narrowband import extract_narrowband
-from muphrid.tools.utility.t29_resolve_target import resolve_target
-from muphrid.tools.utility.t30_advance_phase import advance_phase
-from muphrid.tools.utility.t31_commit_variant import commit_variant
-from muphrid.tools.utility.t32_present_images import present_images
-from muphrid.tools.utility.t34_masked_process import masked_process
-from muphrid.tools.utility.t35_hdr_composite import hdr_composite
-from muphrid.tools.utility.t36_rewind_phase import rewind_phase
-from muphrid.tools.utility.t37_flag_dataset_issue import flag_dataset_issue
-from muphrid.tools.utility.t39_present_for_review import present_for_review
+from muphrid.tools.utility.analyze import analyze_image
+from muphrid.tools.utility.compare_images import compare_images
+from muphrid.tools.utility.plate_solve import plate_solve
+from muphrid.tools.utility.analyze_star_population import analyze_star_population
+from muphrid.tools.utility.pixel_math import pixel_math
+from muphrid.tools.utility.extract_narrowband import extract_narrowband
+from muphrid.tools.utility.resolve_target import resolve_target
+from muphrid.tools.utility.advance_phase import advance_phase
+from muphrid.tools.utility.commit_variant import commit_variant
+from muphrid.tools.utility.present_images import present_images
+from muphrid.tools.utility.masked_process import masked_process
+from muphrid.tools.utility.hdr_composite import hdr_composite
+from muphrid.tools.utility.rewind_phase import rewind_phase
+from muphrid.tools.utility.flag_dataset_issue import flag_dataset_issue
+from muphrid.tools.utility.present_for_review import present_for_review
 
 
 # ── Tool groups ───────────────────────────────────────────────────────────────
 
 UTILITY_TOOLS = [
     analyze_image,
+    compare_images,
     analyze_star_population,
     plate_solve,
     pixel_math,
@@ -96,11 +98,11 @@ UTILITY_TOOLS = [
     present_for_review,
     # analyze_frames and create_mask used to live in ANALYSIS and NONLINEAR
     # respectively, but they are phase-agnostic diagnostics/primitives:
-    #   - analyze_frames reads the registration cache; agents reach for it
-    #     during REGISTRATION to check register quality, not just ANALYSIS.
-    #   - create_mask is a pure companion to pixel_math (which is already a
-    #     utility). Masked blending is legitimate in STRETCH (HDR masked
-    #     stretch) and LINEAR (masked gradient removal), not just NONLINEAR.
+    # - analyze_frames reads the registration cache; agents reach for it
+    # during REGISTRATION to check register quality, not just ANALYSIS.
+    # - create_mask is a pure companion to pixel_math (which is already a
+    # utility). Masked blending is legitimate in STRETCH (HDR masked
+    # stretch) and LINEAR (masked gradient removal), not just NONLINEAR.
     # Moving them here removes phase-gate friction for workflows a human
     # would reach for without thinking about phases. See v2_framework_fixes
     # Issue #3b / #3c.
@@ -112,8 +114,7 @@ UTILITY_TOOLS = [
 # Preprocessing: strict per-phase gating. Each step physically depends on the
 # output of the previous — no cross-phase backtracking. Within-phase iteration
 # is valid (e.g. rebuild a master, re-register with different params, re-select
-# + restack). Research confirms this is how PixInsight, Siril, and expert
-# astrophotographers work.
+# + restack). This mirrors how Siril and expert astrophotographers work.
 
 CALIBRATION_TOOLS = [
     build_masters,
@@ -180,19 +181,19 @@ EXPORT_TOOLS = [
 
 _PHASE_TO_GATE: dict[ProcessingPhase, list] = {
     # Preprocessing: strict per-phase gating (sequential physical dependencies)
-    ProcessingPhase.INGEST:       [],                # resolve_target via UTILITY_TOOLS
-    ProcessingPhase.CALIBRATION:  CALIBRATION_TOOLS,
+    ProcessingPhase.INGEST: [], # resolve_target via UTILITY_TOOLS
+    ProcessingPhase.CALIBRATION: CALIBRATION_TOOLS,
     ProcessingPhase.REGISTRATION: REGISTRATION_TOOLS,
-    ProcessingPhase.ANALYSIS:     ANALYSIS_TOOLS,
-    ProcessingPhase.STACKING:     STACKING_TOOLS,
+    ProcessingPhase.ANALYSIS: ANALYSIS_TOOLS,
+    ProcessingPhase.STACKING: STACKING_TOOLS,
     # Post-preprocessing: fluid iteration, backtracking, creativity
-    ProcessingPhase.LINEAR:       LINEAR_TOOLS,
-    ProcessingPhase.STRETCH:      STRETCH_TOOLS,
-    ProcessingPhase.NONLINEAR:    NONLINEAR_TOOLS,
-    ProcessingPhase.EXPORT:       EXPORT_TOOLS,
+    ProcessingPhase.LINEAR: LINEAR_TOOLS,
+    ProcessingPhase.STRETCH: STRETCH_TOOLS,
+    ProcessingPhase.NONLINEAR: NONLINEAR_TOOLS,
+    ProcessingPhase.EXPORT: EXPORT_TOOLS,
     # Terminal
-    ProcessingPhase.COMPLETE:     [],
-    ProcessingPhase.REVIEW:       [],
+    ProcessingPhase.COMPLETE: [],
+    ProcessingPhase.REVIEW: [],
 }
 
 
@@ -311,7 +312,7 @@ def _assert_no_schema_drift() -> None:
             func_only = func_params - schema_fields
             if schema_only or func_only:
                 drifts.append(
-                    f"  - {t.name}: schema-only={sorted(schema_only) or '∅'}, "
+                    f" - {t.name}: schema-only={sorted(schema_only) or '∅'}, "
                     f"func-only={sorted(func_only) or '∅'}"
                 )
 
@@ -339,7 +340,7 @@ def _assert_image_space_writers() -> None:
     fails to also write metadata.image_space in the SAME Command.update.
 
     metadata.image_space is the authoritative render-state contract — the
-    Gradio preview generator and t24_export both consult it to choose the
+    Gradio preview generator and export both consult it to choose the
     autostretch / source-profile path. If a tool advances current_image
     without also advancing image_space, downstream renders bind to a stale
     value and produce visually different artifacts than what the human
@@ -359,12 +360,12 @@ def _assert_image_space_writers() -> None:
         is a name reference, not a dict literal) are NOT caught by this
         check because they don't carry a literal "current_image" key —
         but they MUST emit `metadata.image_space` as a delta themselves
-        (see t34_masked_process and t35_hdr_composite for the worked
+        (see masked_process and hdr_composite for the worked
         examples). That part is enforced by code review and the doctrine
         in CLAUDE.md.
 
       - Restore branches that conditionally write paths in one branch
-        and metadata in another (see t31_checkpoint) are caught only if
+        and metadata in another (see checkpoint) are caught only if
         the branches happen to be in the same Command.update call — they
         always are by construction in this codebase.
 
@@ -443,7 +444,7 @@ def _assert_image_space_writers() -> None:
                     # Report the metadata value's AST type so we can
                     # distinguish "no metadata key at all" from "metadata
                     # is a variable name" (the bug pattern that bit us
-                    # in t14_stretch — `"metadata": metadata_delta`
+                    # in stretch — `"metadata": metadata_delta`
                     # rather than an inline dict literal).
                     if metadata_val is None:
                         kind = "no 'metadata' key in update payload"
@@ -470,7 +471,7 @@ def _assert_image_space_writers() -> None:
                     except TypeError:
                         src_file = "<unknown>"
                     drifts.append(
-                        f"  - {t.name} ({src_file}, near line {node.lineno}): "
+                        f" - {t.name} ({src_file}, near line {node.lineno}): "
                         f"{kind}"
                     )
 
@@ -478,7 +479,7 @@ def _assert_image_space_writers() -> None:
         msg = (
             "image_space writer-drift detected. metadata.image_space is the "
             "authoritative render-state contract: Gradio preview and "
-            "t24_export both key off it to choose autostretch / ICC source "
+            "export both key off it to choose autostretch / ICC source "
             "profile. Every tool that advances paths.current_image must "
             "also advance metadata.image_space — either to a literal "
             "'linear' / 'display', or by reading state.metadata.image_space "
@@ -489,6 +490,108 @@ def _assert_image_space_writers() -> None:
 
 
 _assert_image_space_writers()
+
+
+_CURRENT_IMAGE_WRITERS: frozenset[str] | None = None
+
+
+def current_image_writer_names() -> frozenset[str]:
+    """Names of registered tools whose Command.update advances paths.current_image.
+
+    Derived structurally from each tool's source — the same AST basis as the
+    image_space writer guard. The orchestration's effect detector (see
+    variant_snapshot) uses this to scope no-op detection to tools whose job is
+    to advance the working image, so tools that legitimately leave
+    current_image unchanged (analyze_image, save_checkpoint, ...) are never
+    mistaken for no-ops.
+
+    Self-contained on purpose: it re-walks rather than sharing the guard's
+    internals, so the critical import-time guard is never coupled to this
+    diagnostic. Compound tools that emit a name-reference `paths` (rather than
+    a dict literal) are not detected — the same documented blind spot as the
+    guard — which only costs those tools no-op collapsing, never correctness.
+
+    Memoized: registered tool sources do not change at runtime.
+    """
+    global _CURRENT_IMAGE_WRITERS
+    if _CURRENT_IMAGE_WRITERS is not None:
+        return _CURRENT_IMAGE_WRITERS
+
+    import ast
+    import textwrap
+
+    def _dict_has_key(d: ast.Dict, key: str) -> bool:
+        return any(
+            isinstance(k, ast.Constant) and k.value == key for k in d.keys
+        )
+
+    def _dict_get(d: ast.Dict, key: str) -> ast.expr | None:
+        for k, v in zip(d.keys, d.values):
+            if isinstance(k, ast.Constant) and k.value == key:
+                return v
+        return None
+
+    def _writes_current_image(t) -> bool:
+        func = getattr(t, "func", None) or getattr(t, "coroutine", None)
+        if func is None:
+            return False
+        try:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+        except (OSError, TypeError, SyntaxError):
+            return False
+
+        # Resolve `update = {...}` / `update: dict = {...}` locals so that
+        # tools building the payload in a variable before
+        # `return Command(update=update)` are covered, not just inline-dict
+        # writers. (restore_checkpoint and commit_variant use this shape.)
+        assigned: dict[str, ast.Dict] = {}
+        for node in ast.walk(tree):
+            target = value = None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target, value = node.targets[0], node.value
+            elif isinstance(node, ast.AnnAssign):
+                target, value = node.target, node.value
+            if isinstance(target, ast.Name) and isinstance(value, ast.Dict):
+                assigned[target.id] = value
+
+        def _resolve(expr: ast.expr | None) -> ast.Dict | None:
+            if isinstance(expr, ast.Dict):
+                return expr
+            if isinstance(expr, ast.Name):
+                return assigned.get(expr.id)
+            return None
+
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "Command"):
+                continue
+            update_kw = next(
+                (kw for kw in node.keywords if kw.arg == "update"), None
+            )
+            if update_kw is None:
+                continue
+            update_dict = _resolve(update_kw.value)
+            if update_dict is None:
+                continue
+            paths_val = _resolve(_dict_get(update_dict, "paths"))
+            if paths_val is not None and _dict_has_key(paths_val, "current_image"):
+                return True
+        return False
+
+    seen: set[str] = set()
+    names: set[str] = set()
+    for group in [CALIBRATION_TOOLS, REGISTRATION_TOOLS, ANALYSIS_TOOLS,
+                  STACKING_TOOLS, LINEAR_TOOLS, STRETCH_TOOLS,
+                  NONLINEAR_TOOLS, EXPORT_TOOLS, UTILITY_TOOLS]:
+        for t in group:
+            if t.name in seen:
+                continue
+            seen.add(t.name)
+            if _writes_current_image(t):
+                names.add(t.name)
+    _CURRENT_IMAGE_WRITERS = frozenset(names)
+    return _CURRENT_IMAGE_WRITERS
 
 
 def all_tools() -> list:

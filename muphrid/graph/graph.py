@@ -1,7 +1,7 @@
 """
 Graph assembly — wires nodes and edges into a compiled StateGraph.
 
-    phase_router → agent → action → hitl_check → agent  (ReAct loop)
+    phase_router → agent → action → hitl_check → agent (ReAct loop)
                      │
                      └── (no tool_calls) → phase_advance → phase_router
 
@@ -66,7 +66,7 @@ def _make_model_factory(base_model=None):
     When `base_model` is passed explicitly (e.g. tests), invalidation is
     disabled — the caller owns the lifecycle.
     """
-    pinned = base_model  # explicit override → no invalidation
+    pinned = base_model # explicit override → no invalidation
     state: dict = {
         "base_model": pinned,
         "fingerprint": _current_model_fingerprint() if pinned is None else None,

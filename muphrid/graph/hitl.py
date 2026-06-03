@@ -131,7 +131,7 @@ def vlm_window_cap() -> int:
 # image will inform a decision the metrics cannot.
 
 _VLM_AUTO_PHASES = frozenset({
-    "stacking",   # current_image becomes meaningful after siril_stack
+    "stacking", # current_image becomes meaningful after siril_stack
     "linear",
     "stretch",
     "nonlinear",
@@ -167,43 +167,48 @@ def vlm_phase_eligible(phase) -> bool:
 # they are diagnostic, not transformative.
 
 TOOL_TO_HITL: dict[str, str] = {
+    # The HITL key is the tool function name. Identity mapping — there's no
+    # separate sequence vocabulary to maintain. A tool appears here iff it
+    # has a configurable HITL gate; absence means "no HITL gate, no review."
+    # Utility/diagnostic tools (analyze_image, etc.) are intentionally absent.
+    #
+    # Export gating note: when export_final's gate is enabled it stages the
+    # rendered JPG into a tentative directory for human review; approval
+    # commits the tentative files into the final output_dir.
+
     # Calibration
-    "build_masters":          "T02_masters",
-    "convert_sequence":       "T02b_convert",
-    "calibrate":              "T03_calibrate",
+    "build_masters": "build_masters",
+    "convert_sequence": "convert_sequence",
+    "calibrate": "calibrate",
     # Registration
-    "siril_register":         "T04_register",
+    "siril_register": "siril_register",
     # Analysis
-    "analyze_frames":         "T05_analyze",
+    "analyze_frames": "analyze_frames",
     # Stacking
-    "select_frames":          "T06_select",
-    "siril_stack":            "T07_stack",
-    "auto_crop":              "T08_crop",
+    "select_frames": "select_frames",
+    "siril_stack": "siril_stack",
+    "auto_crop": "auto_crop",
     # Linear
-    "remove_gradient":        "T09_gradient",
-    "color_calibrate":        "T10_color",
-    "remove_green_noise":     "T11_green",
-    "noise_reduction":        "T12_denoise",
-    "deconvolution":          "T13_decon",
+    "remove_gradient": "remove_gradient",
+    "color_calibrate": "color_calibrate",
+    "remove_green_noise": "remove_green_noise",
+    "noise_reduction": "noise_reduction",
+    "deconvolution": "deconvolution",
     # Stretch
-    "stretch_image":          "T14_stretch",
+    "stretch_image": "stretch_image",
     # Non-linear
-    "star_removal":           "T15_star_removal",
-    "curves_adjust":          "T16_curves",
-    "local_contrast_enhance": "T17_local_contrast",
-    "saturation_adjust":      "T18_saturation",
-    "star_restoration":       "T19_star_restoration",
-    "create_mask":            "T25_mask",
-    "reduce_stars":           "T26_reduce_stars",
-    "multiscale_process":     "T27_multiscale",
-    "selective_star_reblend": "T41_selective_star_reblend",
-    "enhance_star_color":     "T42_enhance_star_color",
-    # Export — gated as a final review on the actual JPG export artifact
-    # (not on a FITS-derived preview). When the gate is enabled, export_final
-    # produces the export to a tentative subdirectory; the human reviews
-    # the rendered JPG; on approval, the backend moves the tentative files
-    # into the final output_dir.
-    "export_final":           "T24_export",
+    "star_removal": "star_removal",
+    "curves_adjust": "curves_adjust",
+    "local_contrast_enhance": "local_contrast_enhance",
+    "saturation_adjust": "saturation_adjust",
+    "star_restoration": "star_restoration",
+    "create_mask": "create_mask",
+    "reduce_stars": "reduce_stars",
+    "multiscale_process": "multiscale_process",
+    "selective_star_reblend": "selective_star_reblend",
+    "enhance_star_color": "enhance_star_color",
+    # Export
+    "export_final": "export_final",
 }
 
 

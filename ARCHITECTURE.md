@@ -19,19 +19,19 @@ target, sky quality, equipment notes
 LangGraph processing graph
     |
     +--> phase_router
-    |        selects phase-specific tool set
+    | selects phase-specific tool set
     |
     +--> agent
-    |        LLM with current phase tools bound
+    | LLM with current phase tools bound
     |
     +--> auto_checkpoint
-    |        bookmarks image before mutating tools
+    | bookmarks image before mutating tools
     |
     +--> action
-    |        executes tool calls
+    | executes tool calls
     |
     +--> variant_snapshot
-    |        captures reviewable image variants
+    | captures reviewable image variants
     |
     +--> hitl_check
              opens or resumes human review gates
@@ -104,9 +104,9 @@ Key graph nodes:
 
 - **`phase_router`** chooses whether to continue and which tools are available.
 - **`agent`** builds the prompt, attaches state-derived visual context, invokes the model, and enforces phase/tool gates.
-- **`auto_checkpoint`** captures pre-call image state before post-stack mutating tools.
+- **`auto_checkpoint`** captures pre-call image state before post-stack mutating tools, and records the pre-action working-image pointer used for effect detection.
 - **`action`** executes LangChain tools through `ToolNode`.
-- **`variant_snapshot`** captures HITL-mapped tool outputs into `variant_pool`.
+- **`variant_snapshot`** captures HITL-mapped tool outputs into `variant_pool`, and records per-call tool effects (did the call change `paths.current_image`) into `tool_effects` from the pre/post state diff.
 - **`hitl_check`** opens review sessions, interrupts for human input, validates approvals, and promotes approved variants.
 - **`agent_chat`** handles text-only responses outside active review.
 
@@ -129,6 +129,7 @@ Important state fields:
 | `review_session` | Canonical HITL review state and proposal contract |
 | `visual_context` | Non-variant images the model should see |
 | `regression_warnings` | Metric regressions detected during analysis |
+| `tool_effects` | Per-call record of whether a tool changed the working image; drives no-op loop detection |
 
 Reducers matter. Some fields are deep-merged so parallel tool calls compose safely (`paths`, `metadata`). Some are replace-aware (`metrics`). Lists such as `variant_pool` are plain replace semantics because the writer recomputes the full list.
 
@@ -140,11 +141,11 @@ Tool implementations live under `muphrid/tools/`.
 
 ```text
 tools/
-  preprocess/   calibration, registration, stacking
-  linear/       linear-stage image processing
-  nonlinear/    stretch-adjacent and nonlinear image processing
-  scikit/       local Python/scikit-image processing tools
-  utility/      analysis, export, checkpoints, review, masks, previews
+  preprocess/ calibration, registration, stacking
+  linear/ linear-stage image processing
+  nonlinear/ stretch-adjacent and nonlinear image processing
+  scikit/ local Python/scikit-image processing tools
+  utility/ analysis, export, checkpoints, review, masks, previews
 ```
 
 Each tool is a LangChain tool with a Pydantic `args_schema`. The registry checks for schema/function drift at startup so a tool cannot silently expose parameters the function does not accept.
@@ -186,6 +187,8 @@ The agent is expected to inspect outcomes before moving on. `analyze_image` and 
 - histogram statistics
 
 `muphrid/graph/regression.py` compares image metrics against prior analysis snapshots. When a metric worsens, the graph records a `regression_warning`. The warning does not automatically block progress; it gives the agent evidence to decide whether to accept the tradeoff, restore a checkpoint, rewind a phase, or continue.
+
+Where `analyze_image` is a deep dive on the current image (and sets the regression baseline), `compare_images` is its read-only, N-way counterpart: given handles the agent already has — variant ids, checkpoint names, or `"current"` (never paths) — it computes each image's metrics fresh and returns a metric-major table tagged with each image's render space. It changes no state, so the agent can contrast candidates (e.g. GraXpert vs Siril gradient variants) without promoting any of them.
 
 ---
 
@@ -236,7 +239,7 @@ This distinction prevents the UI and graph from disagreeing about what is action
 
 ## Variant Pool and Proposals
 
-At reviewable stages, tool outputs are snapshotted into `runs/<thread-id>/variants/` with stable ids such as `T09_v1` or `T14_v3`.
+At reviewable stages, tool outputs are snapshotted into `runs/<thread-id>/variants/` with stable ids such as `remove_gradient_v1` or `stretch_image_v3`.
 
 The agent can:
 
@@ -270,7 +273,7 @@ The UI is intentionally not the policy authority. It renders state from the grap
 - approval controls from the proposal candidates
 - resume/recovery state from LangGraph checkpoints
 
-If a saved checkpoint predates Review Mode and has `active_hitl=True` without `review_session`, the UI refuses to consume a resume value as approval. That is deliberate: old implicit states are not safe approval contracts.
+If a saved checkpoint has `active_hitl=True` without an open `review_session`, the UI refuses to consume a resume value as approval. That is deliberate: inconsistent state is not a safe approval contract.
 
 ---
 
@@ -340,7 +343,7 @@ Runtime Gradio settings can override many config values without rebuilding the g
 
 **Why not fully automate every subjective choice?** Some choices are aesthetic: stretch intensity, contrast, star handling, saturation. The agent should provide data and recommendations, but the human can remain in the loop where taste matters.
 
-**Why open-source tools?** The project is intended to be inspectable and reproducible. The north star is PixInsight-quality output, but built from tools that can be orchestrated programmatically.
+**Why open-source tools?** The project is intended to be inspectable and reproducible, and built from tools that can be orchestrated programmatically.
 
 ---
 

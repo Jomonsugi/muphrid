@@ -19,12 +19,13 @@ What this exercises (not a full pipeline run):
      We don't run the underlying tools (they'd need Siril); we rely on
      the static drift check + spot-check the literal payloads.
 
-  3. State authority on read sites — t24_export refuses when state's
+  3. State authority on read sites — export refuses when state's
      image_space is missing or invalid. analyze_image does NOT clobber
      image_space (its metadata delta only touches last_analysis_snapshot).
 
-  4. Checkpoint round-trip — save_checkpoint records image_space alongside
-     path; restore_checkpoint refuses legacy bare-string entries.
+  4. Checkpoint round-trip — save_checkpoint and auto_checkpoint both build
+     entries via the single writer make_checkpoint_entry, which records
+     image_space alongside path and is the only image_space guard.
 
   5. commit_export round-trip — refuses without tentative_export, moves
      files on success, clears the tentative marker.
@@ -51,7 +52,7 @@ _failures: list[str] = []
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     status = "ok" if ok else "FAIL"
-    msg = f"  {status} {name}"
+    msg = f" {status} {name}"
     if detail:
         msg += f" - {detail}"
     print(msg)
@@ -161,15 +162,15 @@ def test_registry_imports_clean() -> None:
 
 
 def test_export_refuses_missing_image_space() -> None:
-    """t24_export.export_final must refuse when state.metadata.image_space is missing."""
+    """export.export_final must refuse when state.metadata.image_space is missing."""
     print("\n[3] export_final refuses on missing image_space")
 
-    from muphrid.tools.utility.t24_export import export_final
+    from muphrid.tools.utility.export import export_final
 
     state = {
         "dataset": {"working_dir": tempfile.mkdtemp(prefix="img_space_test_")},
         "paths": {"current_image": "/nonexistent.fit"},
-        "metadata": {},  # no image_space
+        "metadata": {}, # no image_space
         "metrics": {"is_linear_estimate": True},
     }
 
@@ -205,8 +206,8 @@ def test_export_picks_correct_source_profile() -> None:
     """
     print("\n[4] export_final picks ICC source profile from image_space")
 
-    from muphrid.tools.utility import t24_export
-    src = inspect_source(t24_export.export_final.func)
+    from muphrid.tools.utility import export
+    src = inspect_source(export.export_final.func)
     check(
         "display path → sRGB",
         '"sRGBlinear" if incoming_image_space == "linear" else "sRGB"' in src,
@@ -217,19 +218,19 @@ def test_export_picks_correct_source_profile() -> None:
 def test_export_review_is_system_owned() -> None:
     """
     Final export review must be system-owned: export_final derives tentative
-    staging from T24_export HITL policy, commit_export is not model-bound, and
+    staging from export_final HITL policy, commit_export is not model-bound, and
     backend commit updates metadata without mutating paths.current_image.
     """
     print("\n[4b] export review is system-owned")
 
     from muphrid.graph.registry import tools_for_phase
     from muphrid.graph.state import ProcessingPhase
-    from muphrid.tools.utility import t24_export
+    from muphrid.tools.utility import export
 
-    src = inspect_source(t24_export.export_final.func)
+    src = inspect_source(export.export_final.func)
     check(
-        "export_final derives tentative from T24_export",
-        'is_enabled("T24_export")' in src and "effective_tentative" in src,
+        "export_final derives tentative from export_final",
+        'is_enabled("export_final")' in src and "effective_tentative" in src,
     )
 
     export_tool_names = {t.name for t in tools_for_phase(ProcessingPhase.EXPORT)}
@@ -263,7 +264,7 @@ def test_export_review_is_system_owned() -> None:
         },
     }
     try:
-        update, _summary = t24_export.commit_export_update(state, note="approved")
+        update, _summary = export.commit_export_update(state, note="approved")
         check("backend export commit does not mutate paths", "paths" not in update)
         check("backend export commit sets export_done", update["metadata"]["export_done"] is True)
     except Exception as e:
@@ -276,10 +277,10 @@ def test_preview_cache_is_render_mode_aware() -> None:
     """Preview filenames must differ for linear autostretch vs display faithful."""
     print("\n[4c] preview cache is render-mode aware")
 
-    from muphrid.tools.utility import t22_generate_preview
+    from muphrid.tools.utility import generate_preview
     import muphrid.gradio_app as gradio_app
 
-    preview_src = inspect_source(t22_generate_preview.generate_preview)
+    preview_src = inspect_source(generate_preview.generate_preview)
     gradio_src = inspect_source(gradio_app._convert_fits_to_preview)
     check(
         "generate_preview includes render-mode suffix",
@@ -306,8 +307,8 @@ def test_analyze_image_does_not_clobber_image_space() -> None:
     """
     print("\n[5] analyze_image preserves image_space")
 
-    from muphrid.tools.utility import t20_analyze
-    src = inspect_source(t20_analyze.analyze_image.func)
+    from muphrid.tools.utility import analyze
+    src = inspect_source(analyze.analyze_image.func)
     # Only one metadata literal in the body, and it must NOT contain image_space.
     check(
         "no image_space write in analyze_image",
@@ -326,13 +327,15 @@ def test_analyze_image_does_not_clobber_image_space() -> None:
 
 def test_checkpoint_save_restore_round_trip() -> None:
     """
-    save_checkpoint records {"path", "image_space"}. restore_checkpoint
-    refuses bare-string legacy entries. Both branches re-assert image_space
-    on restore.
+    All checkpoint entries are {"path", "image_space"}, built by the single
+    writer make_checkpoint_entry. save_checkpoint and the graph's
+    auto_checkpoint both go through it, so restore trusts the shape and
+    re-asserts image_space without defensive checks.
     """
     print("\n[6] checkpoint save/restore round-trip preserves image_space")
 
-    from muphrid.tools.nonlinear.t31_checkpoint import (
+    from muphrid.tools.nonlinear.checkpoint import (
+        make_checkpoint_entry,
         restore_checkpoint,
         save_checkpoint,
     )
@@ -372,15 +375,72 @@ def test_checkpoint_save_restore_round_trip() -> None:
     except Exception as e:
         check("restore re-asserts image_space", False, f"{type(e).__name__}: {e}")
 
-    # Legacy bare-string entry must be refused.
-    state["metadata"]["checkpoints"] = {"ck_legacy": str(fit)}
+    # The single writer is the only place the entry shape is constructed and
+    # the only place image_space is guarded. There is no bare-string format to
+    # support, so readers do not defensively re-check the shape.
+    entry = make_checkpoint_entry(str(fit), "linear")
+    check(
+        "make_checkpoint_entry builds {path, image_space}",
+        entry == {"path": str(fit), "image_space": "linear"},
+        f"entry={entry}",
+    )
     try:
-        restore_checkpoint.func(name="ck_legacy", state=state, tool_call_id="test")
-        check("legacy bare-string entry rejected", False, "did not raise")
-    except RuntimeError as e:
-        check("legacy bare-string entry rejected", "legacy" in str(e).lower())
+        make_checkpoint_entry(str(fit), "garbage")
+        check("make_checkpoint_entry refuses invalid image_space", False, "did not raise")
+    except ValueError:
+        check("make_checkpoint_entry refuses invalid image_space", True)
     except Exception as e:
-        check("legacy bare-string entry rejected", False, f"unexpected: {type(e).__name__}: {e}")
+        check(
+            "make_checkpoint_entry refuses invalid image_space",
+            False,
+            f"unexpected: {type(e).__name__}: {e}",
+        )
+
+    # The graph's auto_checkpoint must emit the SAME structured entry shape —
+    # this is the writer that historically wrote bare strings.
+    from langchain_core.messages import AIMessage
+
+    from muphrid.graph.nodes import auto_checkpoint
+    from muphrid.graph.state import ProcessingPhase
+
+    auto_state = {
+        "phase": ProcessingPhase.LINEAR,
+        "paths": {"current_image": str(fit)},
+        "metadata": {"image_space": "linear"},
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "remove_gradient",
+                    "args": {},
+                    "id": "call_1",
+                    "type": "tool_call",
+                }],
+            )
+        ],
+    }
+    auto_update = auto_checkpoint(auto_state)
+    auto_entries = (auto_update.get("metadata", {}).get("checkpoints") or {})
+    check(
+        "auto_checkpoint emits {path, image_space} entries",
+        bool(auto_entries)
+        and all(
+            isinstance(v, dict) and v.get("image_space") == "linear" and "path" in v
+            for v in auto_entries.values()
+        ),
+        f"entries={auto_entries}",
+    )
+
+    # If image_space is missing, auto_checkpoint records NO checkpoint entry
+    # rather than write an unrestorable one. (It may still emit the
+    # pre_action_image capture for the effect detector — that's orthogonal.)
+    auto_state_no_space = {**auto_state, "metadata": {}}
+    skipped = auto_checkpoint(auto_state_no_space)
+    check(
+        "auto_checkpoint records no checkpoint when image_space missing",
+        "checkpoints" not in skipped.get("metadata", {}),
+        f"got={skipped}",
+    )
 
 
 # ── 6. commit_export round-trip ──────────────────────────────────────────────
@@ -393,7 +453,7 @@ def test_commit_export_round_trip() -> None:
     """
     print("\n[7] commit_export tentative → final round-trip")
 
-    from muphrid.tools.utility.t24_export import commit_export
+    from muphrid.tools.utility.export import commit_export
 
     wd = tempfile.mkdtemp(prefix="commit_export_test_")
     final_dir = Path(wd) / "export"
@@ -470,20 +530,20 @@ def test_commit_export_round_trip() -> None:
 
 def test_stretch_writers_set_display() -> None:
     """
-    t14_stretch.stretch_image and select_stretch_variant must emit
+    stretch.stretch_image and select_stretch_variant must emit
     metadata.image_space="display" (the linear→display transition).
     Inspect the source instead of running Siril.
     """
     print("\n[8] stretch_image emits image_space='display'")
 
-    from muphrid.tools.nonlinear import t14_stretch
-    src = inspect_source(t14_stretch.stretch_image.func)
+    from muphrid.tools.nonlinear import stretch
+    src = inspect_source(stretch.stretch_image.func)
     check(
         'stretch_image: "image_space": "display"',
         '"image_space": "display"' in src,
     )
 
-    src2 = inspect_source(t14_stretch.select_stretch_variant.func)
+    src2 = inspect_source(stretch.select_stretch_variant.func)
     check(
         'select_stretch_variant: "image_space": "display"',
         '"image_space": "display"' in src2,
@@ -500,15 +560,15 @@ def test_linear_writers_set_linear() -> None:
     """
     print("\n[9] linear-stage writers emit image_space='linear'")
 
-    from muphrid.tools.preprocess import t07_stack, t08_crop
-    from muphrid.tools.linear import t09_gradient, t10_color_calibrate, t13_deconvolution
+    from muphrid.tools.preprocess import stack, crop
+    from muphrid.tools.linear import gradient, color_calibrate, deconvolution
 
     for tool, label in [
-        (t07_stack.siril_stack, "siril_stack"),
-        (t08_crop.auto_crop, "auto_crop"),
-        (t09_gradient.remove_gradient, "remove_gradient"),
-        (t10_color_calibrate.color_calibrate, "color_calibrate"),
-        (t13_deconvolution.deconvolution, "deconvolution"),
+        (stack.siril_stack, "siril_stack"),
+        (crop.auto_crop, "auto_crop"),
+        (gradient.remove_gradient, "remove_gradient"),
+        (color_calibrate.color_calibrate, "color_calibrate"),
+        (deconvolution.deconvolution, "deconvolution"),
     ]:
         src = inspect_source(tool.func)
         check(
@@ -538,7 +598,7 @@ def main() -> int:
     if _failures:
         print(f"FAIL — {len(_failures)} check(s) failed:")
         for f in _failures:
-            print(f"  - {f}")
+            print(f" - {f}")
         return 1
     print("All image_space contract tests passed.")
     return 0

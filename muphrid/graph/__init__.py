@@ -2,10 +2,10 @@
 Muphrid LangGraph — single agent with phase-gated tool binding.
 
 Public API:
-    build_graph()              — assemble the graph with a checkpointer
-    build_graph_with_sqlite()  — convenience: graph + SqliteSaver
-    AstroState                 — typed graph state
-    make_empty_state()         — fresh state factory
+    build_graph() — assemble the graph with a checkpointer
+    build_graph_with_sqlite() — convenience: graph + SqliteSaver
+    AstroState — typed graph state
+    make_empty_state() — fresh state factory
 
 Re-exports are loaded lazily so that importing a sibling submodule (e.g.
 ``muphrid.graph.state`` from a tool module) does not eagerly pull in

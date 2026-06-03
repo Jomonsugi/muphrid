@@ -8,11 +8,11 @@
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 """
 Gradio 6 async HITL interface for Muphrid.
@@ -63,7 +63,7 @@ from muphrid.graph.state import (
     build_initial_message,
     make_empty_state,
 )
-from muphrid.tools.preprocess.t01_ingest import ingest_dataset
+from muphrid.tools.preprocess.ingest import ingest_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ def _load_hitl_defaults() -> dict:
     try:
         import tomllib
     except ModuleNotFoundError:
-        import tomli as tomllib  # type: ignore[no-redef]
+        import tomli as tomllib # type: ignore[no-redef]
 
     config_path = Path(__file__).resolve().parent.parent / "hitl_config.toml"
     if config_path.exists():
@@ -90,7 +90,7 @@ def _load_equipment_defaults() -> dict:
     try:
         import tomllib
     except ModuleNotFoundError:
-        import tomli as tomllib  # type: ignore[no-redef]
+        import tomli as tomllib # type: ignore[no-redef]
 
     config_path = Path(__file__).resolve().parent.parent / "equipment.toml"
     if config_path.exists():
@@ -100,7 +100,7 @@ def _load_equipment_defaults() -> dict:
 
 
 def _load_processing_defaults() -> dict:
-    """Read defaults from processing.toml, with env var overrides for backwards compat."""
+    """Read defaults from processing.toml, with env var overrides for CI/runtime control."""
     from muphrid.config import _pcfg
     per_phase = _pcfg("limits", "per_phase") or {}
     return {
@@ -246,7 +246,7 @@ def _convert_fits_to_preview(
     helper takes a strict bool and assumes the caller has resolved it.
     See state.Metadata.image_space and CLAUDE.md.
     """
-    from muphrid.tools.utility.t22_generate_preview import generate_preview
+    from muphrid.tools.utility.generate_preview import generate_preview
 
     preview_paths = []
     for img in image_paths:
@@ -279,8 +279,8 @@ def _resolve_image_space(saved_values: dict) -> str:
     Read the authoritative image_space from a checkpoint snapshot. Refuses
     on missing/invalid — every writer of paths.current_image must also
     write metadata.image_space (enforced by registry._assert_image_space_writers).
-    A snapshot without image_space is a legacy checkpoint and cannot be
-    rendered faithfully. See CLAUDE.md (no-fallbacks-for-authoritative-state).
+    A snapshot without image_space cannot be rendered faithfully. See
+    CLAUDE.md (no-fallbacks-for-authoritative-state).
     """
     metadata = saved_values.get("metadata") or {}
     image_space = metadata.get("image_space")
@@ -583,7 +583,7 @@ def _parse_stream_chunks(
                                 profile = f.get("icc_profile", "?")
                                 path = f.get("path", "?")
                                 lines.append(f"- `{path}`")
-                                lines.append(f"  *{fmt} · {profile} · {size_mb} MB*")
+                                lines.append(f" *{fmt} · {profile} · {size_mb} MB*")
                             chat_messages.append({
                                 "role": "assistant",
                                 "content": "\n".join(lines),
@@ -640,7 +640,7 @@ async def _stream_graph(
 
     Two distinct UI surfaces populated from the HITL payload:
       * variant_pool — passive history (every variant produced this segment)
-      * proposal     — agent's curation (only what was passed to
+      * proposal — agent's curation (only what was passed to
                        present_for_review). Approve buttons attach here.
 
     The proposal is replaced fresh from each HITL payload. The pool can also
@@ -712,16 +712,15 @@ async def _stream_graph(
         # Main review gallery population + canonical labeling.
         #
         # Two invariants we hold here:
-        #   (1) Every agent-presented variant in the approve panel has a
-        #       gallery preview. Raw pool entries are shown only in the bottom
-        #       workbench filmstrip.
-        #   (2) Every gallery entry whose source matches a variant has the
-        #       variant id visible in its caption. This is the fix for
-        #       the user's "neither matches the image" confusion: the
-        #       Approve button says "T14_v1" so the gallery caption needs
-        #       to start with "T14_v1" too. The agent's descriptive label
-        #       (e.g. "GHS D3 SP0.15") is preserved when it provided one
-        #       via present_images — we just prefix it with the id.
+        # (1) Every agent-presented variant in the approve panel has a
+        # gallery preview. Raw pool entries are shown only in the bottom
+        # workbench filmstrip.
+        # (2) Every gallery entry whose source matches a variant has the
+        # variant id visible in its caption. The Approve button shows
+        # the variant id (e.g. "stretch_image_v1"), so the gallery caption
+        # has to start with the same id. The agent's descriptive label
+        # (e.g. "GHS D3 SP0.15") is preserved when it provided one via
+        # present_images — we just prefix it with the id.
         review_variants = _proposal_variants(proposal)
         if review_variants and working_dir:
             # Compute predicted preview paths for every variant once and
@@ -760,10 +759,10 @@ async def _stream_graph(
                         gallery_images.append((p, f"{v['id']} — {v.get('label', '')}"))
             else:
                 # Case B/C: present_images WAS called. Two passes:
-                #   1) Append any variant whose preview isn't already shown.
-                #   2) Normalize captions: any existing gallery entry whose
-                #      path matches a known variant gets the id prefixed,
-                #      preserving the agent's descriptive label.
+                # 1) Append any variant whose preview isn't already shown.
+                # 2) Normalize captions: any existing gallery entry whose
+                # path matches a known variant gets the id prefixed,
+                # preserving the agent's descriptive label.
                 for v, p in zip(review_variants, preview_paths):
                     if Path(p).exists() and str(p) not in existing_preview_paths:
                         gallery_images.append(
@@ -819,7 +818,15 @@ async def _stream_graph(
                 _proposal_rationale_summary(proposal),
             )
 
-        if review_state == "needs_curation":
+        if interrupt_payload.get("type") == "disk_full":
+            footer = (
+                f"**{title}** — system halted.\n\n"
+                f"---\n"
+                f"*Free disk on this volume and send any message to resume. "
+                f"The disk check re-runs on resume; if space is still "
+                f"short, the run halts again with an updated tally.*"
+            )
+        elif review_state == "needs_curation":
             footer = (
                 f"**{title}** — agent needs to select candidates.\n\n"
                 f"---\n"
@@ -974,18 +981,25 @@ async def start_session(
     yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
 
     try:
-        # Apply equipment overrides from UI to os.environ
-        if pixel_size and pixel_size > 0:
-            os.environ["PIXEL_SIZE_UM"] = str(pixel_size)
+        # Equipment values from the UI are passed through to ingest_dataset
+        # as override kwargs. ingest writes them straight into
+        # state.dataset.acquisition_meta — state is the canonical contract
+        # downstream tools read; no env-var side channel.
+        #
+        # Siril's per-app config (Markesteijn pass count for X-Trans
+        # demosaic) is set once at app boot via configure_siril_for_equipment
+        # — pass the same sensor_type when the user changes it via the UI.
         if sensor_type:
-            os.environ["SENSOR_TYPE_OVERRIDE"] = sensor_type
-        if focal_length and focal_length > 0:
-            os.environ["FOCAL_LENGTH_MM"] = str(focal_length)
+            from muphrid.config import configure_siril_for_equipment
+            configure_siril_for_equipment(sensor_type_override=sensor_type)
 
         # Ingest dataset
         ingest_result = ingest_dataset.invoke({
             "root_directory": dataset_path,
             "thread_id": thread_id,
+            "override_focal_length_mm": float(focal_length) if focal_length and focal_length > 0 else None,
+            "override_pixel_size_um": float(pixel_size) if pixel_size and pixel_size > 0 else None,
+            "override_sensor_type": sensor_type or None,
         })
 
         # Build session context
@@ -1471,23 +1485,22 @@ async def resume_session(
         snapshot = await _GRAPH.aget_state(config)
         saved_values = snapshot.values if snapshot else {}
         is_paused_at_hitl = review_ctl.review_is_open(saved_values.get("review_session"))
-        is_legacy_hitl = bool(saved_values.get("active_hitl")) and not is_paused_at_hitl
+        has_broken_hitl_state = bool(saved_values.get("active_hitl")) and not is_paused_at_hitl
     except Exception as e:
         logger.warning(f"resume_session: aget_state failed (non-fatal): {e}")
         saved_values = {}
         is_paused_at_hitl = False
-        is_legacy_hitl = False
+        has_broken_hitl_state = False
 
-    if is_legacy_hitl:
+    if has_broken_hitl_state:
         chat_messages.append({
             "role": "assistant",
             "content": (
-                "**This saved checkpoint predates Review Mode state.** It has "
+                "**This saved checkpoint has inconsistent HITL state.** It has "
                 "`active_hitl=True` but no open `review_session`, so the app "
                 "cannot safely reconstruct the approval contract or consume a "
                 "resume value as human approval. Start from a clean cloned "
-                "checkpoint before the gate, or rerun this phase with the "
-                "current Review Mode implementation."
+                "checkpoint before the gate, or rerun this phase."
             ),
         })
         yield chat_messages, activity_log, gallery_images, pool_gallery_images, variant_pool, proposal, state
@@ -1680,7 +1693,7 @@ def _format_model_info(model_name: str) -> str:
     lines = [f"**{model_name}** — provider: {provider}, temperature: {temp_str}, thinking: {thinking}"]
     if budget > 0:
         lines.append(f"Thinking budget: {budget} tokens")
-    return "  \n".join(lines)
+    return " \n".join(lines)
 
 
 # ── Session settings snapshot & diff ──────────────────────────────────────────
@@ -1790,7 +1803,7 @@ def build_app() -> gr.Blocks:
     blocks_css = """
     @keyframes muphrid-working-pulse {
         0%, 100% { background-color: rgba(96, 156, 247, 0.08); }
-        50%      { background-color: rgba(96, 156, 247, 0.28); }
+        50% { background-color: rgba(96, 156, 247, 0.28); }
     }
     .muphrid-working-banner {
         animation: muphrid-working-pulse 1.6s ease-in-out infinite;
@@ -1807,7 +1820,7 @@ def build_app() -> gr.Blocks:
     # We attach the CSS as an attribute on the returned Blocks so
     # main() can pick it up without having to import blocks_css.
     with gr.Blocks(title="Muphrid") as app:
-        app._muphrid_css = blocks_css  # consumed by main() at launch time
+        app._muphrid_css = blocks_css # consumed by main() at launch time
         session_state = gr.State({
             "thread_id": None,
             "config": None,
@@ -1885,7 +1898,7 @@ def build_app() -> gr.Blocks:
                 with gr.Column(scale=1):
                     chatbot = gr.Chatbot(
                         label="Muphrid",
-                        value=[],  # explicit empty list — Gradio 6 Chatbot uses messages format
+                        value=[], # explicit empty list — Gradio 6 Chatbot uses messages format
                         height=600,
                         buttons=["copy", "copy_all"],
                     )
@@ -1910,13 +1923,13 @@ def build_app() -> gr.Blocks:
                     # we observed in HITL sessions, don't simplify without a
                     # replacement plan):
                     #
-                    #  * lines=2 + submit_btn=True: with lines=1 the textbox
-                    #    auto-submits on Enter, which silently consumed
-                    #    rationale-in-progress when the user expected Enter to
-                    #    insert a newline. Pairing lines>=2 with an explicit
-                    #    submit button matches gr.ChatInterface and the
-                    #    Cursor / Claude-coding-agent style: Enter for newline,
-                    #    button (or Shift+Enter) to send.
+                    # * lines=2 + submit_btn=True: with lines=1 the textbox
+                    # auto-submits on Enter, which silently consumed
+                    # rationale-in-progress when the user expected Enter to
+                    # insert a newline. Pairing lines>=2 with an explicit
+                    # submit button matches gr.ChatInterface and the
+                    # Cursor / Claude-coding-agent style: Enter for newline,
+                    # button (or Shift+Enter) to send.
                     with gr.Row():
                         msg_input = gr.Textbox(
                             placeholder=(
@@ -1999,7 +2012,7 @@ def build_app() -> gr.Blocks:
                         metric_str = " · ".join(metric_bits)
                         desc = f"**{vid}** — {label}"
                         if metric_str:
-                            desc += f"  \n*{metric_str}*"
+                            desc += f" \n*{metric_str}*"
                         gr.Markdown(desc)
 
             # ── Proposal panel (the agent's curation, with Approve buttons) ──
@@ -2089,11 +2102,11 @@ def build_app() -> gr.Blocks:
                         with gr.Row():
                             desc = f"**{vid}** — {label}"
                             if metric_str:
-                                desc += f"  \n*{metric_str}*"
+                                desc += f" \n*{metric_str}*"
                             if rationale:
-                                desc += f"  \n> {rationale}"
+                                desc += f" \n> {rationale}"
                             if recommendation == vid:
-                                desc += "  \n`Recommended`"
+                                desc += " \n`Recommended`"
                             gr.Markdown(desc)
 
             with gr.Group():
@@ -2218,38 +2231,38 @@ def build_app() -> gr.Blocks:
                 return cb
 
             gr.Markdown("**Calibration**")
-            _hitl_cb("T02_masters", "T02 Master Frame Diagnostics")
-            _hitl_cb("T02b_convert", "T02b Sequence Conversion")
-            _hitl_cb("T03_calibrate", "T03 Calibration")
+            _hitl_cb("build_masters", "build_masters Master Frame Diagnostics")
+            _hitl_cb("convert_sequence", "convert_sequence Sequence Conversion")
+            _hitl_cb("calibrate", "calibrate Calibration")
             gr.Markdown("**Registration**")
-            _hitl_cb("T04_register", "T04 Registration")
+            _hitl_cb("siril_register", "siril_register Registration")
             gr.Markdown("**Analysis**")
-            _hitl_cb("T05_analyze", "T05 Frame Analysis")
+            _hitl_cb("analyze_frames", "analyze_frames Frame Analysis")
             gr.Markdown("**Stacking**")
-            _hitl_cb("T06_select", "T06 Frame Selection")
-            _hitl_cb("T07_stack", "T07 Stack Results")
-            _hitl_cb("T08_crop", "T08 Auto Crop")
+            _hitl_cb("select_frames", "select_frames Frame Selection")
+            _hitl_cb("siril_stack", "siril_stack Stack Results")
+            _hitl_cb("auto_crop", "auto_crop Auto Crop")
             gr.Markdown("**Linear**")
-            _hitl_cb("T09_gradient", "T09 Gradient Removal", default=True)
-            _hitl_cb("T10_color", "T10 Color Calibration")
-            _hitl_cb("T11_green", "T11 Green Noise Removal")
-            _hitl_cb("T12_denoise", "T12 Noise Reduction")
-            _hitl_cb("T13_decon", "T13 Deconvolution")
+            _hitl_cb("remove_gradient", "remove_gradient Gradient Removal", default=True)
+            _hitl_cb("color_calibrate", "color_calibrate Color Calibration")
+            _hitl_cb("remove_green_noise", "remove_green_noise Green Noise Removal")
+            _hitl_cb("noise_reduction", "noise_reduction Noise Reduction")
+            _hitl_cb("deconvolution", "deconvolution Deconvolution")
             gr.Markdown("**Stretch**")
-            _hitl_cb("T14_stretch", "T14 Stretch", default=True)
+            _hitl_cb("stretch_image", "stretch_image Stretch", default=True)
             gr.Markdown("**Non-linear**")
-            _hitl_cb("T15_star_removal", "T15 Star Removal")
-            _hitl_cb("T16_curves", "T16 Curves", default=True)
-            _hitl_cb("T17_local_contrast", "T17 Local Contrast")
-            _hitl_cb("T18_saturation", "T18 Saturation")
-            _hitl_cb("T19_star_restoration", "T19 Star Restoration", default=True)
-            _hitl_cb("T25_mask", "T25 Mask Creation")
-            _hitl_cb("T26_reduce_stars", "T26 Star Reduction")
-            _hitl_cb("T27_multiscale", "T27 Multiscale Sharpening")
-            _hitl_cb("T41_selective_star_reblend", "T41 Selective Star Reblend")
-            _hitl_cb("T42_enhance_star_color", "T42 Enhance Star Color")
+            _hitl_cb("star_removal", "star_removal Star Removal")
+            _hitl_cb("curves_adjust", "curves_adjust Curves", default=True)
+            _hitl_cb("local_contrast_enhance", "local_contrast_enhance Local Contrast")
+            _hitl_cb("saturation_adjust", "saturation_adjust Saturation")
+            _hitl_cb("star_restoration", "star_restoration Star Restoration", default=True)
+            _hitl_cb("create_mask", "create_mask Mask Creation")
+            _hitl_cb("reduce_stars", "reduce_stars Star Reduction")
+            _hitl_cb("multiscale_process", "multiscale_process Multiscale Sharpening")
+            _hitl_cb("selective_star_reblend", "selective_star_reblend Selective Star Reblend")
+            _hitl_cb("enhance_star_color", "enhance_star_color Enhance Star Color")
             gr.Markdown("**Export**")
-            _hitl_cb("T24_export", "T24 Final Export Review", default=True)
+            _hitl_cb("export_final", "export_final Final Export Review", default=True)
 
         # ── Model & Limits tab ───────────────────────────────────────
         with gr.Tab("Model & Limits"):
@@ -2373,8 +2386,8 @@ def build_app() -> gr.Blocks:
         # themselves don't need to know about the flag — they just run.
         # If a generator errors, Gradio still fires the trailing .then()
         # with the False payload, so the UI never gets stuck "locked".
-        _stream_start = lambda: True       # noqa: E731
-        _stream_end = lambda: False        # noqa: E731
+        _stream_start = lambda: True # noqa: E731
+        _stream_end = lambda: False # noqa: E731
 
         # Start session: apply settings → flip streaming on → stream → flip off
         start_btn.click(
@@ -2508,7 +2521,7 @@ def main():
     component_css = getattr(app, "_muphrid_css", "") or ""
     app.launch(
         theme=gr.themes.Soft(primary_hue="blue"),
-        allowed_paths=["/"],  # datasets can be anywhere on disk
+        allowed_paths=["/"], # datasets can be anywhere on disk
         css=layout_css + "\n" + component_css,
     )
 

@@ -4,8 +4,8 @@ and flat quality state classification.
 
 These helpers are camera-agnostic — they work for any raw format by reading
 sensor characterization data from EXIF/maker notes. Used by:
-  - T01 (ingest_dataset)         — populate AcquisitionMeta sensor fields
-  - T02 (build_masters)          — sensor-relative HITL thresholds
+  - ingest_dataset         — populate AcquisitionMeta sensor fields
+  - build_masters          — sensor-relative HITL thresholds
   - scripts/check_flat_quality.py — per-frame flat quality assessment
 
 ## Why fill fraction instead of Siril-normalized value
@@ -42,7 +42,7 @@ SATURATED_STD_MAX  = 2.0    # also SATURATED if std is near-zero at high ADU
 
 
 # ── Known X-Trans sensor models (Fuji) ────────────────────────────────────────
-# Bayer vs X-Trans matters for T03 debayering. All other major brands are Bayer.
+# Bayer vs X-Trans matters for calibrate debayering. All other major brands are Bayer.
 
 _XTRANS_MODELS: frozenset[str] = frozenset({
     "X-T5", "X-T4", "X-T3", "X-T30 II", "X-T30", "X-T20", "X-T10",
@@ -144,7 +144,7 @@ def infer_bit_depth(white_level: int) -> int:
 def sensor_info_from_tags(tags: dict) -> SensorInfo:
     """
     Build a SensorInfo from an already-loaded ExifTool tags dict.
-    Called by T01 which loads tags once and reuses them.
+    Called by ingest_dataset which loads tags once and reuses them.
 
     Supports both camera RAW (EXIF metadata) and FITS (FITS headers).
     EXIF keys are checked first; FITS-native keys serve as fallbacks.
@@ -172,7 +172,7 @@ def sensor_info_from_tags(tags: dict) -> SensorInfo:
                 break
 
     # Black level — EXIF keys first, then leave as 0 for FITS
-    # (FITS cameras don't store black level in headers; T02 detects from data)
+    # (FITS cameras don't store black level in headers; build_masters detects from data)
     black = 0
     for key in _BLACK_KEYS:
         v = _parse_first_int(tags.get(key))

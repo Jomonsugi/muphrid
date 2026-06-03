@@ -43,7 +43,7 @@ def _load_processing_config() -> dict:
     try:
         import tomllib
     except ImportError:
-        import tomli as tomllib  # type: ignore[no-reuse-def]
+        import tomli as tomllib # type: ignore[no-reuse-def]
 
     cfg_path = Path(__file__).resolve().parent.parent / "processing.toml"
     if cfg_path.exists():
@@ -87,22 +87,19 @@ def _optional(key: str, default: str = "") -> str:
 @dataclass(frozen=True)
 class Settings:
     # LLM
-    llm_provider: str       # "together" | "anthropic" | "openai"
+    llm_provider: str # "together" | "anthropic" | "openai"
     llm_model: str
-    llm_temperature: float | None  # None = use model default
-    llm_thinking: bool              # enable thinking/extended thinking mode
-    llm_thinking_budget: int        # token budget for Anthropic extended thinking
-    together_api_key: str   # required when llm_provider == "together"
-    anthropic_api_key: str  # required when llm_provider == "anthropic"
+    llm_temperature: float | None # None = use model default
+    llm_thinking: bool # enable thinking/extended thinking mode
+    llm_thinking_budget: int # token budget for Anthropic extended thinking
+    together_api_key: str # required when llm_provider == "together"
+    anthropic_api_key: str # required when llm_provider == "anthropic"
 
     # External binaries
     siril_bin: str
     graxpert_bin: str
-    starnet_bin: str        # absolute path to the starnet2 executable
-    starnet_weights: str    # absolute path to StarNet2_weights.pt
-
-    # Camera sensor
-    pixel_size_um: float | None  # optional override; None → use camera lookup table
+    starnet_bin: str # absolute path to the starnet2 executable
+    starnet_weights: str # absolute path to StarNet2_weights.pt
 
     # LangSmith (optional tracing)
     langchain_tracing: bool
@@ -119,14 +116,14 @@ _MODEL_DEFAULTS: dict[str, dict] = {
     # Instant mode: temp 0.6. Any other temp value errors.
     "moonshotai/Kimi-K2.6": {
         "provider": "together",
-        "temperature": None,        # don't send — model uses fixed 1.0 (thinking) or 0.6 (instant)
+        "temperature": None, # don't send — model uses fixed 1.0 (thinking) or 0.6 (instant)
         "thinking": True,
-        "thinking_budget": 0,       # not applicable for Kimi
+        "thinking_budget": 0, # not applicable for Kimi
     },
     # Claude Sonnet: extended thinking requires temp 1.0
     "claude-sonnet-4-6": {
         "provider": "anthropic",
-        "temperature": 1.0,         # required for extended thinking
+        "temperature": 1.0, # required for extended thinking
         "thinking": True,
         "thinking_budget": 10000,
     },
@@ -159,8 +156,8 @@ def _get_model_defaults(model: str) -> dict:
 
 
 def load_settings() -> Settings:
-    # Priority: os.environ (if set) > processing.toml > hardcoded default
-    # This lets env vars override TOML for backwards compat and CI/testing.
+    # Priority: os.environ (if set) > processing.toml > hardcoded default.
+    # Env vars intentionally override TOML for CI and one-off runtime control.
 
     # Model: env var overrides processing.toml
     model = _optional("LLM_MODEL", "") or _pcfg("model", "default", "moonshotai/Kimi-K2.6")
@@ -219,7 +216,6 @@ def load_settings() -> Settings:
         graxpert_bin=_optional("GRAXPERT_BIN", "graxpert"),
         starnet_bin=_require("STARNET_BIN"),
         starnet_weights=_require("STARNET_WEIGHTS"),
-        pixel_size_um=float(v) if (v := _optional("PIXEL_SIZE_UM")) else None,
         langchain_tracing=tracing,
         langchain_api_key=_optional("LANGCHAIN_API_KEY"),
         langchain_project=_optional("LANGCHAIN_PROJECT", "") or _pcfg("tracing", "project", "muphrid"),
@@ -253,7 +249,7 @@ def _check_siril(siril_bin: str) -> None:
         )
 
 
-def configure_siril_for_equipment() -> str:
+def configure_siril_for_equipment(sensor_type_override: str | None = None) -> str:
     """
     Write Siril demosaic preferences derived from equipment.toml.
 
@@ -261,9 +257,12 @@ def configure_siril_for_equipment() -> str:
     preference in ~/.config/siril/siril.cfg. This function sets it correctly
     for the declared sensor type so the agent never needs to reason about it:
 
-      xtrans → xtrans_passes=3  (Markesteijn 3-pass, best quality)
-      bayer  → xtrans_passes=1  (Markesteijn not used for Bayer; reset to default)
-      mono   → xtrans_passes=1  (no CFA demosaic needed)
+      xtrans → xtrans_passes=3 (Markesteijn 3-pass, best quality)
+      bayer → xtrans_passes=1 (Markesteijn not used for Bayer; reset to default)
+      mono → xtrans_passes=1 (no CFA demosaic needed)
+
+    `sensor_type_override` lets the Gradio app force a sensor type at boot
+    time (the user's UI selection); when None, equipment.toml is canonical.
 
     Returns the sensor_type string for logging.
     Raises ConfigError if equipment.toml is missing or sensor_type is unrecognised.
@@ -271,7 +270,7 @@ def configure_siril_for_equipment() -> str:
     try:
         import tomllib
     except ImportError:
-        import tomli as tomllib  # type: ignore[no-reuse-def]
+        import tomli as tomllib # type: ignore[no-reuse-def]
 
     equipment_path = Path(__file__).resolve().parent.parent / "equipment.toml"
     if not equipment_path.exists():
@@ -283,8 +282,7 @@ def configure_siril_for_equipment() -> str:
     with open(equipment_path, "rb") as f:
         equipment = tomllib.load(f)
 
-    # UI override takes priority over equipment.toml
-    sensor_type = os.environ.get("SENSOR_TYPE_OVERRIDE", "").lower()
+    sensor_type = (sensor_type_override or "").lower()
     if not sensor_type:
         sensor_type = equipment.get("camera", {}).get("sensor_type", "").lower()
     # sensor_type may be empty when equipment.toml is minimal (e.g. ZWO FITS
@@ -361,12 +359,12 @@ def _check_starnet(starnet_bin: str, starnet_weights: str) -> None:
             f"StarNet binary not found at '{starnet_bin}'. "
             "Set STARNET_BIN in .env to the absolute path of your starnet2 executable.\n"
             "Installation:\n"
-            "  1. Download StarNet v2 (MPS build) from: https://www.starnetastro.com/download/\n"
-            "  2. chmod +x starnet2\n"
-            "  3. xattr -d com.apple.quarantine starnet2\n"
-            "  4. Allow in System Settings > Privacy & Security\n"
-            "  5. codesign --force --sign - /path/to/starnet2\n"
-            "  6. Set STARNET_BIN and STARNET_WEIGHTS in .env"
+            " 1. Download StarNet v2 (MPS build) from: https://www.starnetastro.com/download/\n"
+            " 2. chmod +x starnet2\n"
+            " 3. xattr -d com.apple.quarantine starnet2\n"
+            " 4. Allow in System Settings > Privacy & Security\n"
+            " 5. codesign --force --sign - /path/to/starnet2\n"
+            " 6. Set STARNET_BIN and STARNET_WEIGHTS in .env"
         )
     if not os.access(path, os.X_OK):
         raise DependencyError(
@@ -389,7 +387,7 @@ def _check_exiftool() -> None:
         raise DependencyError(
             "ExifTool not found on PATH. "
             "Install with: brew install exiftool\n"
-            "ExifTool is required for reading EXIF metadata from camera RAW files (T01)."
+            "ExifTool is required for reading EXIF metadata from camera RAW files."
         )
     result = subprocess.run(
         [exiftool_path, "-ver"], capture_output=True, text=True, timeout=10
@@ -418,18 +416,18 @@ def _check_python_libs() -> None:
         if packaging.version.Version(skimage.__version__) < packaging.version.Version("0.22"):
             issues.append(f"scikit-image ≥ 0.22 required (installed: {skimage.__version__})")
     except ImportError:
-        issues.append("scikit-image not installed  →  uv add scikit-image")
+        issues.append("scikit-image not installed →  uv add scikit-image")
 
     try:
         import pywt
         if packaging.version.Version(pywt.__version__) < packaging.version.Version("1.6"):
             issues.append(f"PyWavelets ≥ 1.6 required (installed: {pywt.__version__})")
     except ImportError:
-        issues.append("PyWavelets not installed  →  uv add PyWavelets")
+        issues.append("PyWavelets not installed →  uv add PyWavelets")
 
     if issues:
         raise DependencyError(
-            "Python library issues:\n  " + "\n  ".join(issues)
+            "Python library issues:\n " + "\n ".join(issues)
         )
 
 
@@ -467,7 +465,7 @@ def make_llm(settings: Settings | None = None):
         from langchain_openai import ChatOpenAI
         kwargs: dict = {
             "model": settings.llm_model,
-            "api_key": settings.together_api_key,      # type: ignore[arg-type]
+            "api_key": settings.together_api_key, # type: ignore[arg-type]
             "base_url": "https://api.together.xyz/v1/",
             "timeout": 120,
         }
@@ -482,13 +480,13 @@ def make_llm(settings: Settings | None = None):
         return ChatOpenAI(**kwargs)
 
     if settings.llm_provider == "anthropic":
-        from langchain_anthropic import ChatAnthropic  # optional dep
+        from langchain_anthropic import ChatAnthropic # optional dep
         model_kwargs: dict = {
             "extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"},
         }
         anthro_kwargs: dict = {
             "model": settings.llm_model,
-            "api_key": settings.anthropic_api_key,     # type: ignore[arg-type]
+            "api_key": settings.anthropic_api_key, # type: ignore[arg-type]
             "timeout": 120,
             "model_kwargs": model_kwargs,
         }
