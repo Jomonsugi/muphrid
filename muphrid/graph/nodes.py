@@ -1662,6 +1662,7 @@ def _make_variant(
         file_path=file_path,
         preview_path=preview_path,
         metrics=_snapshot_metrics(state),
+        image_space=(state.get("metadata") or {}).get("image_space"),
         created_at=datetime.now(timezone.utc).isoformat(),
         rationale=None,
     )

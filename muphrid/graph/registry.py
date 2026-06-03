@@ -62,6 +62,7 @@ from muphrid.tools.utility.export import export_final
 # ── Imports: Utility (available in every gate) ────────────────────────────────
 
 from muphrid.tools.utility.analyze import analyze_image
+from muphrid.tools.utility.compare_images import compare_images
 from muphrid.tools.utility.plate_solve import plate_solve
 from muphrid.tools.utility.analyze_star_population import analyze_star_population
 from muphrid.tools.utility.pixel_math import pixel_math
@@ -81,6 +82,7 @@ from muphrid.tools.utility.present_for_review import present_for_review
 
 UTILITY_TOOLS = [
     analyze_image,
+    compare_images,
     analyze_star_population,
     plate_solve,
     pixel_math,

@@ -517,6 +517,10 @@ class Variant(TypedDict):
     file_path:    str           # FITS path of the snapshotted result
     preview_path: str | None    # JPG preview path if one exists
     metrics:      dict          # snapshot of relevant metrics at capture time
+    image_space:  str | None    # render space at capture ("linear"|"display"),
+                                # read from metadata.image_space; lets readers
+                                # (e.g. compare_images) tag render space without
+                                # re-deriving it. None only for legacy entries.
     created_at:   str           # ISO 8601
     rationale:    str | None    # populated only after this variant is committed
 

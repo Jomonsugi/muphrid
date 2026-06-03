@@ -188,6 +188,8 @@ The agent is expected to inspect outcomes before moving on. `analyze_image` and 
 
 `muphrid/graph/regression.py` compares image metrics against prior analysis snapshots. When a metric worsens, the graph records a `regression_warning`. The warning does not automatically block progress; it gives the agent evidence to decide whether to accept the tradeoff, restore a checkpoint, rewind a phase, or continue.
 
+Where `analyze_image` is a deep dive on the current image (and sets the regression baseline), `compare_images` is its read-only, N-way counterpart: given handles the agent already has — variant ids, checkpoint names, or `"current"` (never paths) — it computes each image's metrics fresh and returns a metric-major table tagged with each image's render space. It changes no state, so the agent can contrast candidates (e.g. GraXpert vs Siril gradient variants) without promoting any of them.
+
 ---
 
 ## HITL Review Mode
