@@ -425,6 +425,43 @@ def _format_checkpoints_for_prompt(checkpoints: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _format_decisions_for_prompt(state: AstroState) -> str:
+    """Render revisitable decisions for the current phase.
+
+    Surfaces metadata.decisions so the agent knows which converged steps it can
+    reopen with revisit_decision (and with which handle), the way checkpoints
+    are surfaced. Scoped to the current phase — cross-phase rollback is
+    rewind_phase's job.
+    """
+    decisions = (state.get("metadata", {}) or {}).get("decisions") or {}
+    if not decisions:
+        return ""
+    cur_phase = getattr(state.get("phase"), "value", state.get("phase")) or ""
+    rows = [
+        rec for rec in decisions.values()
+        if isinstance(rec, dict) and rec.get("phase") == cur_phase
+    ]
+    if not rows:
+        return ""
+
+    lines = [
+        "## Revisitable decisions",
+        "",
+        "Converged steps this phase. If a later step shows one of these choices "
+        "was wrong, call `revisit_decision(decision=...)` to reopen it with its "
+        "candidates restored — a fresh iteration, not an undo.",
+        "",
+    ]
+    for rec in rows:
+        did = rec.get("decision_id", "?")
+        chosen = (rec.get("chosen") or {}).get("variant_id", "?")
+        n_alt = len(rec.get("candidates") or [])
+        lines.append(
+            f"- `{did}` — chose `{chosen}` of {n_alt} candidate(s)"
+        )
+    return "\n".join(lines)
+
+
 def _format_review_session_for_prompt(review_session: dict | None) -> str:
     """Render explicit Review Mode state for the agent."""
     if not review_ctl.review_is_open(review_session):
@@ -1094,6 +1131,7 @@ def make_agent_node(model_factory):
         checkpoints_section = _format_checkpoints_for_prompt(
             (state.get("metadata", {}) or {}).get("checkpoints")
         )
+        decisions_section = _format_decisions_for_prompt(state)
         review_session_section = _format_review_session_for_prompt(
             state.get("review_session")
         )
@@ -1122,6 +1160,9 @@ def make_agent_node(model_factory):
             if checkpoints_section:
                 # Uncached: regenerated each turn from live checkpoint state
                 system_blocks.append({"type": "text", "text": checkpoints_section})
+            if decisions_section:
+                # Uncached: regenerated each turn from live decision records
+                system_blocks.append({"type": "text", "text": decisions_section})
             if hitl_fragment:
                 # Uncached: only present during active HITL conversations
                 system_blocks.append({"type": "text", "text": hitl_fragment})
@@ -1160,6 +1201,8 @@ def make_agent_node(model_factory):
                 full_system = f"{full_system}\n\n{variant_pool_section}"
             if checkpoints_section:
                 full_system = f"{full_system}\n\n{checkpoints_section}"
+            if decisions_section:
+                full_system = f"{full_system}\n\n{decisions_section}"
             if hitl_fragment:
                 full_system = f"{full_system}\n\n{hitl_fragment}"
             if review_session_section:
@@ -1356,15 +1399,32 @@ def auto_checkpoint(state: AstroState) -> dict[str, Any]:
         f"before {', '.join(mutating_tools)}"
     )
     entry = make_checkpoint_entry(str(path), image_space)
-    return {
-        **pre,
-        "metadata": {
-            "checkpoints": {
-                unique_name: entry,
-                "auto:previous": entry,
-            }
+
+    # Step anchors (set-once per <phase>:<tool> in a segment): the pre-step
+    # image the tool's candidates branch from. This is the moment we have the
+    # correct pre-step image AND its image_space (post-tool space may differ,
+    # e.g. stretch flips linear→display). build_variant_promotion_update reads
+    # the anchor to fill DecisionRecord.pre_step so revisit can restore the
+    # working image to before the step. Emit only NEW keys so the merge reducer
+    # never overwrites an earlier anchor with a later (wrong) pre-image.
+    existing_anchors = (state.get("metadata", {}) or {}).get("step_anchors") or {}
+    anchor_entry = {"path": str(path), "image_space": image_space}
+    new_anchors = {
+        f"{phase_value}:{t}": anchor_entry
+        for t in mutating_tools
+        if f"{phase_value}:{t}" not in existing_anchors
+    }
+
+    metadata_update: dict[str, Any] = {
+        "checkpoints": {
+            unique_name: entry,
+            "auto:previous": entry,
         }
     }
+    if new_anchors:
+        metadata_update["step_anchors"] = new_anchors
+
+    return {**pre, "metadata": metadata_update}
 
 
 def _format_tool_error(exc: Exception) -> str:
@@ -1849,10 +1909,10 @@ def find_variant_in_pool(pool: list[Variant], variant_id: str) -> Variant | None
 
 
 def build_variant_promotion_update(
-    state: AstroState, variant_id: str
+    state: AstroState, variant_id: str, rationale: str | None = None
 ) -> tuple[Variant, dict[str, Any]] | None:
     """
-    Compute the state mutations for promoting a variant from variant_pool.
+    Compute the state mutations for converging on a variant from variant_pool.
     Pure-ish function (one filesystem read for preview resolution); does not
     construct any messages — callers add the appropriate message wrapper for
     their context (HumanMessage for HITL approval, ToolMessage for autonomous
@@ -1860,22 +1920,56 @@ def build_variant_promotion_update(
 
     Returns (variant, update_dict) on success, or None if the id isn't in
     the pool. The update dict contains:
-      - paths.current_image := variant.file_path
-      - variant_pool := []
-      - visual_context := <existing> + phase_carry entry for the approved variant
+      - paths.current_image := variant.file_path  (delta emit)
+      - metadata.image_space := variant.image_space  (render-state contract —
+        promotion moves current_image, so it must re-assert image_space)
+      - variant_pool := []  (the live workbench clears…)
+      - metadata.decisions[<phase>:<tool>] := DecisionRecord  (…but the
+        alternatives + pre-step are archived first, so the converged step is
+        revisitable rather than lost — "converged, not irrevocable")
+      - visual_context := <existing minus hitl_variant/phase_carry>
       - metadata.last_committed_variant := {id, file_path} (race-fix signal:
         lets commit_variant detect "already promoted via HITL" when the pool
         has been cleared and return idempotent success instead of an error)
 
-    Shared by promote_variant (HITL) and the commit_variant tool (autonomous).
+    This is the single writer of decision records, shared by promote_variant
+    (HITL) and the commit_variant tool (autonomous) — so convergence is
+    recorded identically in every mode.
     """
     pool = state.get("variant_pool", []) or []
     variant = find_variant_in_pool(pool, variant_id)
     if variant is None:
         return None
 
-    paths = dict(state.get("paths", {}) or {})
-    paths["current_image"] = variant["file_path"]
+    # Archive the decision before clearing the live pool: the chosen variant,
+    # the alternatives that were on the table, and the pre-step image (from the
+    # step anchor auto_checkpoint recorded). This is what makes the step
+    # revisitable. Mode is inferred from whether a HITL gate is open.
+    phase_v = variant.get("phase") or review_ctl.phase_value(state.get("phase"))
+    tool_name = variant.get("tool_name") or ""
+    did = review_ctl.decision_id(str(phase_v), str(tool_name))
+    pre_step = ((state.get("metadata") or {}).get("step_anchors") or {}).get(did)
+    mode = "hitl" if review_ctl.active_review_session(state) else "autonomous"
+    _did, decision = review_ctl.make_decision_record(
+        chosen=variant,
+        candidates=pool,
+        pre_step=pre_step,
+        rationale=rationale,
+        mode=mode,
+    )
+
+    metadata_update: dict[str, Any] = {
+        "last_committed_variant": {
+            "id": variant["id"],
+            "file_path": variant["file_path"],
+        },
+        "decisions": {did: decision},
+    }
+    # Render-state contract: promotion advances current_image, so re-assert
+    # image_space in the same update. Variants capture it at snapshot time.
+    image_space = variant.get("image_space")
+    if image_space in ("linear", "display"):
+        metadata_update["image_space"] = image_space
 
     # Drop the now-promoted variant's hitl_variant entry (variant_pool is
     # being cleared, but visual_context may have older present_images /
@@ -1893,18 +1987,15 @@ def build_variant_promotion_update(
     ]
 
     update: dict[str, Any] = {
-        "paths": paths,
+        # Delta emit — the paths reducer is _merge_dicts, so listing only the
+        # key we change composes with parallel siblings (was a whole-paths
+        # spread, the documented clobber anti-pattern).
+        "paths": {"current_image": variant["file_path"]},
         "variant_pool": [],
         "visual_context": existing_visual,
         # metadata is merged via _merge_dicts, so partial updates are safe —
-        # other metadata fields are preserved and only last_committed_variant
-        # is overwritten.
-        "metadata": {
-            "last_committed_variant": {
-                "id": variant["id"],
-                "file_path": variant["file_path"],
-            },
-        },
+        # other metadata fields are preserved.
+        "metadata": metadata_update,
     }
     return variant, update
 
@@ -1927,7 +2018,7 @@ def promote_variant(
     track "last tool output" beyond what's in messages, so its next tool call
     will read the promoted file correctly.
     """
-    result = build_variant_promotion_update(state, variant_id)
+    result = build_variant_promotion_update(state, variant_id, rationale=rationale)
     if result is None:
         return None
     variant, update = result

@@ -64,5 +64,4 @@ runs/
 # Gradio local cache/flag dir
 .gradio/
 .claude/
-CLAUDE.md
 BACKLOG.md

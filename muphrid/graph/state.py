@@ -228,6 +228,24 @@ class Metadata(TypedDict):
     # become meaningful in different phases).
     last_analysis_snapshot: dict | None
 
+    # Loop-aware iteration substrate (mode-independent — written in both HITL
+    # and autonomous runs). See DecisionRecord.
+    #
+    # decisions: keyed by "<phase>:<tool>". Each entry is the durable record of
+    # a converged step — the chosen variant, the alternatives that were on the
+    # table, and the pre-step image — so a decision can be revisited later
+    # (revisit_decision) instead of being lost when the live pool clears.
+    # Approval/commit means "this loop converged," not "this step is
+    # irrevocable": the record is the recoverable history.
+    decisions: dict[str, "DecisionRecord"] | None
+
+    # step_anchors: keyed by "<phase>:<tool>". The pre-step image pointer
+    # ({"path", "image_space"}) captured the FIRST time a tool produces a
+    # variant in the current segment — i.e. the input the step's candidates
+    # branched from. Used to fill DecisionRecord.pre_step so revisit can
+    # restore the working image to before the step ran. Set-once per segment.
+    step_anchors: dict[str, dict] | None
+
     # Phase-boundary state snapshots, keyed by ProcessingPhase value.
     # Written by advance_phase as the pipeline transitions: the snapshot
     # under key X represents the working state at the moment the pipeline
@@ -525,6 +543,33 @@ class Variant(TypedDict):
     rationale:    str | None    # populated only after this variant is committed
 
 
+class DecisionRecord(TypedDict):
+    """
+    The durable record of a converged processing step.
+
+    Written by build_variant_promotion_update (the single writer shared by
+    HITL approval and the autonomous commit_variant tool), so it exists in
+    every mode. It is the "commit" in the version-control sense: choosing a
+    variant records the decision and preserves the alternatives, rather than
+    destroying them. revisit_decision reads it to reopen the step — restoring
+    the pre-step image, repopulating the pool with the recorded candidates,
+    and (when the gate is enabled) reopening the review session.
+
+    The record is append-only history: revisiting does not delete it; it
+    starts a fresh iteration seeded from it. Keyed in metadata.decisions by
+    "<phase>:<tool_name>".
+    """
+    decision_id:  str            # "<phase>:<tool_name>"
+    tool_name:    str
+    phase:        str
+    chosen:       dict           # {"variant_id", "path", "image_space"}
+    candidates:   list[Variant]  # the pool at decision time (alternatives kept)
+    pre_step:     dict | None    # {"path", "image_space"} the step branched from
+    rationale:    str | None
+    mode:         str            # "hitl" | "autonomous"
+    decided_at:   str            # ISO 8601
+
+
 class ReviewHumanEvent(TypedDict, total=False):
     """
     A typed human event delivered while a HITL review session is paused.
@@ -809,6 +854,8 @@ def make_empty_state(dataset: Dataset, session: SessionContext) -> AstroState:
             checkpoints=None,
             last_committed_variant=None,
             last_analysis_snapshot=None,
+            decisions=None,
+            step_anchors=None,
             phase_checkpoints=None,
             phase_rewind_counts=None,
         ),

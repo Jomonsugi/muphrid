@@ -74,6 +74,7 @@ from muphrid.tools.utility.present_images import present_images
 from muphrid.tools.utility.masked_process import masked_process
 from muphrid.tools.utility.hdr_composite import hdr_composite
 from muphrid.tools.utility.rewind_phase import rewind_phase
+from muphrid.tools.utility.revisit_decision import revisit_decision
 from muphrid.tools.utility.flag_dataset_issue import flag_dataset_issue
 from muphrid.tools.utility.present_for_review import present_for_review
 
@@ -90,6 +91,7 @@ UTILITY_TOOLS = [
     resolve_target,
     advance_phase,
     rewind_phase,
+    revisit_decision,
     flag_dataset_issue,
     masked_process,
     hdr_composite,

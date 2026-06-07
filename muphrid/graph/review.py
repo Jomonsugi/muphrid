@@ -13,9 +13,10 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage
 
 from muphrid.graph.content import text_content
-from muphrid.graph.hitl import is_enabled, tool_cfg
+from muphrid.graph.hitl import TOOL_TO_HITL, is_enabled, tool_cfg
 from muphrid.graph.state import (
     AstroState,
+    DecisionRecord,
     ProcessingPhase,
     ReviewHumanEvent,
     ReviewProposal,
@@ -535,3 +536,94 @@ def build_visible_response_required_prompt(review_session: dict | None) -> Human
     )
 
 
+
+# ── Decision records & revisit ────────────────────────────────────────────────
+#
+# A decision record is the durable "commit" of a converged step: the chosen
+# variant, the alternatives that were on the table, and the pre-step image.
+# Recording it (instead of just clearing the pool) is what makes approval mean
+# "this loop converged," not "this step is irrevocable" — revisit_decision
+# reads it to reopen the step. These helpers are mode-independent: the single
+# writer build_variant_promotion_update calls make_decision_record for both
+# HITL approval and the autonomous commit_variant tool. See DecisionRecord.
+
+
+def decision_id(phase: str, tool_name: str) -> str:
+    """Stable key for metadata.decisions / metadata.step_anchors."""
+    return f"{phase}:{tool_name}"
+
+
+def make_decision_record(
+    *,
+    chosen: Variant,
+    candidates: list[Variant],
+    pre_step: dict | None,
+    rationale: str | None,
+    mode: str,
+) -> tuple[str, DecisionRecord]:
+    """Construct a converged-step record. The single constructor of the shape.
+
+    chosen is the promoted variant; candidates is the full pool at decision
+    time (the alternatives, preserved); pre_step is the {path, image_space}
+    the step branched from (from metadata.step_anchors), or None.
+    """
+    phase = str(chosen.get("phase") or "")
+    tool_name = str(chosen.get("tool_name") or "")
+    did = decision_id(phase, tool_name)
+    record = DecisionRecord(
+        decision_id=did,
+        tool_name=tool_name,
+        phase=phase,
+        chosen={
+            "variant_id": chosen.get("id"),
+            "path": chosen.get("file_path"),
+            "image_space": chosen.get("image_space"),
+        },
+        candidates=list(candidates or []),
+        pre_step=pre_step,
+        rationale=rationale or None,
+        mode=mode,
+        decided_at=utc_now(),
+    )
+    return did, record
+
+
+def resolve_decision(
+    state: AstroState, handle: str
+) -> tuple[DecisionRecord | None, list[str]]:
+    """Resolve a revisit handle to a record.
+
+    handle may be a full decision_id ("<phase>:<tool>") or a bare tool name
+    (resolved within the current phase first, else the most recent match).
+    Returns (record, available_handles); record is None when unresolved.
+    """
+    decisions = (state.get("metadata") or {}).get("decisions") or {}
+    available = list(decisions.keys())
+    if not decisions:
+        return None, available
+    if handle in decisions:
+        return decisions[handle], available
+    matches = [v for v in decisions.values() if v.get("tool_name") == handle]
+    if matches:
+        cur_phase = phase_value(state.get("phase"))
+        for rec in matches:
+            if rec.get("phase") == cur_phase:
+                return rec, available
+        return matches[-1], available
+    return None, available
+
+
+def reopen_review_for_revisit(
+    state: AstroState, record: DecisionRecord
+) -> ReviewSession | None:
+    """Fresh open review session for a revisited decision's gate.
+
+    Returns a new session when the tool's HITL gate is enabled (so the human
+    re-enters the discussion), or None in autonomous mode / when the gate is
+    disabled (the agent simply iterates again with the restored pool).
+    """
+    tool_name = record.get("tool_name") or ""
+    hitl_key = TOOL_TO_HITL.get(tool_name)
+    if not hitl_key or not is_enabled(hitl_key):
+        return None
+    return make_review_session(state=state, hitl_key=hitl_key, tool_name=tool_name)

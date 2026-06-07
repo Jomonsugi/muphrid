@@ -130,6 +130,7 @@ Important state fields:
 | `visual_context` | Non-variant images the model should see |
 | `regression_warnings` | Metric regressions detected during analysis |
 | `tool_effects` | Per-call record of whether a tool changed the working image; drives no-op loop detection |
+| `metadata.decisions` | Per converged step: the chosen variant, all candidates, and the pre-step image — so a step can be revisited (`revisit_decision`) instead of lost |
 
 Reducers matter. Some fields are deep-merged so parallel tool calls compose safely (`paths`, `metadata`). Some are replace-aware (`metrics`). Lists such as `variant_pool` are plain replace semantics because the writer recomputes the full list.
 
@@ -252,6 +253,18 @@ The agent can:
 Approval promotes the selected variant to `paths.current_image`, clears the pool, closes the review session, and resumes the pipeline from the approved image.
 
 In autonomous mode, the agent uses `commit_variant` instead of human approval.
+
+Either way, convergence is a **commit, not a one-way door**. Approving or
+committing records a decision (`metadata.decisions`) that keeps the rejected
+alternatives and the pre-step image, rather than discarding them. If a later
+step shows an earlier choice was wrong, `revisit_decision` reopens that step —
+restoring the pre-step image, repopulating the pool with the recorded
+candidates, and (under HITL) reopening the gate. It is mode-independent and
+append-only: the autonomous agent uses it to back out and retry on its own
+(like a coding agent reverting a change), the record is preserved, and HITL
+only adds a human voice to the same loop. This mirrors a version-control
+model: the pool is the working tree, the decision is the commit, and history
+stays recoverable.
 
 ---
 

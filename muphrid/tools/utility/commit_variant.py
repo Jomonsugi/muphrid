@@ -122,7 +122,7 @@ def commit_variant(
                 )],
             })
 
-    result = build_variant_promotion_update(state, variant_id)
+    result = build_variant_promotion_update(state, variant_id, rationale=rationale)
     if result is None:
         # Race guard: if this variant_id was already promoted (either via
         # HITL promote_variant or a prior commit_variant), the pool has been
